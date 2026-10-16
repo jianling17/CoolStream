@@ -64,15 +64,50 @@
 
 我是一名**大二学生**（护理学专业），没有编程基础。开发方式见上面 [「关于开发方式」](#关于开发方式--how-this-was-built)。
 
-我日常用 DeepSeek 问问题、查资料。但官方的移动端方案（或者说各种基于 WebView 的第三方客户端）在我的手机上有一个很明显的毛病：**用十几分钟就明显发热**，电量掉得也快。
+**这个项目的起点不是「我想学安卓开发」，而是一连串具体的麻烦：**
 
-发热的原因我大概能猜到：WebView 本质上是一个完整的浏览器内核，为了渲染一个聊天界面，它要跑一整套 HTML/CSS/JS 引擎。对聊天这种「文字一条一条往外蹦」的场景来说，这套引擎太重了。
+1. 一开始我在**笔记本上本地构建 DSH**（DeepSeek Harness）。能用，但很不方便 —— DSH 是跑在本机的服务，总不能一直坐在电脑前问问题。
+2. 于是我用 **DeepSeek 网页端**去找手机版，找到了 [**woaiys3/deepseek-harness-android-app**](https://github.com/woaiys3/deepseek-harness-android-app)：一位大佬把 DSH 打包成了可以直接安装的 Android APK。
+3. 装上之后确实方便了，但有个很严重的毛病：**发热极其严重**，用十几分钟就明显烫手，电量掉得也快。
+4. 所以我用 **WorkBuddy 国际版**的免费模型额度（底层是 DeepSeek-V4.1-Flash）接入模型，自己写了一个原生 Android 客户端 —— 就是这个仓库 **CoolStream**。UI 用 **Jetpack Compose**，目标只有一个：**把发热降下来**。
+5. 顺带一个插曲：写 CoolStream 期间 GitHub 一直连不稳，最后是靠**笔记本上那份 DSH** 帮我排查，把 GitHub 的**裸连**（不走代理的直连）修好了。
 
-于是我想：**能不能用安卓原生的 UI 框架重写一个，把不必要的开销砍掉？**
+### 1.1 先把「烫」变成数字
+
+「感觉烫」不是能拿来做决策的依据。所以我用 **PerfDog** 对那个客户端做了一次采样，拿到两个数字：
+
+| 指标 | 实测 |
+|---|---:|
+| 退到后台时的 CPU 占用 | **108%（单核口径）** |
+| CPU 结温 | **94.5℃** |
+
+两条都反常：一个已经退到后台、界面上什么都不做的 App，正常应该被系统降优先级、限流，占用落在个位数百分比；而 94.5℃ 已经贴着手机的热保护阈值了。
+
+### 1.2 瓶颈落在 WebView
+
+顺着「后台为什么还在算」往下查，占用最高的不是壳本身，而是 **WebView 的渲染进程**。
+
+> **一句准确性说明**：那个客户端**不是「WebView 套壳」**。它的外层是原生 Java 壳，里面内置 Node.js 运行时跑 DSH 引擎；但它的**界面层**是 DSH 自己的 Web 前端，最终由系统 **WebView** 渲染。下面说「WebView 瓶颈」，指的是**界面渲染这一层**，不是整个 App 的架构。
+
+原因不难理解：WebView 本质上是一个完整的浏览器内核。为了渲染一个聊天界面，它要跑一整套 HTML / CSS / JS 引擎，加上排版和合成。对「文字一条一条往外蹦」这种场景来说，这套引擎太重了。
+
+于是判断可以写成一句可直接验证的话：
+
+> **如果发热的主要来源是 WebView 的渲染开销，那么把界面层换成安卓原生 UI，这块开销就应该显著下降。**
+
+（这不是在说那个项目写得不好 —— 只要界面层是 WebView，同样的量级基本躲不掉。）
+
+### 1.3 把目标收敛成一个能测的指标
+
+但「用原生 UI 重写」本身没法验证，得先收敛成一条可量化的假设：
+
+> **流式输出时，UI 不需要每来一个碎片就刷新一次。攒够 50ms 刷一次，重绘次数应该能降一个数量级。**
+
+这就是 **50ms 批处理** 的来历。
 
 代码是 AI 写的。我在这个项目里实际做的事情是这条链路：
 
-> **发现 WebView 发热痛点 → 定义优化目标（50ms 批处理）→ 设计 A/B 对照实验 → 抓日志采集数据 → 判断结论是否站得住**
+> **本地 DSH 不方便 → 换手机版 → 手机版发热严重 → PerfDog 测出 WebView 瓶颈 → 用原生 UI 重写（CoolStream）→ 定义「50ms 批处理」这个可测假设 → 设计 A/B 对照实验 → 抓日志采集数据 → 判断结论是否站得住**
 
 **这个仓库的重点不是「我写了一个 App」，而是「我用可复现的数据验证了一个优化假设」。**
 
@@ -105,7 +140,7 @@
 | 网络 | **OkHttp 4.12.0** | 只需一条依赖；流式响应手写 SSE 解析，不引额外库 |
 | JSON | **`org.json`** | Android 平台自带，零依赖 |
 | 并发 | **Kotlin 协程** | 网络在 `Dispatchers.IO`，UI 更新切回 `Dispatchers.Main` |
-| 模型 | **DeepSeek**（`deepseek-flash`） | 官方公开 API，OpenAI 兼容格式 |
+| 模型 | **DeepSeek-V4.1-Flash**（`deepseek-v4.1-flash`） | 通过 WorkBuddy 国际版的免费模型额度调用，OpenAI 兼容格式 |
 
 - `minSdk 24`（Android 7.0） / `targetSdk 36`
 - 整个项目**只有一个 Activity、一个 Kotlin 文件**（约 580 行），刻意不做架构分层 —— 因为作者是新手，文件越少越不容易出错。
@@ -196,7 +231,7 @@ onFlush = { text ->
 
 ### 4.4 关闭思考模式，减少空碎片
 
-`deepseek-flash` 的**思考模式默认是开启的**。开启后它会先推一长串思维链，而思维链碎片里 `content` 字段是 `null`（思维内容放在 `reasoning_content` 字段）。
+`deepseek-v4.1-flash` 的**思考模式默认是开启的**。开启后它会先推一长串思维链，而思维链碎片里 `content` 字段是 `null`（思维内容放在 `reasoning_content` 字段）。
 
 这带来两个问题：首字延迟变长；以及一堆无效碎片。所以显式关掉：
 
@@ -355,7 +390,7 @@ stream done: total=1458 chars (deltas=911, flushes=58, skipped=2)
 911 个碎片只触发了 58 次刷新。理论上限是每秒 20 次（1000ms ÷ 50ms），58 次刷新意味着这段流式输出至少持续了 **2.9 秒**。
 
 **第三，一个自洽性检查。**
-58 次刷新 × 50ms = 2.9 秒，这是流式过程的最短耗时。也就是说 911 个碎片是在 2.9 秒以上吐完的，平均每秒不超过约 314 个字 —— 这个量级与 `deepseek-flash` 的实际速度相符。反过来说：**在那 2.9 秒里，不做批处理就要重绘 911 次，做批处理只要 58 次。**
+58 次刷新 × 50ms = 2.9 秒，这是流式过程的最短耗时。也就是说 911 个碎片是在 2.9 秒以上吐完的，平均每秒不超过约 314 个字 —— 这个量级与 `deepseek-v4.1-flash` 的实际速度相符。反过来说：**在那 2.9 秒里，不做批处理就要重绘 911 次，做批处理只要 58 次。**
 
 ### 5.5 怎么自己复现
 
@@ -393,9 +428,11 @@ tag:MyChatPerf & package:mine
 | 最低运行版本 | Android 7.0（API 24） |
 | 手机 | 开启「USB 调试」的 Android 真机（模拟器也可以，但测不了温度） |
 
-### 6.2 第一步：拿到 DeepSeek API Key
+### 6.2 第一步：拿到 WorkBuddy 国际版的 API Key
 
-去 [platform.deepseek.com](https://platform.deepseek.com) 注册并生成一个 Key，形如 `sk-xxxxxxxx`。
+注册 **WorkBuddy 国际版**，在它的免费模型额度里生成一个 API Key，形如 `sk-xxxxxxxx`。
+
+> ⚠️ **两处常量要和你自己的渠道对齐**：代码里 `MainActivity.kt` 的 `API_URL` 目前写的是 `https://api.deepseek.com/chat/completions`，`MODEL_NAME` 写的是 `deepseek-flash`。换用其它渠道的 Key 时，把这两行改成该渠道给出的 OpenAI 兼容地址与模型名即可，**其余代码不用动**（请求体格式和 SSE 解析都是通用的）。
 
 ### 6.3 第二步：把 Key 放进 `local.properties`
 
@@ -447,7 +484,7 @@ android {
 }
 
 dependencies {
-    // OkHttp：流式请求 DeepSeek API
+    // OkHttp：流式请求模型 API（OpenAI 兼容格式）
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 ```
@@ -484,8 +521,8 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 | `Unresolved reference: okhttp3` | 依赖没加或没 Sync | 检查 `dependencies` 并重新 Sync |
 | `Unresolved reference: util`（在 `build.gradle.kts` 里） | 写了 `java.util.Properties()` | Gradle Kotlin DSL 里 `java` 会被解析成 Gradle 扩展，**必须在文件顶部 `import java.util.Properties`** |
 | `Could not resolve ... No cached version available for offline mode` | `gradle.properties` 里有 `org.gradle.offline=true` | 注释掉这一行再 Sync |
-| `HTTP 401` | Key 无效 / 过期 / 多复制了空格 | 去平台重新生成，粘贴时注意空格 |
-| `HTTP 404` | 接口地址不完整 | 必须是 `https://api.deepseek.com/chat/completions` |
+| `HTTP 401` | Key 无效 / 过期 / 多复制了空格 | 去你的 API 渠道后台重新生成，粘贴时注意空格 |
+| `HTTP 404` | 接口地址不完整 | 必须是该渠道的 OpenAI 兼容地址，即 `/chat/completions` 结尾（对应代码里的 `API_URL`） |
 | 界面上出现 `nullnullnull` | 用了 `optString` 取 `content` | 见 [4.6 节](#46-顺手踩到的一个-android-专属坑optstring-会把-json-null-变成-null) |
 | AI 不记得上一轮说了什么 | 历史没打包，或 `MAX_HISTORY_MESSAGES` 太小 | 见 [4.5 节](#45-多轮上下文把整个对话历史一起发过去) |
 
@@ -559,7 +596,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 
 **它做不到的是**：`buildConfigField` 生成的字符串会被**编译进 APK**，任何人拿到你的 APK 都可以反编译提取出来。
 
-真正安全的做法是**加一个自己的后端做代理**：App 请求你自己的服务器，服务器再带着 Key 去请求 DeepSeek。这个项目没有做，因为它需要额外的服务器，超出了「学做一个客户端」的范围。
+真正安全的做法是**加一个自己的后端做代理**：App 请求你自己的服务器，服务器再带着 Key 去请求模型 API。这个项目没有做，因为它需要额外的服务器，超出了「学做一个客户端」的范围。
 
 **所以：不要把这个 APK 分发给别人。**
 
@@ -589,12 +626,13 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 
 ## 8. 免责声明 / Disclaimer
 
-- 本项目是**个人学习项目**，与 DeepSeek 官方没有任何关系，不代表官方立场。
-- 本项目调用的是 **DeepSeek 官方公开的 HTTP API**，使用的是公开文档中记载的接口格式。**不涉及任何逆向工程**，没有破解、没有抓包官方 App、没有绕过任何协议。
-- 本项目**不提供任何绕过付费、绕过限额、共享账号的功能**。API 调用产生的费用由使用者自己承担。
+- 本项目是**个人学习项目**，与 DeepSeek、WorkBuddy 官方均无任何关系，不代表任何一方立场。
+- **开发期使用的是 WorkBuddy 国际版的免费模型额度**（底层模型为 DeepSeek-V4.1-Flash），**不是 DeepSeek 官方的付费 API**。使用者复现时请遵守该渠道的服务条款。
+- 本项目调用的是渠道公开提供的 **OpenAI 兼容 HTTP 接口**，使用的是公开文档中记载的格式。**不涉及任何逆向工程**，没有破解、没有抓包官方 App、没有绕过任何协议。
+- 本项目**不提供任何绕过付费、绕过限额、共享账号的功能**。API 调用产生的费用（如有）由使用者自己承担。
 - **API Key 不会被上传到任何地方**，只保存在使用者本机的 `local.properties` 中。但请注意 7.8 节所述的局限性。
 - 本项目**仅限个人学习与自用**。请勿用于任何商业用途，也请勿将打包好的 APK 分发给他人。
-- 使用者应遵守 [DeepSeek 服务条款](https://platform.deepseek.com) 及所在地区的相关法律法规。
+- 使用者应遵守所用 API 渠道的服务条款及所在地区的相关法律法规。
 - 作者是护理学专业学生，**本项目与护理学、医学均无关**，不构成任何医疗建议。
 
 ---
@@ -602,7 +640,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 ## 9. 后续计划 / Roadmap
 
 - [x] 最小可用聊天界面
-- [x] 接入 DeepSeek 流式 API
+- [x] 接入模型流式 API（OpenAI 兼容）
 - [x] 50ms 批处理 + 只更新最后一个气泡
 - [x] 关闭思考模式，过滤空碎片
 - [x] 用日志量化验证批处理效果
@@ -623,7 +661,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 - **设计 A/B 对照实验** —— 确定唯一变量（`FLUSH_INTERVAL_MS` 取 `0L` / `50L`），设计对照组与实验组的测试流程
 - **数据采集** —— 在真机上抓取 Logcat，记录 `deltas` / `flushes` 两组原始数据
 - **数据分析** —— 计算压缩比，得出「减少 93.6% 无效重绘」的结论
-- **方案决策** —— 选定 DeepSeek 作为模型服务、OkHttp 作为网络库，确定 API Key 的存放方式
+- **方案决策** —— 选定模型渠道（WorkBuddy 国际版的免费额度）与 OkHttp 作为网络库，确定 API Key 的存放方式
 - **质疑与纠错** —— 在 AI 给出错误结论时提出质疑（例如模型名一度给成了已停用的 `deepseek-chat`）
 
 ### AI 工具做的事
@@ -642,8 +680,8 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 
 ### 致谢
 
-- **DeepSeek** —— 提供本项目的模型 API，以及开发过程中使用的网页端
-- **WorkBuddy** —— 提供项目开发与验证环境
+- **DeepSeek** —— 提供本项目使用的模型（DeepSeek-V4.1-Flash），以及开发过程中使用的网页端
+- **WorkBuddy 国际版** —— 提供开发期的免费模型额度，以及项目开发与验证环境
 - **Jetpack Compose / OkHttp** —— 本项目依赖的开源项目
 
 ---
