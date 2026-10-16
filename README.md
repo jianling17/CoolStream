@@ -76,6 +76,8 @@
 
 **这个仓库的重点不是「我写了一个 App」，而是「我用可复现的数据验证了一个优化假设」。**
 
+> 本文的数据来源见 [docs/background-dsh-heat-analysis.md](docs/background-dsh-heat-analysis.md)。
+
 ---
 
 ## 2. 界面 / Screenshots
