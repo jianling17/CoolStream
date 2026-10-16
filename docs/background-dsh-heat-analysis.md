@@ -31,7 +31,7 @@
 1. 一开始我在**笔记本上本地构建 DSH**（DeepSeek Harness）。能用，但很不方便 —— DSH 是跑在本机的服务，总不能一直坐在电脑前问问题。
 2. 于是我用 **DeepSeek 网页端**去找手机版，找到了 [**woaiys3/deepseek-harness-android-app**](https://github.com/woaiys3/deepseek-harness-android-app)：一位大佬把 DSH 打包成了可以直接安装的 Android APK。
 3. 装上之后确实方便了，但有个很严重的毛病：**发热极其严重** —— 用十几分钟就明显烫手，电量掉得也快。
-4. 所以我用 **WorkBuddy 国际版**的免费模型额度（底层是 DeepSeek-V4.1-Flash）接入模型，自己写了一个原生 Android 客户端（CoolStream），目标只有一个：把发热降下来。
+4. 所以我用 **WorkBuddy 国际版**辅助写代码，做出了一个原生 Android 客户端（CoolStream），模型走 DeepSeek 官方 API，目标只有一个：把发热降下来。
 5. 顺带一个插曲：写 CoolStream 期间 GitHub 一直连不稳，最后是靠**笔记本上那份 DSH** 帮我排查，把 GitHub 的**裸连**修好了。
 
 回到发热本身。它不是「有点温」，是**能明显感觉到的那种烫**，而且有规律：**只要界面在动（流式输出中），就烫；静止放着，就凉下来。** 这个规律本身就是线索——发热跟着「渲染」走。
