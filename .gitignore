@@ -16,4 +16,11 @@ local.properties
 
 # 编辑器/工具的备份文件，不进仓库
 *.bak
+*.bak-*
 *~
+
+# Kotlin 2.0 的构建中间目录（KSP / 编译器缓存），不进仓库
+.kotlin/
+
+# Android Studio 自己的 App Insights 配置，机器相关
+/.idea/appInsightsSettings.xml
