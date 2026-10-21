@@ -5,6 +5,35 @@
     <!-- 联网权限：必须放在 <application> 外面 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+        读取本地文件用的权限（Agent 的 read_file 工具需要）。
+
+        ⚠️ 这个权限比较特殊：
+          · Android 11（API 30）起，它授予的是「所有文件访问权限」
+          · 光在 Manifest 里声明没用，必须由用户在系统设置里手动打开
+          · 所以 App 启动时要检查，没开就引导用户去设置页
+
+        ⚠️ Google Play 对它有严格审核（一般只批文件管理器 / 备份工具类应用），
+           自用 + 侧载安装不受影响。
+    -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!--
+        通知权限（Android 13 / API 33 起需要运行时申请）。
+        DSH 后续做后台任务时要用通知告诉用户"正在执行"，没有它就看不到任何提示。
+    -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        前台服务：让 App 在后台持续跑（比如长任务、工具执行），不被系统回收。
+        这是给后面的 DSH 长任务准备的。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14 起，前台服务还必须声明具体类型，否则启动就会崩 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -26,6 +55,30 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            Shizuku UserService。
+            Shizuku 会把这个 Service 跑在「shell 权限」的进程里，
+            我们的 App 通过 AIDL 接口把命令丢过去执行。
+            exported 必须是 false —— 只让 Shizuku 绑，不让别的 App 绑。
+        -->
+        <service
+            android:name=".RemoteShellService"
+            android:exported="false" />
+
+        <!--
+            Shizuku 的 provider。
+            Shizuku App 通过它和我们的 App 通信，把「已授权 + 服务在跑」这个状态传过来。
+            不声明的话 requestPermission() 永远拿不到结果。
+            authorities 用 ${applicationId} 占位，编译时会替换成 com.example.mychat.shizuku。
+        -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 
 </manifest>
