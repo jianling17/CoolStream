@@ -500,6 +500,100 @@ Inline code uses `SpanStyle(fontFamily = Monospace, background = CodeInlineBackg
 
 ---
 
+### 3.8 ViewModel — surviving rotation
+
+Rotating the screen destroys the Activity. Two things break:
+
+1. `remember { mutableStateOf() }` is gone, so the conversation and the selected session vanish
+2. **`rememberCoroutineScope()` is cancelled together with the composition** — an in-flight stream is silently killed mid-answer
+
+The second one is the real damage. Fix: move state into a `ChatViewModel` and run streams on `viewModelScope`.
+
+```kotlin
+class ChatViewModel(app: Application) : AndroidViewModel(app) {
+    val sessions = mutableStateListOf<ChatSession>()
+    val currentSessionIdState = mutableStateOf("")
+    var loadedOnce = false
+    var streamJob: Job? = null
+}
+
+val vm: ChatViewModel = viewModel()
+val sessions = vm.sessions
+var currentSessionId by vm.currentSessionIdState
+val streamScope: CoroutineScope = vm.viewModelScope
+```
+
+The trick that keeps the diff small: the ViewModel exposes raw `MutableState`, and the composable delegates with `by`. Several hundred lines of existing logic barely change.
+
+**The load guard matters as much as the ViewModel itself:**
+
+```kotlin
+if (vm.loadedOnce) return@LaunchedEffect
+```
+
+Without it, rotation re-reads the database and wipes the in-flight bubble plus any tool cards that haven't been written yet.
+
+Measured, with two rotations during a single request:
+
+```
+06:23:21  App started / 旋转回来，跳过重新加载（sessions=1）
+06:23:26  agent done: chars=7141
+06:23:29  App started / 旋转回来，跳过重新加载（sessions=1）
+```
+
+Same PID throughout; the 7,141-character answer completed intact.
+
+---
+
+### 3.9 Sidebar long-press: rename and delete
+
+`Modifier.combinedClickable(onClick, onLongClick)` on each row opens a glass `AlertDialog` with 重命名 / 删除.
+
+**The dangerous case is deleting the session currently on screen** — naive implementations crash or render a blank view. The fallback chain:
+
+```kotlin
+if (currentSessionId == id) {
+    val next = sessions.firstOrNull()?.id
+    if (next != null) currentSessionId = next else newSession()
+}
+```
+
+Deletion relies on the v2 foreign key's `ON DELETE CASCADE`, so messages go with the session and there is no manual cleanup. Measured: after deleting the only session, `messages` dropped to 0 and a fresh empty session was created automatically.
+
+---
+
+### 3.10 Tool cards: ordering and timing
+
+Tool cards originally lived only in memory, so after a restart they simply **disappeared** — they did not degrade into plain text.
+
+Two things are required, and the second is easy to miss.
+
+**1. Persist with a completion handle.** `onToolCallStarted` inserts the row and `onToolCallFinished` updates it, but the insert runs on IO — the update can arrive first and target a row id that doesn't exist yet:
+
+```kotlin
+val deferred = CompletableDeferred<Int>()
+toolCardRowIds[callId] = deferred
+streamScope.launch(Dispatchers.IO) {
+    val rid = dao.insert(card).toInt()
+    deferred.complete(rid)
+}
+// later: deferred.await() before updateContent
+```
+
+**2. Timestamps must be layered.** On reload, messages come back with `ORDER BY timestamp ASC, id ASC`:
+
+```
+user message   = now
+tool cards     = now + 1
+AI placeholder = now + 2
+```
+
+Give the card `System.currentTimeMillis()` instead, and on reload it lands **after** the AI reply — because it really was created later in wall-clock time.
+
+Verified: the reloaded order came back as `USER → TOOL_CALL → AI_TEXT`, and after a restart the card rendered as `🔧 已执行：read_file` together with its result.
+
+---
+
 ## 4. Environment & Build (the most time-consuming section)
 
 ### ⚠️ Auto timestamp versioning: two traps
@@ -575,6 +669,23 @@ Not under "App permissions". It is at:
 The most reliable way to reach it is the intent:
 `Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`
 
+### ⚠️ Emulator UI automation: the keyboard moves the dialog
+
+Driving Compose UI with `adb shell input tap` has one trap that cost several debugging rounds:
+
+> **Tapping a text field inside an `AlertDialog` raises the IME, and the whole dialog shifts upward.** Every coordinate computed before typing is now wrong — the "Save" tap lands outside the dialog and silently dismisses it, which looks exactly like "the feature doesn't work".
+
+Correct sequence: tap the field → type → **`input keyevent 4` to dismiss the keyboard** → re-dump → compute coordinates → tap.
+
+Other notes that saved time:
+
+- Long-press = `adb shell input swipe x y x y 900` (same point, 900 ms)
+- Clear a field with `input keyevent 67` (DEL) repeated
+- Compose's `Icon(contentDescription = ...)` sometimes does not appear in the `uiautomator` tree; fall back to hard-coded coordinates
+- When matching dialog buttons, **match the text exactly** — `"Allow"` also matches the dialog title `"Allow MyChat to send you notifications?"`
+- `uiautomator dump` renders emoji as numeric character references (`&#128295;`); that is its encoding, not file corruption
+- `adb shell input text` auto-corrects: typing `/sdcard` produced `/SD card` — always verify the path in the logs
+
 ### ⚠️ `git push` blocked: proxy returns 502 for `github.com` only
 
 Symptom:
@@ -631,6 +742,9 @@ The proxy is up, but its upstream for **one specific host** (`github.com`) is br
 - [x] Workspace: system folder picker (`OpenDocumentTree`), tree Uri → absolute path, SharedPreferences persistence
 - [x] Workspace enforcement inside `read_file` / `list_dir` / `search_files`, plus a workspace clause injected into the system prompt
 - [x] Verified end-to-end on an Android 17 emulator (Pixel 9 Pro): picker works, path survives a restart, out-of-workspace reads are blocked
+- [x] ViewModel: conversation state **and in-flight streams** survive rotation
+- [x] Sidebar long-press → rename / delete (cascade), with a safe fallback when the active session is deleted
+- [x] Tool calls persisted to Room with layered timestamps — cards re-render after a restart
 
 ### Summary
 
@@ -1179,7 +1293,122 @@ agent round 2 结束: toolCalls=0, textLen=255
 
 ---
 
+### 3.8 ViewModel —— 扛住屏幕旋转
+
+旋转屏幕会销毁 Activity，坏掉的是两件事：
+
+1. `remember { mutableStateOf() }` 全没了，对话内容和当前会话一起消失
+2. **`rememberCoroutineScope()` 会随组合一起被 cancel** —— 正在跑的流式请求会在回答中途被静默掐断
+
+第二条才是真正的伤害。做法：状态搬进 `ChatViewModel`，流式请求跑在 `viewModelScope` 上。
+
+```kotlin
+class ChatViewModel(app: Application) : AndroidViewModel(app) {
+    val sessions = mutableStateListOf<ChatSession>()
+    val currentSessionIdState = mutableStateOf("")
+    var loadedOnce = false
+    var streamJob: Job? = null
+}
+
+val vm: ChatViewModel = viewModel()
+val sessions = vm.sessions
+var currentSessionId by vm.currentSessionIdState
+val streamScope: CoroutineScope = vm.viewModelScope
+```
+
+让改动量最小的关键：ViewModel 对外暴露**裸的 `MutableState`**，界面侧用 `by` 委托。
+现有几百行逻辑几乎一行不用改。
+
+**加载守卫和 ViewModel 本身一样重要：**
+
+```kotlin
+if (vm.loadedOnce) return@LaunchedEffect
+```
+
+没有它，旋转回来会重新读库，把**正在流式的气泡**和**还没落库的工具卡片**一起冲掉。
+
+实测（一次请求中连续旋转两次）：
+
+```
+06:23:21  App started / 旋转回来，跳过重新加载（sessions=1）
+06:23:26  agent done: chars=7141
+06:23:29  App started / 旋转回来，跳过重新加载（sessions=1）
+```
+
+**全程同一个 PID**，7141 字的回答完整收完。
+
+---
+
+### 3.9 侧边栏长按：重命名与删除
+
+每一项挂 `Modifier.combinedClickable(onClick, onLongClick)`，长按弹出毛玻璃 `AlertDialog`：重命名 / 删除。
+
+**最危险的场景是删掉当前正在看的那个会话** —— 处理不好就是崩溃或白屏。兜底链：
+
+```kotlin
+if (currentSessionId == id) {
+    val next = sessions.firstOrNull()?.id
+    if (next != null) currentSessionId = next else newSession()
+}
+```
+
+删除本身依赖 v2 建表时那个 `ON DELETE CASCADE` 外键，消息会跟着会话一起走，不用手动清。
+实测：删掉唯一一个会话后，`messages` 归 0，并自动新建了一个空会话。
+
+---
+
+### 3.10 工具卡片：时序与排序
+
+工具卡片最初只存在内存里，重启后是**直接消失**（不是退化成纯文本）。
+
+要做对两件事，第二件特别容易漏。
+
+**① 用完成信号保证顺序。** `onToolCallStarted` 插行、`onToolCallFinished` 更新行，但 insert 跑在 IO 上 —— 更新可能先到，打到一个还不存在的行 id 上：
+
+```kotlin
+val deferred = CompletableDeferred<Int>()
+toolCardRowIds[callId] = deferred
+streamScope.launch(Dispatchers.IO) {
+    val rid = dao.insert(card).toInt()
+    deferred.complete(rid)
+}
+// 之后先 deferred.await()，再 updateContent
+```
+
+**② 时间戳必须分层。** 重新加载时是按 `ORDER BY timestamp ASC, id ASC` 排的：
+
+```
+用户消息   = now
+工具卡片   = now + 1
+AI 占位    = now + 2
+```
+
+如果卡片用 `System.currentTimeMillis()`，它在真实时间里确实是后创建的，重新加载后就会**排到 AI 回复后面**。
+
+验证：重载后的顺序是 `USER → TOOL_CALL → AI_TEXT`；重启后卡片正确渲染成 `🔧 已执行：read_file`，结果也在。
+
+---
+
 ## 4. 环境与构建（这一节的坑最耗时间）
+
+### ⚠️ 模拟器 UI 自动化：键盘会把弹窗顶飞
+
+用 `adb shell input tap` 驱动 Compose 界面有一个坑，为此调了好几轮：
+
+> **点 `AlertDialog` 里的输入框会弹起输入法，整个弹窗随之上移。**
+> 打字之前算好的坐标这时全是错的 —— 点「保存」会落到弹窗外，弹窗被静默关掉，
+> 表现和你以为的「功能没生效」一模一样。
+
+正确顺序：点输入框 → 打字 → **`input keyevent 4` 收键盘** → 重新 dump → 取坐标 → 点击。
+
+几条省时间的经验：
+
+- **长按** = `adb shell input swipe x y x y 900`（同一个点，时长 900ms）
+- 清空输入框用 `input keyevent 67`（DEL）连按
+- Compose 的 `Icon(contentDescription = ...)` 有时不出现在 `uiautomator` 树里，只能退回硬编码坐标
+- 匹配弹窗按钮要**精确匹配文本** —— `"Allow"` 也会命中标题 `"Allow MyChat to send you notifications?"`
+- `uiautomator dump` 会把 emoji 输出成数字字符引用（`&#128295;`），那是它的编码，不是文件被污染
+- `adb shell input text` 会自动纠正：想打 `/sdcard` 结果变成 `/SD card`，**一定要去日志里核对实际路径**
 
 ### ⚠️ 自动时间戳版本号：两个坑
 
@@ -1313,6 +1542,9 @@ fatal: unable to access 'https://github.com/...': CONNECT tunnel failed, respons
 - [x] 工作区：系统目录选择器（`OpenDocumentTree`）、tree Uri → 绝对路径、SharedPreferences 持久化
 - [x] `read_file` / `list_dir` / `search_files` 三层越界拦截，外加注入系统提示词的工作区约束
 - [x] 在 Android 17 模拟器（Pixel 9 Pro）上全链路验证：选择器可用、路径重启不丢、越界读取被拦
+- [x] ViewModel：对话状态**和正在跑的流式请求**都能扛住屏幕旋转
+- [x] 侧边栏长按 → 重命名 / 删除（级联），删掉当前会话时有安全兜底
+- [x] 工具调用落库 + 时间戳分层，重启后卡片仍渲染成卡片
 
 ### 总结
 
