@@ -717,6 +717,37 @@ The model spotted and flagged its own mistake afterwards, but the card had alrea
 
 ---
 
+### 3.14 Auto-scroll, and a settings page with tabs and plugin switches
+
+**Auto-scroll: three decisions, one of which is counter-intuitive.**
+
+1. *Don't hijack the user.* If someone scrolled up to read history, yanking them to the bottom on every token is worse than not scrolling at all. The check is `visibleItemsInfo.last().index == totalItemsCount - 1` — "is the last item on screen?" — evaluated *before* the new content lands. `derivedStateOf` keeps it from recomposing the list on every scroll pixel.
+2. *Instant, not animated, during streaming.* A 50 ms flush rate against `animateScrollToItem` means every animation is cancelled by the next one. The scroll never finishes, it just vibrates. New messages animate (they're discrete and rare); streaming content uses `scrollToItem`.
+3. *`scrollToItem(last)` is not enough.* It aligns the **top** of the last item with the top of the viewport. A long streaming reply is taller than the screen, so you'd end up staring at its first line while new text appears off-screen. A follow-up `scrollBy(200_000f)` pins to the true bottom and clamps harmlessly on short items.
+
+**Settings: four tabs.** 通用 / 模型 / 插件 / 关于. Two things worth recording:
+
+- **`fontScale`, not `density`.** `LocalDensity provides Density(density, fontScale)` scales text only. Overriding `density` instead would balloon paddings, corner radii and icon sizes together, and the layout falls apart at 大. Verified: the workspace path wraps to two lines at 大 while the cards keep their proportions.
+- **`LocalIsDark`, because forcing a theme breaks `isSystemInDarkTheme()`.** The glass palette (`glassFill`/`glassEdge`/…) all read the system theme directly. The moment someone forces light mode on a dark system, text switches to dark-on-light while the glass surfaces stay dark — invisible text. So the resolved boolean is provided once via `staticCompositionLocalOf` and both the theme and the glass read it.
+
+**Plugin switches: three places, not one.** Turning a tool off has to be enforced in three layers or it leaks:
+
+| Layer | What it does | Why it matters |
+|---|---|---|
+| `buildToolsArray()` | Filters the JSON array sent as `tools` | The model literally cannot call what isn't there |
+| System prompt | "当前可用工具：…，不在清单里的已被关闭" | Without this the model keeps calling the disabled tool and burns rounds on "未知工具" |
+| Settings UI | The switch itself | The user needs to see the consequence |
+
+Tools are filtered at **request time**, not cached at startup — the switch can flip between messages, and parsing six JSON objects costs microseconds.
+
+**Verified on the emulator.** With `read_file` switched off, logcat showed `本次启用工具 5 个: [list_dir, search_files, write_file, replace_in_file, run_shell]`, and the model's own answer was:
+
+> `read_file` is not in my current toolset … if you need it, enable it in 设置 → 插件.
+
+It quoted our UI path back at us — that sentence came from the prompt line, not from training data. Turning the switch back on restored `6 个` without a restart.
+
+---
+
 ## 4. Environment & Build (the most time-consuming section)
 
 ### ⚠️ Auto timestamp versioning: two traps
@@ -874,6 +905,8 @@ The proxy is up, but its upstream for **one specific host** (`github.com`) is br
 - [x] `MAX_TOOL_ROUNDS` 5 → 8 so 4-step chains (search → read → edit → verify) fit with margin
 - [x] Per-tool icons on the tool card (wrench / green pencil / list / magnifier / play)
 - [x] Red/green diff view inside successful `replace_in_file` cards (LCS, computed in the UI layer)
+- [x] Auto-scroll that follows new messages and streaming output, without hijacking a user who scrolled up
+- [x] Four-tab settings (通用 / 模型 / 插件 / 关于): theme, font scale, card default state, per-tool switches
 
 ### Summary
 
@@ -1696,6 +1729,52 @@ diff 一眼就把它照出来了：
 
 ---
 
+### 3.14 自动滚动，以及带 Tab 和插件开关的设置页
+
+**自动滚动：三个决定，其中一个是反直觉的。**
+
+1. *别抢用户的滚动。* 人家往上翻历史，你每个 token 就把他拽回底部，比不滚动更糟。
+   判断是 `visibleItemsInfo.last().index == totalItemsCount - 1`——「最后一条在不在屏幕上」，
+   而且是在新内容落地**之前**读。用 `derivedStateOf` 包着，不会因为滚动一个像素就重组整张列表。
+2. *流式输出用瞬时滚动，不用动画。* 50ms 一刷 + `animateScrollToItem`，
+   等于每次动画都被下一次刷新打断 —— 永远滚不完，只是在原地抖。
+   新消息用动画（离散、不频繁），流式内容用 `scrollToItem`。
+3. *只 `scrollToItem(last)` 不够。* 它是把最后一条的**顶部**对齐到视口顶部。
+   长回复的气泡比屏幕还高，结果就是你盯着它的第一行，新吐出来的字在屏幕外。
+   后面补一个 `scrollBy(200_000f)` 顶到真正的底部，内容短时会自动停住，不会越界。
+
+**设置页：四个 Tab。** 通用 / 模型 / 插件 / 关于。两个值得记的点：
+
+- **缩放 `fontScale`，不是 `density`。** `LocalDensity provides Density(density, fontScale)`
+  只放大文字。改 `density` 会把内边距、圆角、图标尺寸一起放大，选「大」的时候布局直接散架。
+  实测：字号调「大」之后工作区路径自动折成两行，卡片比例没变。
+- **`LocalIsDark`，因为强制主题会让 `isSystemInDarkTheme()` 说谎。**
+  毛玻璃那一套（`glassFill`/`glassEdge`/…）全都直接读系统主题。
+  一旦用户在深色系统上强制浅色，文字变成深色、玻璃面还是深色 —— 文字直接看不见。
+  所以把「最终是不是深色」算一次，用 `staticCompositionLocalOf` 发下去，主题和玻璃共用。
+
+**插件开关：三个地方都要拦，少一个就漏。**
+
+| 层 | 做什么 | 为什么必须有 |
+|---|---|---|
+| `buildToolsArray()` | 过滤发给模型的 `tools` 数组 | 数组里没有，模型客观上就调不了 |
+| 系统提示词 | 「当前可用工具：…，不在清单里的已被关闭」 | 少了这句，模型会照旧调用被关的工具，白烧几轮「未知工具」 |
+| 设置页 | 开关本身 | 用户得看得见后果 |
+
+过滤放在**发请求时**做，不在启动时缓存 —— 两条消息之间开关就可能被改，
+而解析六个 JSON 对象只花几十微秒。
+
+**模拟器上的验证。** 关掉 `read_file` 后，logcat 是
+`本次启用工具 5 个: [list_dir, search_files, write_file, replace_in_file, run_shell]`，
+而模型自己的回答是：
+
+> `read_file` is not in my current toolset … if you need it, enable it in 设置 → 插件.
+
+它把我们自己的界面路径原样念了出来 —— 这句来自提示词，不是训练数据。
+把开关拨回去，立刻恢复 `6 个`，不用重启。
+
+---
+
 ## 4. 环境与构建（这一节的坑最耗时间）
 
 ### ⚠️ 模拟器 UI 自动化：键盘会把弹窗顶飞
@@ -1858,6 +1937,8 @@ fatal: unable to access 'https://github.com/...': CONNECT tunnel failed, respons
 - [x] `MAX_TOOL_ROUNDS` 5 → 8，让「搜索 → 读取 → 修改 → 复查」这类四步链有余量
 - [x] 工具卡片按工具类型换图标（扳手 / 绿色钢笔 / 列表 / 放大镜 / 播放键）
 - [x] `replace_in_file` 成功的卡片里显示红绿 diff（LCS，纯 UI 层计算）
+- [x] 自动滚动：跟随新消息与流式输出，但不会抢走用户往上翻的滚动
+- [x] 四 Tab 设置页（通用 / 模型 / 插件 / 关于）：主题、字号、卡片默认状态、逐工具开关
 
 ### 总结
 

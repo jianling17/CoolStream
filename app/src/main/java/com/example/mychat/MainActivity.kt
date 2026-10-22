@@ -33,6 +33,9 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -44,9 +47,16 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -83,6 +93,8 @@ import android.content.Context
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -259,14 +271,29 @@ val SYSTEM_PROMPT = """
  */
 private fun systemPromptWithWorkspace(): String {
     val ws = currentWorkspace
-    return if (ws.isBlank()) {
-        SYSTEM_PROMPT + "\n\n12. 用户还没有设置工作区，暂时不限制路径范围。"
+
+    // ★ 工具开关是运行时状态，拼进来让模型知道「哪些工具现在真的能用」。
+    //   只删 tools 数组、不提一句的话，模型会照旧调用已被关掉的工具，
+    //   然后一直收到「未知工具」，白烧好几轮。
+    val enabled = ALL_TOOL_NAMES.filter { it in AppSettings.enabledTools }
+    val toolLine = if (enabled.isEmpty()) {
+        "当前可用工具：无（用户在设置里把工具全关了）。你只能凭对话回答，" +
+            "绝不要声称你读过、写过或改过任何文件。"
     } else {
-        SYSTEM_PROMPT +
-            "\n\n12. 你的工作区是：$ws" +
-            "\n    所有工具操作（读文件、写文件、改文件、列目录、搜索、shell）都必须严格限制在这个目录下，严禁越界。" +
-            "\n    越界的操作会被代码层直接拦截并返回「工作区越界」，不要换路径反复重试。"
+        "当前可用工具：${enabled.joinToString("、")}。" +
+            "不在这份清单里的工具已被用户在设置里关闭，不要调用，也不要假装调用过；" +
+            "如果当前任务确实需要某个被关掉的工具，如实告诉用户去「设置 → 插件」里打开它。"
     }
+
+    val wsLine = if (ws.isBlank()) {
+        "用户还没有设置工作区，暂时不限制路径范围。"
+    } else {
+        "你的工作区是：$ws\n" +
+            "    所有工具操作（读文件、写文件、改文件、列目录、搜索、shell）都必须严格限制在这个目录下，严禁越界。\n" +
+            "    越界的操作会被代码层直接拦截并返回「工作区越界」，不要换路径反复重试。"
+    }
+
+    return SYSTEM_PROMPT + "\n\n12. $toolLine\n13. $wsLine"
 }
 
 /** 日志标签，Logcat 里用 tag:MyChatPerf 过滤 */
@@ -1200,6 +1227,131 @@ private fun saveWorkspace(context: Context, path: String) {
         .putString(KEY_WORKSPACE, path)
         .apply()
     currentWorkspace = path
+}
+
+// ============================================================
+// 3.24 用户偏好：外观 / 字号 / 工具开关
+//
+// 这些偏好的共同点是「影响全局、而且要在 Compose 里能被观察到」。
+// 所以统一放进 AppSettings 这个对象，内部用 mutableStateOf 托着 ——
+// 一改就会触发重组，不需要在界面里手动刷新。
+//
+// 读写仍然走 SharedPreferences（重启后还在），AppSettings 只是内存镜像。
+// ============================================================
+
+/** 六个手写工具的标识，顺序即设置页里的显示顺序，也是发给模型时的顺序 */
+internal val ALL_TOOL_NAMES = listOf(
+    "list_dir", "search_files", "read_file", "write_file", "replace_in_file", "run_shell"
+)
+
+/** 每个工具在设置页里的一句话说明（写给用户看，不是写给模型看） */
+private val TOOL_DESCRIPTIONS = mapOf(
+    "list_dir" to "列出目录里有什么",
+    "search_files" to "按文件名递归搜索",
+    "read_file" to "读取文本文件内容",
+    "write_file" to "新建文件，或整份覆盖已有文件",
+    "replace_in_file" to "局部替换文件里的某段文本（改代码用这个）",
+    "run_shell" to "通过 Shizuku 执行 shell 命令，权限很高"
+)
+
+private const val KEY_THEME_MODE = "theme_mode"      // system / light / dark
+private const val KEY_FONT_SCALE = "font_scale"      // 0.9 / 1.0 / 1.15
+private const val KEY_CARD_EXPANDED = "tool_card_expanded"
+private const val KEY_TOOL_PREFIX = "tool_enabled_"
+
+/**
+ * 全局设置的内存镜像。
+ *
+ * ⚠️ 用 mutableStateOf 而不是普通变量：主题、字号、工具开关都会影响界面，
+ *    必须是「可被 Compose 观察」的，否则改了设置要重启才生效。
+ */
+private object AppSettings {
+    /** system / light / dark */
+    var themeMode by mutableStateOf("system")
+
+    /** 字号倍率，只缩放文字，不缩放 dp */
+    var fontScale by mutableStateOf(1f)
+
+    /** 工具卡片首次渲染时是否展开 */
+    var cardExpanded by mutableStateOf(false)
+
+    /** 当前开启的工具名集合 */
+    var enabledTools by mutableStateOf(ALL_TOOL_NAMES.toSet())
+}
+
+/**
+ * 当前是不是深色。
+ *
+ * ★ 为什么不直接用 isSystemInDarkTheme()：
+ *   用户在设置里可以强制浅色/深色，那时系统主题就不作数了。
+ *   玻璃取色（glassFill 等）必须和 MyChatTheme 用同一个判断，
+ *   否则会出现「文字按深色排、毛玻璃按浅色算」的错位。
+ */
+private val LocalIsDark = staticCompositionLocalOf { true }
+
+private fun prefsOf(context: Context) =
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+/** App 启动时读一次，把 SharedPreferences 灌进 AppSettings */
+internal fun loadAppSettings(context: Context) {
+    val p = prefsOf(context)
+    AppSettings.themeMode = p.getString(KEY_THEME_MODE, "system") ?: "system"
+    AppSettings.fontScale = p.getFloat(KEY_FONT_SCALE, 1f)
+    AppSettings.cardExpanded = p.getBoolean(KEY_CARD_EXPANDED, false)
+    // 没写过的工具默认开启
+    AppSettings.enabledTools = ALL_TOOL_NAMES.filter {
+        p.getBoolean(KEY_TOOL_PREFIX + it, true)
+    }.toSet()
+    Log.d(
+        TAG,
+        "设置已加载: theme=${AppSettings.themeMode}, fontScale=${AppSettings.fontScale}, " +
+            "cardExpanded=${AppSettings.cardExpanded}, tools=${AppSettings.enabledTools}"
+    )
+}
+
+internal fun setThemeMode(context: Context, mode: String) {
+    prefsOf(context).edit().putString(KEY_THEME_MODE, mode).apply()
+    AppSettings.themeMode = mode
+}
+
+internal fun setFontScale(context: Context, scale: Float) {
+    prefsOf(context).edit().putFloat(KEY_FONT_SCALE, scale).apply()
+    AppSettings.fontScale = scale
+}
+
+internal fun setCardExpanded(context: Context, expanded: Boolean) {
+    prefsOf(context).edit().putBoolean(KEY_CARD_EXPANDED, expanded).apply()
+    AppSettings.cardExpanded = expanded
+}
+
+/** 开关某个工具。内存镜像立刻更新，持久化异步写盘 */
+internal fun setToolEnabled(context: Context, name: String, enabled: Boolean) {
+    prefsOf(context).edit().putBoolean(KEY_TOOL_PREFIX + name, enabled).apply()
+    AppSettings.enabledTools = if (enabled) {
+        AppSettings.enabledTools + name
+    } else {
+        AppSettings.enabledTools - name
+    }
+    Log.d(TAG, "工具开关: $name = $enabled，当前开启 ${AppSettings.enabledTools.size} 个")
+}
+
+/**
+ * 组装发给模型的 tools 数组 —— 只放用户开着的那几个。
+ *
+ * ★ 为什么在发请求时过滤，而不是启动时过滤一次：
+ *   TOOL_DEFINITIONS 是一整段静态 JSON，过滤的代价是解析一次（几十微秒），
+ *   而工具开关随时可能在设置页里被改。每次现算最不容易出错。
+ */
+private fun buildToolsArray(): JSONArray {
+    val all = JSONArray(TOOL_DEFINITIONS)
+    val enabled = AppSettings.enabledTools
+    val out = JSONArray()
+    for (i in 0 until all.length()) {
+        val item = all.optJSONObject(i) ?: continue
+        val name = item.optJSONObject("function")?.optString("name").orEmpty()
+        if (name.isNotEmpty() && name in enabled) out.put(item)
+    }
+    return out
 }
 
 /**
@@ -2276,7 +2428,9 @@ fun runAgentLoop(
                 })
             }
 
-            val toolsArray = JSONArray(TOOL_DEFINITIONS)
+            // ★ 只把用户开着的那几个工具发给模型（设置 → 插件 里的开关）
+            val toolsArray = buildToolsArray()
+            Log.d(TAG, "本次启用工具 ${toolsArray.length()} 个: ${AppSettings.enabledTools}")
             var totalChars = 0
             var round = 0
             // 多轮工具调用会把 token 用量逐轮累加
@@ -2293,7 +2447,10 @@ fun runAgentLoop(
                     //   DeepSeek 默认只在非流式请求里给 usage
                     put("stream_options", JSONObject().put("include_usage", true))
                     put("messages", messages)
-                    put("tools", toolsArray)
+                    // 工具全被关掉时不要发空数组 —— 有些实现会因此报 400
+                    if (toolsArray.length() > 0) {
+                        put("tools", toolsArray)
+                    }
                     put("thinking", JSONObject().put("type", "disabled"))
                 }.toString()
 
@@ -2509,9 +2666,29 @@ class MainActivity : ComponentActivity() {
         Log.d(TAG, "App started")
 
         enableEdgeToEdge()
+
+        // 设置要在第一次重组之前读出来，否则会先按默认主题渲染一帧再跳变
+        loadAppSettings(this)
+
         setContent {
-            MyChatTheme {
-                ChatScreen()
+            // 外观：跟随系统 / 强制浅色 / 强制深色
+            val dark = when (AppSettings.themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> isSystemInDarkTheme()
+            }
+
+            // 字号：只改 fontScale，不动 density ——
+            // 动 density 的话间距、圆角、图标会跟着一起缩放，布局会散架。
+            val baseDensity = LocalDensity.current
+
+            CompositionLocalProvider(
+                LocalIsDark provides dark,
+                LocalDensity provides Density(baseDensity.density, AppSettings.fontScale)
+            ) {
+                MyChatTheme(darkTheme = dark) {
+                    ChatScreen()
+                }
             }
         }
     }
@@ -2536,16 +2713,16 @@ class MainActivity : ComponentActivity() {
 //    这里用「半透明底 + 高光边框」的拟态做法，视觉接近、开销几乎为零。
 // ============================================================
 @Composable
-private fun glassFill(): Color = if (isSystemInDarkTheme()) GlassFillDark else GlassFillLight
+private fun glassFill(): Color = if (LocalIsDark.current) GlassFillDark else GlassFillLight
 
 @Composable
-private fun glassDrawer(): Color = if (isSystemInDarkTheme()) GlassDrawerDark else GlassDrawerLight
+private fun glassDrawer(): Color = if (LocalIsDark.current) GlassDrawerDark else GlassDrawerLight
 
 @Composable
-private fun glassEdge(): Color = if (isSystemInDarkTheme()) GlassEdgeDark else GlassEdgeLight
+private fun glassEdge(): Color = if (LocalIsDark.current) GlassEdgeDark else GlassEdgeLight
 
 @Composable
-private fun glassTint(): Color = if (isSystemInDarkTheme()) GlassTintDark else GlassTintLight
+private fun glassTint(): Color = if (LocalIsDark.current) GlassTintDark else GlassTintLight
 
 
 // ============================================================
@@ -2964,7 +3141,50 @@ fun ChatScreen() {
                         )
                     }
                 } else {
+                    // ---------- 自动滚到底 ----------
+                    //
+                    // 两个细节值得说：
+                    //  ① 用户往上翻历史时不要把他拽回底部，否则根本没法看旧消息
+                    //  ② 流式输出用瞬时滚动，不用动画 —— 每 50ms 刷一次，
+                    //     动画会被下一次刷新打断，看起来反而在抖
+                    val listState = rememberLazyListState()
+                    val itemCount = currentMessages.size
+                    val lastLen = currentMessages.lastOrNull()?.content?.length ?: 0
+                    var prevCount by remember { mutableStateOf(0) }
+
+                    // 「最后一条是否已经露在屏幕里」。用 index 判断而不是精确偏移，
+                    // 是因为流式输出的气泡经常比屏幕还高，精确偏移反而判不准。
+                    val atBottom by remember {
+                        derivedStateOf {
+                            val info = listState.layoutInfo
+                            val last = info.visibleItemsInfo.lastOrNull()
+                            last == null || last.index == info.totalItemsCount - 1
+                        }
+                    }
+
+                    LaunchedEffect(itemCount, lastLen) {
+                        if (itemCount == 0) {
+                            prevCount = 0
+                            return@LaunchedEffect
+                        }
+                        val isNewMessage = itemCount != prevCount
+                        prevCount = itemCount
+                        if (!atBottom) return@LaunchedEffect
+
+                        val target = itemCount - 1
+                        if (isNewMessage) {
+                            listState.animateScrollToItem(target)
+                        } else {
+                            listState.scrollToItem(target)
+                            // 最后一条比屏幕高时（长回复流式输出），
+                            // 只定位到「它的顶部」看不到新吐出来的字，再往前顶一段。
+                            // 到底会自动停住，不会越界。
+                            listState.scrollBy(200_000f)
+                        }
+                    }
+
                     LazyColumn(
+                        state = listState,
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth(),
@@ -3722,6 +3942,9 @@ fun SettingsScreen(
         }
     }
 
+    var tab by remember { mutableStateOf(0) }
+    val tabTitles = listOf("通用", "模型", "插件", "关于")
+
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = cs.background,
@@ -3732,7 +3955,6 @@ fun SettingsScreen(
                 .fillMaxSize()
                 // ★ App 开了 enableEdgeToEdge()，不补这个内边距，
                 //   顶栏会钻到状态栏底下，和信号/电量图标叠在一起。
-                //   （聊天主界面由 Scaffold 自动处理，设置页是自己画的，得手动补）
                 .statusBarsPadding()
                 .navigationBarsPadding()
         ) {
@@ -3755,112 +3977,466 @@ fun SettingsScreen(
                 )
             }
 
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
+            // ---------- 顶部 Tab ----------
+            TabRow(
+                selectedTabIndex = tab,
+                containerColor = Color.Transparent,
+                contentColor = cs.onSurface
             ) {
-                // ---------- 运行 ----------
-                item { SectionHeader("运行") }
-                item { InfoRow("模型", MODEL_NAME) }
-                item { InfoRow("接口", API_URL) }
-                item { InfoRow("批处理", "${FLUSH_INTERVAL_MS}ms") }
-                item { InfoRow("上下文", "最近 $MAX_HISTORY_MESSAGES 条") }
-
-                // ---------- 工作区 ----------
-                item { SectionHeader("工作区") }
-                item {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(6.dp))
-                            // 点一下弹系统的「选择目录」，选完自动转成绝对路径并保存
-                            .clickable { folderPicker.launch(null) }
-                            .padding(vertical = 8.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                tabTitles.forEachIndexed { index, title ->
+                    Tab(
+                        selected = tab == index,
+                        onClick = { tab = index },
+                        text = {
                             Text(
-                                text = "工作区设置",
+                                text = title,
                                 fontFamily = FontFamily.Monospace,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = cs.onSurface,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Text(
-                                text = if (workspace.isBlank()) "选择目录" else "点击更换",
-                                fontFamily = FontFamily.Monospace,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = cs.onSurfaceVariant
+                                style = MaterialTheme.typography.labelLarge
                             )
                         }
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            text = workspace.ifBlank { "未设置（不限制路径）" },
-                            fontFamily = FontFamily.Monospace,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (workspace.isBlank()) {
-                                cs.onSurfaceVariant
-                            } else {
-                                Color(0xFF3FB950)
-                            }
-                        )
-                    }
-                }
-
-                // ---------- 权限 ----------
-                item { SectionHeader("权限") }
-                item {
-                    val storageOk = hasAllFilesAccess(context)
-                    PermissionRow(
-                        label = "文件权限",
-                        status = if (storageOk) "已开启" else "未开启",
-                        ok = storageOk,
-                        onClick = { openAllFilesAccessSettings(context) }
                     )
-                }
-                item {
-                    val running = isShizukuRunning()
-                    PermissionRow(
-                        label = "Shizuku",
-                        status = when {
-                            !running -> "服务未运行"
-                            shizukuGranted -> "已授权"
-                            else -> "点此授权"
-                        },
-                        ok = shizukuGranted,
-                        onClick = {
-                            // 已授权 → 重新绑一次（可能是冷启动没连上）
-                            // 未授权 → 弹 Shizuku 的授权对话框
-                            if (isShizukuGranted()) {
-                                bindShizukuUserService(context)
-                            } else {
-                                requestShizukuPermission()
-                            }
-                        }
-                    )
-                }
-
-                // ---------- 关于 ----------
-                item { SectionHeader("关于") }
-                item {
-                    // ★ 版本号来自 BuildConfig.BUILD_VERSION_NAME，
-                    //   由 build.gradle.kts 在【编译时】按「0.yyMMddHHmm」生成。
-                    //   每次构建都会变，不需要手动改。
-                    Text(
-                        text = "当前版本：${BuildConfig.BUILD_VERSION_NAME}",
-                        fontFamily = FontFamily.Monospace,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = cs.onSurface,
-                        modifier = Modifier.padding(vertical = 8.dp)
-                    )
-                }
-                item {
-                    InfoRow("工具", "list_dir / search_files / read_file / run_shell")
-                }
-                item {
-                    InfoRow("数据", "Room v3 本地数据库")
                 }
             }
+
+            // ---------- 内容 ----------
+            when (tab) {
+                0 -> GeneralTab(
+                    context = context,
+                    workspace = workspace,
+                    shizukuGranted = shizukuGranted,
+                    onPickWorkspace = { folderPicker.launch(null) }
+                )
+                1 -> ModelTab()
+                2 -> PluginsTab()
+                else -> AboutTab()
+            }
+        }
+    }
+}
+
+/** 通用：外观、字号、卡片默认展开、工作区、权限 */
+@Composable
+private fun GeneralTab(
+    context: Context,
+    workspace: String,
+    shizukuGranted: Boolean,
+    onPickWorkspace: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
+    ) {
+        item { SectionHeader("外观") }
+        item {
+            ChoiceRow(
+                label = "主题",
+                options = listOf(
+                    "system" to "跟随系统",
+                    "light" to "浅色",
+                    "dark" to "深色"
+                ),
+                selected = AppSettings.themeMode,
+                onSelect = { setThemeMode(context, it) }
+            )
+        }
+        item {
+            ChoiceRow(
+                label = "字号",
+                options = listOf("0.9" to "小", "1.0" to "标准", "1.15" to "大"),
+                selected = AppSettings.fontScale.toString(),
+                onSelect = { setFontScale(context, it.toFloat()) }
+            )
+        }
+
+        item { SectionHeader("工具卡片") }
+        item {
+            SettingSwitchRow(
+                label = "默认展开",
+                desc = "新出现的工具调用卡片自动展开参数与结果",
+                checked = AppSettings.cardExpanded,
+                onChange = { setCardExpanded(context, it) }
+            )
+        }
+
+        item { SectionHeader("工作区") }
+        item {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(6.dp))
+                    // 点一下弹系统的「选择目录」，选完自动转成绝对路径并保存
+                    .clickable(onClick = onPickWorkspace)
+                    .padding(vertical = 8.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "工作区设置",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = if (workspace.isBlank()) "选择目录" else "点击更换",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = workspace.ifBlank { "未设置（不限制路径）" },
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (workspace.isBlank()) cs.onSurfaceVariant else Color(0xFF3FB950)
+                )
+            }
+        }
+
+        item { SectionHeader("权限") }
+        item {
+            val storageOk = hasAllFilesAccess(context)
+            PermissionRow(
+                label = "文件权限",
+                status = if (storageOk) "已开启" else "未开启",
+                ok = storageOk,
+                onClick = { openAllFilesAccessSettings(context) }
+            )
+        }
+        item {
+            val running = isShizukuRunning()
+            PermissionRow(
+                label = "Shizuku",
+                status = when {
+                    !running -> "服务未运行"
+                    shizukuGranted -> "已授权"
+                    else -> "点此授权"
+                },
+                ok = shizukuGranted,
+                onClick = {
+                    // 已授权 → 重新绑一次（可能是冷启动没连上）
+                    // 未授权 → 弹 Shizuku 的授权对话框
+                    if (isShizukuGranted()) {
+                        bindShizukuUserService(context)
+                    } else {
+                        requestShizukuPermission()
+                    }
+                }
+            )
+        }
+    }
+}
+
+/** 模型：接口、运行时参数、计费口径 */
+@Composable
+private fun ModelTab() {
+    val cs = MaterialTheme.colorScheme
+    val keyConfigured = BuildConfig.DEEPSEEK_API_KEY.isNotBlank()
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
+    ) {
+        item { SectionHeader("接口") }
+        item { InfoRow("模型", MODEL_NAME) }
+        item { InfoRow("地址", API_URL) }
+        item {
+            InfoRow(
+                "Key",
+                // 不显示任何一位 Key —— 截图、录屏时不会意外泄露
+                if (keyConfigured) "已配置" else "未配置，检查 local.properties"
+            )
+        }
+
+        item { SectionHeader("运行时") }
+        item { InfoRow("批处理", "${FLUSH_INTERVAL_MS}ms") }
+        item {
+            // 1_000_000 显示成「1M」比「1000K」好读
+            val ctxLabel = if (CONTEXT_WINDOW_TOKENS >= 1_000_000) {
+                "${CONTEXT_WINDOW_TOKENS / 1_000_000}M tokens"
+            } else {
+                "${CONTEXT_WINDOW_TOKENS / 1000}K tokens"
+            }
+            InfoRow("上下文", ctxLabel)
+        }
+        item { InfoRow("历史", "最近 $MAX_HISTORY_MESSAGES 条") }
+        item { InfoRow("轮次上限", "$MAX_TOOL_ROUNDS 轮") }
+
+        item { SectionHeader("计费口径") }
+        item {
+            Text(
+                text = "费用按 DeepSeek 官方峰谷单价估算，不是账单。\n" +
+                    "高峰时段：北京时间周一至周五 09:00–12:00、14:00–18:00（法定节假日除外）。\n" +
+                    "节假日无法在客户端判断，那几天会按高峰价算，偏高。",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+            )
+        }
+    }
+}
+
+/** 插件：六个工具的开关 */
+@Composable
+private fun PluginsTab() {
+    val cs = MaterialTheme.colorScheme
+    val context = LocalContext.current
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        item {
+            Text(
+                text = "关掉的工具不会出现在请求里，也不会写进系统提示词。\n" +
+                    "改动在下一轮对话生效，不需要重启。",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(top = 14.dp, bottom = 6.dp, start = 4.dp, end = 4.dp)
+            )
+        }
+
+        itemsIndexed(ALL_TOOL_NAMES) { _, name ->
+            val checked = name in AppSettings.enabledTools
+            ToolSwitchCard(
+                name = name,
+                desc = TOOL_DESCRIPTIONS[name] ?: "",
+                checked = checked,
+                onChange = { setToolEnabled(context, name, it) }
+            )
+        }
+
+        item {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "已开启 ${AppSettings.enabledTools.size} / ${ALL_TOOL_NAMES.size}" +
+                    if (AppSettings.enabledTools.isEmpty()) {
+                        "　—— 全部关闭时模型不会收到任何工具，只能纯聊天"
+                    } else "",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp)
+            )
+        }
+    }
+}
+
+/** 关于 */
+@Composable
+private fun AboutTab() {
+    val cs = MaterialTheme.colorScheme
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
+    ) {
+        item { SectionHeader("版本") }
+        item {
+            // ★ 版本号来自 BuildConfig.BUILD_VERSION_NAME，
+            //   由 build.gradle.kts 在【编译时】按「0.yyMMddHHmm」生成。
+            //   每次构建都会变，不需要手动改。
+            Text(
+                text = "当前版本：${BuildConfig.BUILD_VERSION_NAME}",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodyMedium,
+                color = cs.onSurface,
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+        }
+
+        item { SectionHeader("组成") }
+        item { InfoRow("界面", "Jetpack Compose + Material 3") }
+        item { InfoRow("网络", "OkHttp 4.12（手写 SSE 解析）") }
+        item { InfoRow("数据", "Room v3 本地数据库") }
+        item { InfoRow("提权", "Shizuku 13（AIDL UserService）") }
+        item { InfoRow("工具", "${ALL_TOOL_NAMES.size} 个本地工具，见「插件」页") }
+
+        item { SectionHeader("说明") }
+        item {
+            Text(
+                text = "CoolStream 是个人项目，不是产品。\n" +
+                    "API Key 存在本机的 local.properties 里，没有服务端代理，\n" +
+                    "所以这个 APK 只适合自己用，不要分发给别人。",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+            )
+        }
+    }
+}
+
+/**
+ * 一行「几个选项选一个」的分段控件。
+ *
+ * 没用 Material 的 SegmentedButton —— 那个在窄屏上会挤成一团，
+ * 这里用等宽排 + 玻璃描边，和整体极客风更连贯。
+ */
+@Composable
+private fun ChoiceRow(
+    label: String,
+    options: List<Pair<String, String>>,
+    selected: String,
+    onSelect: (String) -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+    ) {
+        Text(
+            text = label,
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall,
+            color = cs.onSurface
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            options.forEach { (id, text) ->
+                val on = id == selected
+                Surface(
+                    color = if (on) cs.primary.copy(alpha = 0.16f) else Color.Transparent,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        if (on) cs.primary.copy(alpha = 0.55f) else glassEdge()
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onSelect(id) }
+                ) {
+                    Text(
+                        text = text,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (on) cs.primary else cs.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 9.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 带开关的一行（现在只有「默认展开」用，但插件卡片另有自己的样式） */
+@Composable
+private fun SettingSwitchRow(
+    label: String,
+    desc: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = label,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurface
+            )
+            if (desc.isNotEmpty()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = desc,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = cs.onSurfaceVariant
+                )
+            }
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color(0xFF0D1117),
+                checkedTrackColor = Color(0xFF3FB950)
+            )
+        )
+    }
+}
+
+/**
+ * 插件页里的一张小卡片：图标 + 工具名 + 说明 + 开关。
+ *
+ * 图标复用工具卡片那套 toolVisual()，让「设置里关的是哪个」和
+ * 「聊天里出现的是哪个」能对上号。
+ */
+@Composable
+private fun ToolSwitchCard(
+    name: String,
+    desc: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val visual = toolVisual(name)
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = glassFill(),
+        border = BorderStroke(1.dp, glassEdge()),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = visual.icon,
+                contentDescription = null,
+                // 关掉之后图标跟着变灰，不用看开关也知道状态
+                tint = if (checked) visual.tint else cs.onSurfaceVariant.copy(alpha = 0.35f),
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = name,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (checked) cs.onSurface else cs.onSurfaceVariant
+                )
+                if (desc.isNotEmpty()) {
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = desc,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = cs.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Switch(
+                checked = checked,
+                onCheckedChange = onChange,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Color(0xFF0D1117),
+                    checkedTrackColor = Color(0xFF3FB950)
+                )
+            )
         }
     }
 }
@@ -4427,8 +5003,8 @@ private fun ToolCallCard(
 ) {
     val cs = MaterialTheme.colorScheme
 
-    // 折叠 / 展开。默认折叠，只占一行。
-    var expanded by remember { mutableStateOf(false) }
+    // 折叠 / 展开。默认值来自设置页的「工具卡片默认展开」
+    var expanded by remember { mutableStateOf(AppSettings.cardExpanded) }
 
     // 解析结果按 content 缓存，重组时不重复解析
     val view = remember(message.content) { parseToolCall(message.content) }
