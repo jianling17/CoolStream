@@ -4248,13 +4248,109 @@ private fun CodeBlock(code: String) {
 // 不用再加 toolName / toolArgs 两列（少一次迁移）。
 // ============================================================
 
-/** 卡片要显示的三样东西 */
+/** 卡片要显示的三样东西（外加一个可选的 diff） */
 private data class ToolCallView(
     val name: String,
     val argsText: String,
     val ok: Boolean?,   // null = 还在执行
-    val output: String
+    val output: String,
+    val diff: List<DiffRow> = emptyList()
 )
+
+/** diff 里一行属于哪一类 */
+private enum class DiffType { CONTEXT, DELETE, ADD }
+
+/** diff 视图的一行 */
+private data class DiffRow(val type: DiffType, val text: String)
+
+/**
+ * 行级 diff（LCS，最长公共子序列）。
+ *
+ * ★ 为什么在 UI 层算，而不是让工具把 diff 存下来：
+ *   工具卡片的 content 里已经存了 arguments，而 replace_in_file 的 arguments 就是
+ *   search（改之前）和 replace（改之后）这两段原文 —— diff 需要的数据本来就在手边。
+ *   存一份 diff 等于把同一份信息写两遍，还要改持久化格式（多一次迁移风险）。
+ *   所以这里纯计算，不碰任何存储结构。
+ *
+ * ★ 限制：
+ *   LCS 是 O(n×m)，两段都是 60 行时约 3600 次比较，可以忽略；
+ *   但模型真塞进来两段几百行的文本时会吃掉几 MB 内存，所以超过阈值就退化成
+ *   「整段红 + 整段绿」，视觉效果差一点但不至于卡死。
+ */
+private fun diffLines(
+    before: String,
+    after: String,
+    maxLinesEach: Int = 200,
+    maxRows: Int = 120
+): List<DiffRow> {
+    val a = before.split('\n')
+    val b = after.split('\n')
+
+    // 退化路径：太长就不做 LCS
+    if (a.size > maxLinesEach || b.size > maxLinesEach) {
+        val fallback = ArrayList<DiffRow>(a.size + b.size)
+        a.forEach { fallback.add(DiffRow(DiffType.DELETE, it)) }
+        b.forEach { fallback.add(DiffRow(DiffType.ADD, it)) }
+        return fallback.take(maxRows)
+    }
+
+    val n = a.size
+    val m = b.size
+    // dp[i][j] = a[i..] 与 b[j..] 的 LCS 长度
+    val dp = Array(n + 1) { IntArray(m + 1) }
+    for (i in n - 1 downTo 0) {
+        for (j in m - 1 downTo 0) {
+            dp[i][j] = if (a[i] == b[j]) {
+                dp[i + 1][j + 1] + 1
+            } else {
+                maxOf(dp[i + 1][j], dp[i][j + 1])
+            }
+        }
+    }
+
+    val rows = ArrayList<DiffRow>(n + m)
+    var i = 0
+    var j = 0
+    while (i < n && j < m) {
+        when {
+            a[i] == b[j] -> {
+                rows.add(DiffRow(DiffType.CONTEXT, a[i]))
+                i++
+                j++
+            }
+            // 相等时优先走「删除」，让红色排在绿色前面，读起来更自然
+            dp[i + 1][j] >= dp[i][j + 1] -> {
+                rows.add(DiffRow(DiffType.DELETE, a[i]))
+                i++
+            }
+            else -> {
+                rows.add(DiffRow(DiffType.ADD, b[j]))
+                j++
+            }
+        }
+    }
+    while (i < n) {
+        rows.add(DiffRow(DiffType.DELETE, a[i]))
+        i++
+    }
+    while (j < m) {
+        rows.add(DiffRow(DiffType.ADD, b[j]))
+        j++
+    }
+
+    // 模型常把整个函数塞进 search，首尾会带一长串根本没变的行。
+    // 全留着卡片会变得又长又没重点，所以每侧只保留紧挨改动的那 1 行做上下文。
+    var from = 0
+    while (from < rows.size && rows[from].type == DiffType.CONTEXT) from++
+    from = maxOf(0, from - 1)
+
+    var to = rows.size
+    while (to > 0 && rows[to - 1].type == DiffType.CONTEXT) to--
+    to = minOf(rows.size, to + 1)
+
+    if (from >= to) return rows.take(maxRows)   // 理论上不会走到（search != replace）
+    return rows.subList(from, to).take(maxRows)
+}
 
 /** 从 content 里解析出「工具名 + 美化后的参数 + 执行结果」 */
 private fun parseToolCall(content: String): ToolCallView {
@@ -4277,7 +4373,17 @@ private fun parseToolCall(content: String): ToolCallView {
             else -> null                              // JSON null = 还在执行
         }
 
-        ToolCallView(name, argsText, ok, (root.opt("output") as? String) ?: "")
+        // ★ 只在「改成功了」的时候算 diff：
+        //   失败时文件一个字都没变，画个红红绿绿的差异图只会误导。
+        val diff = if (ok == true && name == "replace_in_file" && argsNode is JSONObject) {
+            val search = (argsNode.opt("search") as? String).orEmpty()
+            val replace = (argsNode.opt("replace") as? String).orEmpty()
+            if (search.isNotEmpty() && search != replace) diffLines(search, replace) else emptyList()
+        } else {
+            emptyList()
+        }
+
+        ToolCallView(name, argsText, ok, (root.opt("output") as? String) ?: "", diff)
     } catch (e: Exception) {
         // 不是合法 JSON 就原样显示，绝不让界面崩
         ToolCallView("unknown", content, null, "")
@@ -4407,6 +4513,37 @@ private fun ToolCallCard(
 
                 CodeSurface(text = view.argsText)
 
+                // ---------- 差异（只有 replace_in_file 成功时才有） ----------
+                if (view.diff.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "差异",
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = cs.onSurfaceVariant
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        val removed = view.diff.count { it.type == DiffType.DELETE }
+                        val added = view.diff.count { it.type == DiffType.ADD }
+                        Text(
+                            text = "−$removed",
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = DiffDelColor
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "+$added",
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = DiffAddColor
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    DiffSurface(rows = view.diff)
+                }
+
                 if (view.output.isNotEmpty()) {
                     Spacer(Modifier.height(10.dp))
                     Text(
@@ -4448,6 +4585,79 @@ private fun CodeSurface(text: String) {
                 .padding(10.dp)
                 .horizontalScroll(rememberScrollState())
         )
+    }
+}
+
+
+/** diff 视图的三种配色。红绿取的是 GitHub 深色主题的调子，和代码块的底色是一套 */
+private val DiffDelColor = Color(0xFFF85149)
+private val DiffAddColor = Color(0xFF3FB950)
+private val DiffDelBackground = DiffDelColor.copy(alpha = 0.15f)
+private val DiffAddBackground = DiffAddColor.copy(alpha = 0.15f)
+
+/**
+ * 极简 diff 视图：一行一条，前面带 - / + / 空格 的前缀。
+ *
+ * 刻意保持和 CodeSurface 一样的深色底 + 等宽字体，让它在毛玻璃卡片里
+ * 看起来像同一套东西，而不是突然插进来的一个控件。
+ *
+ * 没有用横向滚动：手机屏幕窄，代码行一横滚就看不到行首缩进，
+ * diff 反而更难读。这里让长行自己折行，行号和背景跟着一起折。
+ */
+@Composable
+private fun DiffSurface(rows: List<DiffRow>) {
+    Surface(
+        color = CodeBlockBackground,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, CodeBlockBorder),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+        ) {
+            rows.forEach { row ->
+                val bg = when (row.type) {
+                    DiffType.DELETE -> DiffDelBackground
+                    DiffType.ADD -> DiffAddBackground
+                    DiffType.CONTEXT -> Color.Transparent
+                }
+                val sign = when (row.type) {
+                    DiffType.DELETE -> "-"
+                    DiffType.ADD -> "+"
+                    DiffType.CONTEXT -> " "
+                }
+                val signColor = when (row.type) {
+                    DiffType.DELETE -> DiffDelColor
+                    DiffType.ADD -> DiffAddColor
+                    DiffType.CONTEXT -> CodeBlockText.copy(alpha = 0.35f)
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(bg)
+                        .padding(start = 8.dp, end = 8.dp, top = 1.dp, bottom = 1.dp)
+                ) {
+                    Text(
+                        text = sign,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = signColor,
+                        modifier = Modifier.width(12.dp)
+                    )
+                    Text(
+                        // 空行也要占一行高度，不然 diff 的行会挤在一起
+                        text = row.text.ifEmpty { " " },
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CodeBlockText,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
     }
 }
 

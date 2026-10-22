@@ -683,6 +683,40 @@ Result: `greet` → `Hi`, `greetAgain` untouched, `greet.kt.bak` holding the ori
 
 ---
 
+### 3.13 A red/green diff view for `replace_in_file`
+
+The tool card used to answer "what changed?" with a sentence: *"已修改 …（第 7 行，替换 1 处）"*. You had to take its word for it. Now, when a `replace_in_file` succeeds, expanding the card shows the actual change.
+
+**Where the data comes from — and why not from the tool.** The obvious design is "let the tool compute a diff and store it in the card". That means a new field in the persisted JSON, which means touching the message schema, which means a migration for a purely visual feature. It is also unnecessary: the card already stores `arguments`, and for this tool `arguments` **is** the before/after pair — `search` is the old text, `replace` is the new one. So the diff is computed in the UI layer from data that was already on disk.
+
+There is a second reason: after a successful write, the original text no longer exists on the device. `.bak` isn't reliable (only written for files ≤ 1 MB, and overwritten by the next edit). Reconstructing "before" later is impossible; deriving it from the arguments is exact.
+
+**Line-level LCS.** Same textbook algorithm as any diff tool — `dp[i][j] = LCS(a[i..], b[j..])`, walk back emitting context / delete / add. Two guards, because the input is model-controlled:
+
+| Guard | Why |
+|---|---|
+| Either side > 200 lines → skip LCS, emit all-red + all-green | `O(n×m)` allocates `n×m` ints; 500×500 is 1 MB of scratch per card |
+| More than 120 rows → truncate | A card taller than the screen has stopped being a card |
+
+Then trim to **one context line on each side**. Models routinely put a whole function into `search` (our prompt asks them to), so without trimming the diff opens with fifteen grey lines before anything happens.
+
+**Only when the call succeeded.** `ok == true` is a hard requirement: a refused or failed replace changes zero bytes, and drawing a red/green diff for it would be a lie that looks like evidence.
+
+**Visual.** Same `CodeBlockBackground` / monospace as the neighbouring code surfaces, so it reads as part of the card rather than a widget dropped into it. Delete rows use `#F85149` at 15 % alpha, add rows `#3FB950` at 15 %, context rows no fill at all. No horizontal scroll — on a phone, scrolling sideways to read code loses the indentation, so long lines wrap instead and the row background wraps with them.
+
+**It immediately paid for itself.** First real run, the model wrote `debug=f` instead of `debug=false`. The diff made that obvious at a glance:
+
+```
+  port=8080        ← context
+- debug=true       ← red
++ debug=f          ← green
+  timeout=30       ← context
+```
+
+The model spotted and flagged its own mistake afterwards, but the card had already shown it.
+
+---
+
 ## 4. Environment & Build (the most time-consuming section)
 
 ### ⚠️ Auto timestamp versioning: two traps
@@ -839,6 +873,7 @@ The proxy is up, but its upstream for **one specific host** (`github.com`) is br
 - [x] First unit-test suite (16 JVM cases) — caught a hardcoded `/` in the workspace check
 - [x] `MAX_TOOL_ROUNDS` 5 → 8 so 4-step chains (search → read → edit → verify) fit with margin
 - [x] Per-tool icons on the tool card (wrench / green pencil / list / magnifier / play)
+- [x] Red/green diff view inside successful `replace_in_file` cards (LCS, computed in the UI layer)
 
 ### Summary
 
@@ -1612,6 +1647,55 @@ read_file(greet.kt)          ← 自己复查改完的结果
 
 ---
 
+### 3.13 `replace_in_file` 的红绿 diff 视图
+
+以前工具卡片回答「改了什么」只有一句话：「已修改 …（第 7 行，替换 1 处）」——
+你只能信它。现在 `replace_in_file` 成功之后展开卡片，能看到真正改了什么。
+
+**数据从哪来——以及为什么不从工具里来。** 最直觉的做法是「让工具算好 diff 存进卡片」。
+那意味着持久化 JSON 多一个字段、消息结构要动、为一个纯视觉功能做一次迁移。
+而且完全没必要：卡片本来就存着 `arguments`，而这个工具的 `arguments`
+**本身就是改前/改后这一对**——`search` 是旧文本，`replace` 是新文本。
+所以 diff 在 UI 层算，用的是早就已经躺在磁盘上的数据。
+
+还有一个更硬的理由：写成功之后，原文在设备上已经不存在了。
+`.bak` 靠不住（只对 ≤1MB 的文件写，而且下次编辑就被覆盖）。
+事后想还原「改之前」是不可能的；从参数推导才是精确的。
+
+**行级 LCS。** 和所有 diff 工具一样的老算法：`dp[i][j] = LCS(a[i..], b[j..])`，
+回溯着输出「上下文 / 删除 / 新增」。两道保险，因为输入是模型给的：
+
+| 保险 | 为什么 |
+|---|---|
+| 任一侧 > 200 行 → 不做 LCS，直接整段红 + 整段绿 | `O(n×m)` 要分配 `n×m` 个 int；500×500 一张卡片就要 1MB 临时内存 |
+| 超过 120 行 → 截断 | 比屏幕还长的卡片已经不叫卡片了 |
+
+然后首尾各裁到**只留 1 行上下文**。模型经常把整个函数塞进 `search`（我们的提示词还鼓励它这么做），
+不裁的话 diff 一展开就是十几行灰色，正事被埋在底下。
+
+**只在成功时显示。** `ok == true` 是硬条件：被拒绝或失败的替换一个字节都没改，
+给它画一张红红绿绿的差异图，等于伪造一份看起来很可信的证据。
+
+**视觉。** 和旁边的代码块共用同一套 `CodeBlockBackground` + 等宽字体，
+读起来是卡片的一部分，而不是突然插进来的控件。
+删除行用 `#F85149` 15% 透明度铺底，新增行 `#3FB950` 15%，上下文行不铺底。
+没有横向滚动——手机上为了看一行的尾巴去横滑，缩进就丢了；
+所以长行自己折行，背景跟着一起折。
+
+**它第一次上线就赚回了成本。** 真机第一轮，模型把 `debug=false` 写成了 `debug=f`。
+diff 一眼就把它照出来了：
+
+```
+  port=8080        ← 上下文
+- debug=true       ← 红
++ debug=f          ← 绿
+  timeout=30       ← 上下文
+```
+
+模型事后自己也发现并说明了这个笔误，但卡片早就把它摆在脸上了。
+
+---
+
 ## 4. 环境与构建（这一节的坑最耗时间）
 
 ### ⚠️ 模拟器 UI 自动化：键盘会把弹窗顶飞
@@ -1773,6 +1857,7 @@ fatal: unable to access 'https://github.com/...': CONNECT tunnel failed, respons
 - [x] 第一套单元测试（16 条 JVM 用例）——抓出工作区判断里写死的 `/`
 - [x] `MAX_TOOL_ROUNDS` 5 → 8，让「搜索 → 读取 → 修改 → 复查」这类四步链有余量
 - [x] 工具卡片按工具类型换图标（扳手 / 绿色钢笔 / 列表 / 放大镜 / 播放键）
+- [x] `replace_in_file` 成功的卡片里显示红绿 diff（LCS，纯 UI 层计算）
 
 ### 总结
 
