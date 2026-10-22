@@ -107,4 +107,10 @@
     <string name="section_version">版本</string>
     <string name="section_stack">组成</string>
     <string name="section_notes">说明</string>
+    <string name="input_attach">添加附件</string>
+    <string name="attach_remove">移除</string>
+    <string name="action_send">发送</string>
+    <string name="sheet_title">添加附件</string>
+    <string name="sheet_image">上传图片</string>
+    <string name="sheet_file">上传文件</string>
 </resources>

@@ -107,4 +107,10 @@
     <string name="section_version">Version</string>
     <string name="section_stack">Built with</string>
     <string name="section_notes">Notes</string>
+    <string name="input_attach">Add attachment</string>
+    <string name="attach_remove">Remove</string>
+    <string name="action_send">Send</string>
+    <string name="sheet_title">Add attachment</string>
+    <string name="sheet_image">Upload image</string>
+    <string name="sheet_file">Upload file</string>
 </resources>

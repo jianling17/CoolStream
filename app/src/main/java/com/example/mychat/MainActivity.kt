@@ -22,6 +22,7 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -98,6 +99,7 @@ import java.net.UnknownHostException
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import android.content.Context
+import android.provider.OpenableColumns
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
@@ -139,6 +141,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Menu
@@ -152,6 +155,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
@@ -3493,6 +3498,55 @@ fun ChatScreen() {
                     }
                 }
 
+                val ctx = LocalContext.current
+                var attachments by remember { mutableStateOf<List<Attachment>>(emptyList()) }
+                var showAttachSheet by remember { mutableStateOf(false) }
+
+                // 系统相册（Android 13+ 走照片选择器，不需要读存储权限）
+                val imagePicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.PickVisualMedia()
+                ) { uri ->
+                    if (uri != null) {
+                        attachments = attachments + Attachment(
+                            uri = uri,
+                            name = displayNameOf(ctx, uri),
+                            isImage = true
+                        )
+                        Log.d(TAG, "选择图片: $uri")
+                    }
+                }
+
+                // 系统文件管理器，不限 MIME 类型
+                val filePicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocument()
+                ) { uri ->
+                    if (uri != null) {
+                        attachments = attachments + Attachment(
+                            uri = uri,
+                            name = displayNameOf(ctx, uri),
+                            isImage = false
+                        )
+                        Log.d(TAG, "选择文件: $uri")
+                    }
+                }
+
+                // ---------- 附件选择弹层 ----------
+                if (showAttachSheet) {
+                    AttachmentSheet(
+                        onDismiss = { showAttachSheet = false },
+                        onPickImage = {
+                            showAttachSheet = false
+                            imagePicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        onPickFile = {
+                            showAttachSheet = false
+                            filePicker.launch(arrayOf("*/*"))
+                        }
+                    )
+                }
+
                 // ---------- 底部：InfoBar（本轮费用 + 上下文用量） ----------
                 if (lastUsage.totalTokens > 0) {
                     InfoBar(usage = lastUsage, isStreaming = isStreaming)
@@ -3503,14 +3557,26 @@ fun ChatScreen() {
                     text = inputText,
                     enabled = !isStreaming,        // ★ 发送中禁止再发，防止重复请求
                     isStreaming = isStreaming,
+                    attachments = attachments,
                     onTextChange = { inputText = it },
+                    onAttachClick = { showAttachSheet = true },
+                    onRemoveAttachment = { index ->
+                        attachments = attachments.filterIndexed { i, _ -> i != index }
+                    },
                     onSend = {
-                        val trimmed = inputText.trim()
+                        // 附件只记文件名，真正的文件内容还没接入请求
+                        val attachNote = if (attachments.isEmpty()) {
+                            ""
+                        } else {
+                            "\n\n📎 附件：" + attachments.joinToString("、") { it.name }
+                        }
+                        val trimmed = (inputText.trim() + attachNote).trim()
 
                         // 空消息不发；正在流式回复时也不发
                         if (trimmed.isNotEmpty() && !isStreaming) {
 
                             inputText = ""
+                            attachments = emptyList()
                             isStreaming = true
 
                             // ★ 先把这一刻的会话 id 钉住。后面所有回调都认它，
@@ -6192,12 +6258,52 @@ fun InfoBar(usage: UsageStats, isStreaming: Boolean) {
 // ============================================================
 // 7. 底部输入区
 // ============================================================
+/** 输入区里挂着的附件。uri 是 content://，真正读取时才解析 */
+data class Attachment(val uri: Uri, val name: String, val isImage: Boolean)
+
+/** 从 content:// 取出文件名；取不到就退回路径末段 */
+private fun displayNameOf(context: Context, uri: Uri): String {
+    val fallback = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: "file"
+    return try {
+        context.contentResolver
+            .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) c.getString(idx)?.takeIf { it.isNotBlank() } ?: fallback else fallback
+                } else fallback
+            } ?: fallback
+    } catch (e: Exception) {
+        Log.e(TAG, "读取文件名失败: $uri", e)
+        fallback
+    }
+}
+
+/**
+ * 底部输入区。
+ *
+ * 结构（严格按这个嵌套来）：
+ *   Column
+ *     ├─ 附件 Chip 行（有附件时才出现，贴在胶囊正上方）
+ *     └─ Surface（毛玻璃胶囊）
+ *          └─ Row
+ *               ├─ IconButton(+)   ← 最左，独立按钮，40dp 全是热区
+ *               ├─ BasicTextField  ← weight(1f)，占满中间
+ *               └─ 发送/停止按钮   ← 最右
+ *
+ * ★ + 号刻意不放进 BasicTextField 的 leadingIcon：
+ *   leadingIcon 会被算进输入框内部，点击热区只有图标本身那么大，
+ *   而且文字起点会被它顶开、光标位置也跟着变。独立成一个 IconButton 更宽松。
+ */
 @Composable
 fun InputBar(
     text: String,
     enabled: Boolean,
     isStreaming: Boolean,
+    attachments: List<Attachment>,
     onTextChange: (String) -> Unit,
+    onAttachClick: () -> Unit,
+    onRemoveAttachment: (Int) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier
@@ -6205,91 +6311,231 @@ fun InputBar(
     val cs = MaterialTheme.colorScheme
     val canSend = text.isNotBlank() && enabled
 
-    // 悬浮毛玻璃胶囊：半透明深灰底 + 半透明白色高光边框 + 微弱漫反射阴影
-    Surface(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 14.dp, vertical = 10.dp),
-        shape = RoundedCornerShape(30.dp),
-        color = glassFill(),
-        border = BorderStroke(1.dp, glassEdge()),
-        shadowElevation = 8.dp,
-        tonalElevation = 0.dp
-    ) {
-        Row(
-            modifier = Modifier.padding(start = 18.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            // 内部只留文字。
-            // 不用 OutlinedTextField 是因为它自带边框，会和外面这层 Surface 形成双重描边。
-            BasicTextField(
-                value = text,
-                onValueChange = onTextChange,
+    Column(modifier = modifier.fillMaxWidth()) {
+        // ---------- 附件：胶囊正上方 ----------
+        if (attachments.isNotEmpty()) {
+            Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .padding(vertical = 6.dp),
-                enabled = enabled,
-                textStyle = MaterialTheme.typography.bodyMedium.copy(
-                    fontFamily = FontFamily.Monospace,
-                    color = cs.onSurface
-                ),
-                cursorBrush = SolidColor(cs.primary),
-                // 自适应高度：1 行起步，最多 4 行，超过就框内滚动
-                maxLines = 4,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = { if (canSend) onSend() }),
-                decorationBox = { innerTextField ->
-                    Box {
-                        if (text.isEmpty()) {
-                            Text(
-                                text = stringResource(R.string.input_hint),
-                                fontFamily = FontFamily.Monospace,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = cs.onSurfaceVariant
-                            )
-                        }
-                        innerTextField()
-                    }
-                }
-            )
-
-            if (isStreaming) {
-                // ★ 流式输出中：发送按钮变成「停止」——正圆底 + 正中间的方块
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(CircleShape)
-                        .background(cs.primary)
-                        .clickable { onStop() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(12.dp)
-                            .clip(RoundedCornerShape(2.dp))
-                            .background(cs.onPrimary)
-                    )
-                }
-            } else {
-                // 正圆形发送按钮
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(CircleShape)
-                        .background(if (canSend) cs.primary else cs.outline)
-                        .clickable(enabled = canSend) { onSend() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "发送",
-                        tint = if (canSend) cs.onPrimary else cs.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp)
-                    )
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 14.dp, bottom = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                attachments.forEachIndexed { index, att ->
+                    AttachmentChip(att = att, onRemove = { onRemoveAttachment(index) })
                 }
             }
         }
+
+        // ---------- 毛玻璃胶囊 ----------
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp)
+                .padding(bottom = 10.dp),
+            shape = RoundedCornerShape(30.dp),
+            color = glassFill(),
+            border = BorderStroke(1.dp, glassEdge()),
+            shadowElevation = 8.dp,
+            tonalElevation = 0.dp
+        ) {
+            Row(
+                // 左边距从 18dp 收到 6dp：+ 号按钮自己占 40dp，
+                // 视觉上文字起点和以前基本一致。
+                modifier = Modifier.padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                IconButton(
+                    onClick = onAttachClick,
+                    enabled = enabled,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Add,
+                        contentDescription = stringResource(R.string.input_attach),
+                        tint = if (enabled) cs.onSurfaceVariant else cs.outline,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+
+                // 内部只留文字。
+                // 不用 OutlinedTextField 是因为它自带边框，会和外面这层 Surface 形成双重描边。
+                BasicTextField(
+                    value = text,
+                    onValueChange = onTextChange,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(vertical = 6.dp),
+                    enabled = enabled,
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                        fontFamily = FontFamily.Monospace,
+                        color = cs.onSurface
+                    ),
+                    cursorBrush = SolidColor(cs.primary),
+                    // 自适应高度：1 行起步，最多 4 行，超过就框内滚动
+                    maxLines = 4,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { if (canSend) onSend() }),
+                    decorationBox = { innerTextField ->
+                        Box {
+                            if (text.isEmpty()) {
+                                Text(
+                                    text = stringResource(R.string.input_hint),
+                                    fontFamily = FontFamily.Monospace,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = cs.onSurfaceVariant
+                                )
+                            }
+                            innerTextField()
+                        }
+                    }
+                )
+
+                if (isStreaming) {
+                    // ★ 流式输出中：发送按钮变成「停止」——正圆底 + 正中间的方块
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(cs.primary)
+                            .clickable { onStop() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(12.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(cs.onPrimary)
+                        )
+                    }
+                } else {
+                    // 正圆形发送按钮
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(if (canSend) cs.primary else cs.outline)
+                            .clickable(enabled = canSend) { onSend() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Send,
+                            contentDescription = stringResource(R.string.action_send),
+                            tint = if (canSend) cs.onPrimary else cs.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 附件小卡片：类型标记 + 文件名 + × 移除 */
+@Composable
+private fun AttachmentChip(att: Attachment, onRemove: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = glassFill(),
+        border = BorderStroke(1.dp, glassEdge()),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 10.dp, end = 2.dp, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = if (att.isImage) "IMG" else "FILE",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.primary
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = att.name,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 130.dp)
+            )
+            IconButton(onClick = onRemove, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = stringResource(R.string.attach_remove),
+                    tint = cs.onSurfaceVariant,
+                    modifier = Modifier.size(14.dp)
+                )
+            }
+        }
+    }
+}
+
+
+/**
+ * 点击 + 号后从底部升起的选择器。
+ *
+ * 只放「从哪拿」这两项，不做权限申请 —— 照片选择器（PickVisualMedia）
+ * 和系统文件管理器（OpenDocument）都是授权动作本身，不需要额外申请读存储权限。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AttachmentSheet(
+    onDismiss: () -> Unit,
+    onPickImage: () -> Unit,
+    onPickFile: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+        containerColor = glassFill(),
+        contentColor = cs.onSurface,
+        dragHandle = null
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 18.dp)
+        ) {
+            Text(
+                text = stringResource(R.string.sheet_title),
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelMedium,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(start = 22.dp, top = 20.dp, bottom = 6.dp)
+            )
+            SheetAction(emoji = "📷", label = stringResource(R.string.sheet_image), onClick = onPickImage)
+            SheetAction(emoji = "📁", label = stringResource(R.string.sheet_file), onClick = onPickFile)
+        }
+    }
+}
+
+/** 弹层里的一行 */
+@Composable
+private fun SheetAction(emoji: String, label: String, onClick: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 22.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(text = emoji, style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.width(14.dp))
+        Text(
+            text = label,
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodyMedium,
+            color = cs.onSurface
+        )
     }
 }
 
