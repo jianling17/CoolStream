@@ -106,6 +106,14 @@ dependencies {
     // OkHttp：流式请求 DeepSeek API
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // ===== Rhino：PTC 预设的 JavaScript 运行时 =====
+    // PTC = Programmatic Tool Calling，模型写一段 JS 在代码里连续调工具。
+    // Android 出厂不带 JS 引擎，Rhino 是唯一的纯 JVM 选择（没有原生库、不用 WebView）。
+    // 用 faendir 的 rhino-android 而不是 org.mozilla:rhino：
+    //   前者为 Android 重新打包过，规避了老机型上 java.lang.invoke 的坑（minSdk=24）。
+    // ⚠️ 代码里必须 optimizationLevel = -1（解释执行），Dalvik 不能吃它生成的字节码。
+    implementation("com.faendir.rhino:rhino-android:1.6.0")
+
     // 加密存储：API Key 不能明文躺在 SharedPreferences 里。
     // 底层是 Android Keystore 里的一把 AES256 主密钥，文件被拷走也解不开。
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
@@ -137,6 +145,12 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     testImplementation(libs.junit)
+    // ★ 单元测试必须用真的 org.json。
+    //   测试跑在 JVM 上，classpath 里那份 org.json 来自 android.jar 的桩实现，
+    //   配合 returnDefaultValues=true，连 JSONObject().put() 都返回 null ——
+    //   于是所有链式 put 全是 NPE，测出来的失败跟代码对不对没关系。
+    //   加上真实现之后测试类路径会优先用这个 jar（Android 运行时不受影响）。
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

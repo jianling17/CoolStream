@@ -40,6 +40,15 @@
     <string name="tab_plugins">插件</string>
     <string name="tab_about">关于</string>
 
+    <string name="section_agent">Agent 模式</string>
+    <string name="label_preset">预设</string>
+    <string name="preset_standard">标准</string>
+    <string name="preset_ptc">PTC</string>
+    <string name="preset_minimal">极简</string>
+    <string name="desc_preset_standard">六个工具逐个交给模型，一次调一个。最稳，出问题好定位。</string>
+    <string name="desc_preset_ptc">只给一个 run_code，模型写 JavaScript 在代码里连续调工具。适合批量处理。</string>
+    <string name="desc_preset_minimal">不挂任何工具，纯对话。省 token，但读不了文件。</string>
+
     <string name="section_appearance">外观</string>
     <string name="label_language">语言</string>
     <string name="lang_system">跟随系统</string>

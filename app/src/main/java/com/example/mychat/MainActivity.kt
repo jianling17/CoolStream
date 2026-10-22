@@ -93,6 +93,17 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.mozilla.javascript.BaseFunction
+import org.mozilla.javascript.ClassShutter
+// ★ 必须起别名：本文件里 Context 已经是 android.content.Context（几十处在用），
+//   直接 import org.mozilla.javascript.Context 会变成「Conflicting import」，
+//   而 KSP 只会报一个莫名其妙的 MissingType，把真正的错误盖住。
+import org.mozilla.javascript.Context as RhinoContext
+import org.mozilla.javascript.ContextFactory
+import org.mozilla.javascript.EvaluatorException
+import org.mozilla.javascript.Scriptable
+import org.mozilla.javascript.ScriptableObject
+import org.mozilla.javascript.Undefined
 import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
@@ -289,36 +300,60 @@ val SYSTEM_PROMPT = """
 """.trim()
 
 /**
- * 实际发给模型的系统提示词 = 静态规则 + 当前工作区约束。
+ * 实际发给模型的系统提示词 = 预设基础提示词 + 当前运行时的约束。
  *
- * 工作区是**运行时**才确定的（用户在设置页里选的），没法写死在 SYSTEM_PROMPT 里，
- * 所以每次请求前拼上去。
+ * 工作区和工具开关都是**运行时**才确定的（用户在设置页里选的），
+ * 没法写死在常量里，所以每次请求前拼上去。
  */
 private fun systemPromptWithWorkspace(): String {
-    val ws = currentWorkspace
-
-    // ★ 工具开关是运行时状态，拼进来让模型知道「哪些工具现在真的能用」。
-    //   只删 tools 数组、不提一句的话，模型会照旧调用已被关掉的工具，
-    //   然后一直收到「未知工具」，白烧好几轮。
     val enabled = ALL_TOOL_NAMES.filter { it in AppSettings.enabledTools }
-    val toolLine = if (enabled.isEmpty()) {
-        "当前可用工具：无（用户在设置里把工具全关了）。你只能凭对话回答，" +
-            "绝不要声称你读过、写过或改过任何文件。"
-    } else {
-        "当前可用工具：${enabled.joinToString("、")}。" +
-            "不在这份清单里的工具已被用户在设置里关闭，不要调用，也不要假装调用过；" +
-            "如果当前任务确实需要某个被关掉的工具，如实告诉用户去「设置 → 插件」里打开它。"
-    }
+    val disabled = ALL_TOOL_NAMES.filter { it !in AppSettings.enabledTools }
+    val wsLine = workspaceRuleLine()
 
-    val wsLine = if (ws.isBlank()) {
+    return when (AppSettings.preset) {
+        // ---------- 极简：一个工具都没有，只留一句工作区说明是多余的，直接返回 ----------
+        AgentPreset.MINIMAL -> MINIMAL_SYSTEM_PROMPT
+
+        // ---------- PTC：只有 run_code，但要告诉它沙箱里哪些函数是关着的 ----------
+        AgentPreset.PTC -> buildString {
+            append(PTC_SYSTEM_PROMPT)
+            append("\n\n补充约束：\n")
+            if (wsLine.isNotEmpty()) append("1. ").append(wsLine).append('\n')
+            if (disabled.isNotEmpty()) {
+                append("2. 用户在设置里关闭了这些工具：").append(disabled.joinToString("、"))
+                    .append("。在代码里调用它们会直接返回 ok=false，不要写进代码，")
+                    .append("确实需要就让用户去「设置 → 插件」里打开。")
+            }
+        }
+
+        // ---------- 标准：原样保留，一个字符都不改 ----------
+        AgentPreset.STANDARD -> {
+            // ★ 工具开关是运行时状态，拼进来让模型知道「哪些工具现在真的能用」。
+            //   只删 tools 数组、不提一句的话，模型会照旧调用已被关掉的工具，
+            //   然后一直收到「未知工具」，白烧好几轮。
+            val toolLine = if (enabled.isEmpty()) {
+                "当前可用工具：无（用户在设置里把工具全关了）。你只能凭对话回答，" +
+                    "绝不要声称你读过、写过或改过任何文件。"
+            } else {
+                "当前可用工具：${enabled.joinToString("、")}。" +
+                    "不在这份清单里的工具已被用户在设置里关闭，不要调用，也不要假装调用过；" +
+                    "如果当前任务确实需要某个被关掉的工具，如实告诉用户去「设置 → 插件」里打开它。"
+            }
+            SYSTEM_PROMPT + "\n\n12. " + toolLine + "\n13. " + wsLine
+        }
+    }
+}
+
+/** 工作区那一条约束。未设置时返回空串（PTC 模式下直接跳过这一条） */
+private fun workspaceRuleLine(): String {
+    val ws = currentWorkspace
+    return if (ws.isBlank()) {
         "用户还没有设置工作区，暂时不限制路径范围。"
     } else {
         "你的工作区是：$ws\n" +
             "    所有工具操作（读文件、写文件、改文件、列目录、搜索、shell）都必须严格限制在这个目录下，严禁越界。\n" +
             "    越界的操作会被代码层直接拦截并返回「工作区越界」，不要换路径反复重试。"
     }
-
-    return SYSTEM_PROMPT + "\n\n12. $toolLine\n13. $wsLine"
 }
 
 /** 日志标签，Logcat 里用 tag:MyChatPerf 过滤 */
@@ -1323,7 +1358,138 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "run_shell" to "通过 Shizuku 执行 shell 命令，权限很高"
 )
 
+// ============================================================
+// 3.24a Agent 预设模式
+//
+// 同一个模型，换一种「工具怎么交给它」的方式，行为差别很大。
+// 三种预设的本质区别只有两件事：**tools 数组里放什么** 和 **系统提示词怎么写**。
+//
+//   standard（标准）
+//     六个工具逐个作为 function 定义发过去，模型一次挑一个调。
+//     最稳、最好调试，出问题一眼能看出是哪一步。
+//
+//   ptc（Programmatic Tool Calling）
+//     只发一个 run_code 工具。模型写一段 JavaScript，在代码里连续调用工具 ——
+//     能循环、能分支、能一次读十个文件再汇总，省掉「一次只能调一个」的往返。
+//     概念对齐 DSH 的 PTC 预设（其原文：「标准模式直接向模型提供各个工具；
+//     PTC 让模型用代码组织工具调用」），只是把它的 TS 运行时换成了 Rhino。
+//
+//   minimal（极简）
+//     一个工具都不发，系统提示词压到最短，纯对话。
+//     用来对比「不挂工具时模型的回答质量」，也方便临时省 token。
+//
+// ⚠️ 预设只改变「怎么把工具交给模型」，不改变工具本身的行为；
+//    每个工具干的活、工作区限制、shell 黑名单，三种模式下完全一致。
+// ============================================================
+enum class AgentPreset(val id: String) {
+    STANDARD("standard"),
+    PTC("ptc"),
+    MINIMAL("minimal");
+
+    companion object {
+        /** 从持久化的字符串还原；认不出来就退回标准模式，绝不让 App 起不来 */
+        fun of(id: String?): AgentPreset =
+            values().firstOrNull { it.id == id } ?: STANDARD
+    }
+}
+
+/**
+ * PTC 模式的 tools 数组 —— 只有一个 run_code。
+ *
+ * ★ description 写这么长是有原因的：模型必须**准确知道** JS 里有哪些函数、
+ *   参数是什么、返回值长什么样，否则会写出一堆调不存在的 API 的代码。
+ *   这本质上是一份塞进 schema 里的 SDK 文档。
+ */
+private val PTC_TOOL_DEFINITION = """
+{
+  "type": "function",
+  "function": {
+    "name": "run_code",
+    "description": "用 JavaScript 组织多次工具调用，在一段代码里连续完成多个步骤。适合需要循环、条件判断、批量处理的任务（一次读多个文件、按内容筛选、连续改写多处）。沙箱里没有网络、没有 Java 类、不能用 require/import，只能调用 tools 对象上的方法。每次调用返回 {ok: boolean, output: string}，务必检查 ok 再决定下一步。最后一行表达式的值会作为返回值。用 print(...) 打印调试信息。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "要执行的 JavaScript 源码。\n★ 这个引擎是老式 JS，以下写法【不要用】，否则报错或结果错误：\n  - 模板字符串插值（`a${'$'}{x}` 不会替换，会原样保留）→ 用 'a' + x\n  - for (const x of arr) 里的 const → 用 let 或 var\n  - 展开运算符 ...、可选链 ?.、空值合并 ??\n可放心使用：let / const 声明、箭头函数、解构、for (let ... of ...)、Map / Set、includes、padStart、以及所有数组方法。\nAPI：\n  tools.listDir(path)                          -> {ok, output}\n  tools.searchFiles(keyword, path)             -> {ok, output}\n  tools.readFile(path)                         -> {ok, output}\n  tools.writeFile(path, content)               -> {ok, output}\n  tools.replaceInFile(path, search, replace, replaceAll) -> {ok, output}\n  tools.runShell(command)                      -> {ok, output}\n另有 print(...)。示例：\nconst r = tools.readFile('/sdcard/Documents/a.txt');\nif (!r.ok) { print('读失败: ' + r.output); }\nelse { print('长度 ' + r.output.length); }\nr.ok"
+        }
+      },
+      "required": ["code"]
+    }
+  }
+}
+""".trim()
+
+/** PTC 模式的系统提示词。工具清单在这里，不在「规则」里 —— 混着写模型容易漏 */
+private val PTC_SYSTEM_PROMPT = """
+你是 CoolStream，运行在用户安卓手机上的本地助手。
+
+★ 当前是【PTC 模式】：你手上只有一个工具 run_code。
+   你不能直接调用 read_file 这些工具，只能写一段 JavaScript，
+   在代码里通过 tools 对象去调用它们。代码在你的手机本地、一个隔离沙箱里执行。
+
+沙箱里可用的 API（全部同步、返回 {ok, output}）：
+  tools.listDir(path)
+  tools.searchFiles(keyword, path)
+  tools.readFile(path)
+  tools.writeFile(path, content)
+  tools.replaceInFile(path, search, replace, replaceAll)
+  tools.runShell(command)
+  print(...)                    // 打印到执行输出，方便你看中间结果
+
+写法要求：
+1. 每个调用都要检查 r.ok。失败时 r.output 里是原因，不要当作成功继续往下算。
+2. 不要用 require / import / fetch / XMLHttpRequest / Packages / java ——
+   沙箱把这些全封了，用到就会报错。
+3. ★ 这个 JS 引擎偏老，下面这几样【不能用】：
+   - 模板字符串插值 `` `a${'$'}{x}` ``：不报错，但 ${'$'}{} 不会被替换，会原样留着 → 用 'a' + x 拼接
+   - for (const x of arr)：const 当循环变量会报语法错误 → 用 for (let x of arr)
+   - 展开 ...、可选链 ?.、空值合并 ??
+   能放心用的：let / const 声明、箭头函数、解构、forEach / map / filter、
+   for (let ... of ...)、Map / Set、字符串 includes / padStart。
+4. 一段代码做完一件事。需要看结果再决定的，就在代码里 if 判断，
+   不要拆成两次 run_code 来回问 —— 那正是不用 PTC 的理由。
+5. 最后一行放一个表达式作为返回值（比如最后的统计结果对象）。
+6. 代码要短。十几行能搞定的别写五十行。
+
+规则：
+1. 用户要求查看、读取、打开某个文件时，直接读，绝对不要说"我没有权限"
+   "我无法访问你手机上的文件"之类的话。
+2. 路径必须是绝对路径。从用户话语里提取路径时，去掉所有中文标点
+   （中文双引号、单引号、逗号、句号、空格都不能带进路径）。
+3. 绝对不要凭空编造路径。读不到就如实说没读到，不要猜内容。
+4. read_file 只能读文本。pptx / docx / zip / 图片等二进制文件会失败，
+   这时如实说"这是二进制文件，读不了内容"，不要假装读到了。
+5. 工具报错就如实转述错误原因，不要粉饰。
+6. 回答简洁、分点，不要长篇大论。
+7. run_shell 权限很高：只有用户明确要求执行命令时才用；破坏性命令先问用户。
+8. write_file 是整份覆盖而不是追加。覆盖已存在的文件前先读一遍，
+   内容重要就先问用户一句。
+9. 改已有文件的某一段用 tools.replaceInFile，search 必须从刚才读到的内容里
+   【逐字复制】。凭印象手打的一定匹配不上。
+""".trim()
+
+/**
+ * 极简模式的系统提示词 —— 故意写得很短。
+ *
+ * 这段提示词的作用是「不误导」：既然一个工具都没有，
+ * 就必须明确说清楚，否则模型会沿用训练里的习惯，声称自己去读文件了。
+ */
+private val MINIMAL_SYSTEM_PROMPT = """
+你是 CoolStream，运行在用户安卓手机上的对话助手。
+
+★ 当前是【极简模式】：你没有任何工具，不能读文件、不能写文件、
+   不能执行命令、不能搜索手机上的内容。
+
+因此：
+- 需要文件内容才能回答时，如实说"极简模式下我没有文件访问能力，
+  请切换到标准模式"，然后把你能凭常识回答的部分讲清楚；
+- 绝对不要假装读过某个文件，也不要编造文件内容；
+- 回答简洁准确，不知道就说不知道。
+""".trim()
+
 private const val KEY_THEME_MODE = "theme_mode"      // system / light / dark
+private const val KEY_PRESET = "agent_preset"        // standard / ptc / minimal
 private const val KEY_FONT_SCALE = "font_scale"      // 0.9 / 1.0 / 1.15
 private const val KEY_CARD_EXPANDED = "tool_card_expanded"
 private const val KEY_TOOL_PREFIX = "tool_enabled_"
@@ -1335,7 +1501,7 @@ private const val KEY_LANGUAGE = "language"   // system / zh / en
  * ⚠️ 用 mutableStateOf 而不是普通变量：主题、字号、工具开关都会影响界面，
  *    必须是「可被 Compose 观察」的，否则改了设置要重启才生效。
  */
-private object AppSettings {
+internal object AppSettings {
     /** system / light / dark */
     var themeMode by mutableStateOf("system")
 
@@ -1350,6 +1516,14 @@ private object AppSettings {
 
     /** 界面语言：system / zh / en */
     var language by mutableStateOf("system")
+
+    /**
+     * Agent 预设：standard / ptc / minimal
+     *
+     * ★ 用可变状态而不是只读常量：切换预设要立刻影响下一次请求，
+     *   也要让设置页上的选中态立刻跟着变。
+     */
+    var preset by mutableStateOf(AgentPreset.STANDARD)
 }
 
 /**
@@ -1372,6 +1546,7 @@ internal fun loadAppSettings(context: Context) {
     AppSettings.fontScale = p.getFloat(KEY_FONT_SCALE, 1f)
     AppSettings.cardExpanded = p.getBoolean(KEY_CARD_EXPANDED, false)
     AppSettings.language = p.getString(KEY_LANGUAGE, "system") ?: "system"
+    AppSettings.preset = AgentPreset.of(p.getString(KEY_PRESET, AgentPreset.STANDARD.id))
     // 没写过的工具默认开启
     AppSettings.enabledTools = ALL_TOOL_NAMES.filter {
         p.getBoolean(KEY_TOOL_PREFIX + it, true)
@@ -1379,8 +1554,16 @@ internal fun loadAppSettings(context: Context) {
     Log.d(
         TAG,
         "设置已加载: theme=${AppSettings.themeMode}, fontScale=${AppSettings.fontScale}, " +
-            "cardExpanded=${AppSettings.cardExpanded}, tools=${AppSettings.enabledTools}"
+            "cardExpanded=${AppSettings.cardExpanded}, preset=${AppSettings.preset.id}, " +
+            "tools=${AppSettings.enabledTools}"
     )
+}
+
+/** 切换 Agent 预设。下一次请求立刻生效，不需要重启 */
+internal fun setPreset(context: Context, preset: AgentPreset) {
+    prefsOf(context).edit().putString(KEY_PRESET, preset.id).apply()
+    AppSettings.preset = preset
+    Log.d(TAG, "Agent 预设切换为: ${preset.id}")
 }
 
 internal fun setThemeMode(context: Context, mode: String) {
@@ -1421,7 +1604,16 @@ internal fun setToolEnabled(context: Context, name: String, enabled: Boolean) {
  *   TOOL_DEFINITIONS 是一整段静态 JSON，过滤的代价是解析一次（几十微秒），
  *   而工具开关随时可能在设置页里被改。每次现算最不容易出错。
  */
-private fun buildToolsArray(): JSONArray {
+internal fun buildToolsArray(): JSONArray {
+    // ★ 预设优先于单个工具开关：
+    //   极简模式下一个工具都不发（连 run_code 也不发），
+    //   PTC 模式只发 run_code —— 那六个工具变成沙箱里的函数，不再出现在 tools 里。
+    when (AppSettings.preset) {
+        AgentPreset.MINIMAL -> return JSONArray()
+        AgentPreset.PTC -> return JSONArray().put(JSONObject(PTC_TOOL_DEFINITION))
+        AgentPreset.STANDARD -> Unit   // 落到下面按开关过滤
+    }
+
     val all = JSONArray(TOOL_DEFINITIONS)
     val enabled = AppSettings.enabledTools
     val out = JSONArray()
@@ -2443,7 +2635,397 @@ private fun runShell(command: String): ToolExecResult {
     }
 }
 
-private fun executeTool(name: String, argsJson: String): ToolExecResult {
+// ============================================================
+// 3.27 PTC 沙箱：run_code 的 JavaScript 运行时
+//
+// 这一段回答一个问题：**凭什么敢让大模型写的代码在你手机上跑？**
+//
+// 三层约束，缺一不可：
+//   1. ClassShutter 全禁
+//      不给 JS 任何碰 Java 类的通道。没有 Packages.java、没有 getClass()，
+//      也就不可能摸到 Runtime.exec —— 这是最重要的一层，没它前面全白搭。
+//   2. 能力只有一个入口
+//      JS 能看到的只有一个 tools 对象，六个方法，全部走 executeTool。
+//      工作区拦截、shell 黑名单、文件大小上限，因此在 PTC 模式下**同样生效**，
+//      不是绕开它们另开一条路。
+//   3. 指令数观察器 + 墙钟截止
+//      while(true){} 这类死循环必须能被掐断，否则主界面就再也回不来了。
+//      Rhino 没有内置超时，靠 observeInstructionCount 定期回调来检查时间。
+//
+// ⚠️ optimizationLevel 必须是 -1（解释执行）。
+//    Android 跑在 Dalvik/ART 上，Rhino 默认的字节码生成那条路走不通。
+// ⚠️ Context 是「每线程一个」，用完必须 RhinoContext.exit()，
+//    否则那个线程下次进入会拿到一个没清理的上下文。
+// ============================================================
+
+/** 一段 run_code 最多跑多久（毫秒）。超了就抛异常中止，不是等它自己停 */
+private const val RUN_CODE_TIMEOUT_MS = 15_000L
+
+/** 回传给模型的输出最多多少字符 —— 脚本可以把 print 刷到几十万字，得截断 */
+private const val RUN_CODE_MAX_OUTPUT = 20_000
+
+/** 模型给的代码最多多长。超了基本是它把整个文件内容当代码塞进来了 */
+private const val RUN_CODE_MAX_CODE = 200_000
+
+/**
+ * 当前线程这次 run_code 的截止时刻（SystemClock.elapsedRealtime）。
+ *
+ * ★ 用 ThreadLocal 而不是普通变量：并发跑两段代码时互不干扰。
+ *   每个线程有自己的 deadline，观察器只读自己那个。
+ */
+private val runCodeDeadline = ThreadLocal<Long>()
+
+/**
+ * 沙箱专用的 ContextFactory。
+ *
+ * 所有安全设置都在 makeContext 里一次配好 —— 这样即使别处不小心用了
+ * RhinoContext.enter()，也拿不到能碰 Java 类的上下文。
+ */
+private object PtcContextFactory : ContextFactory() {
+
+    override fun makeContext(): RhinoContext {
+        val cx = super.makeContext()
+
+        // 解释执行。Android 上必须这样，不能让它生成字节码
+        cx.optimizationLevel = -1
+        // 允许 const / 箭头函数 / 模板字符串，模型写现代 JS 更顺手
+        cx.languageVersion = RhinoContext.VERSION_ES6
+
+        // ★ 第 1 层：任何 Java 类对脚本都不可见
+        cx.setClassShutter(ClassShutter { _ -> false })
+
+        // ★ 第 3 层：每执行 2 万条指令回调一次，用来检查是否超时
+        cx.setInstructionObserverThreshold(20_000)
+
+        // 递归深度上限，防止爆栈把进程带走
+        cx.setMaximumInterpreterStackDepth(400)
+
+        return cx
+    }
+
+    override fun observeInstructionCount(cx: RhinoContext, instructionCount: Int) {
+        val limit = runCodeDeadline.get() ?: return
+        if (SystemClock.elapsedRealtime() > limit) {
+            // 抛异常是唯一能中止 evaluateString 的方式
+            throw EvaluatorException("代码执行超过 ${RUN_CODE_TIMEOUT_MS / 1000} 秒，已强制中止")
+        }
+    }
+}
+
+/** 把一个 Kotlin 函数包装成 JS 里可以调用的函数 */
+private fun jsHostFunction(
+    fn: (RhinoContext, Scriptable, Array<Any?>) -> Any?
+): BaseFunction = object : BaseFunction() {
+    override fun call(
+        cx: RhinoContext,
+        scope: Scriptable,
+        thisObj: Scriptable?,
+        args: Array<Any?>
+    ): Any? = fn(cx, scope, args)
+}
+
+/** 取第 i 个 JS 参数当字符串。undefined / 缺参 / null 一律当空串 */
+private fun jsArgStr(args: Array<Any?>, i: Int): String {
+    if (i >= args.size) return ""
+    val v = args[i] ?: return ""
+    if (v is Undefined) return ""
+    return RhinoContext.toString(v)
+}
+
+/** 取第 i 个 JS 参数当布尔。只认真正的 truthy 值，字符串 "false" 不算 true */
+private fun jsArgBool(args: Array<Any?>, i: Int): Boolean {
+    if (i >= args.size) return false
+    val v = args[i] ?: return false
+    if (v is Undefined) return false
+    if (v is Boolean) return v
+    if (v is Number) return v.toDouble() != 0.0
+    return RhinoContext.toString(v) == "true"
+}
+
+/**
+ * 把 JS 的值变成人能读的一行字，用在实际返回值的展示上。
+ *
+ * 对象只展开一层：深了没意义（模型自己可以 print(JSON.stringify(x))），
+ * 而且循环引用的对象会无限递归 —— depth 就是拦这个的。
+ */
+private fun jsValuePreview(v: Any?, depth: Int = 0): String {
+    if (v == null) return "null"
+    if (v is Undefined) return "undefined"
+    if (v is Scriptable) {
+        if (depth >= 2) return "{…}"
+        val ids = v.ids
+        if (ids.isEmpty()) return "{}"
+        val shown = ids.take(20)
+        val body = shown.joinToString(", ") { id ->
+            "$id: ${jsValuePreview(ScriptableObject.getProperty(v, id.toString()), depth + 1)}"
+        }
+        return if (ids.size > shown.size) "{$body, …}" else "{$body}"
+    }
+    return RhinoContext.toString(v)
+}
+
+/**
+ * 把字符串字面量、行注释、块注释全部替换成等长空格（保留换行）。
+ *
+ * ★ 为什么要这么绕：执行前检查要判断「代码里有没有 `??`」，
+ *   但 `print("a ?? b")` 里的 ?? 只是普通文本，不该误报。
+ *   换成等长空格而不是直接删掉，是为了让后面算出的行号还能对上原文。
+ *
+ * 反引号字符串【故意不抹掉】—— 模板字符串插值失效这一条正是要检测它。
+ */
+private fun maskJsLiterals(src: String): String {
+    val out = StringBuilder(src)
+    var i = 0
+    val n = src.length
+    fun blank(p: Int) {
+        if (p < n && src[p] != '\n') out.setCharAt(p, ' ')
+    }
+    while (i < n) {
+        val c = src[i]
+        when {
+            // 行注释 //
+            c == '/' && i + 1 < n && src[i + 1] == '/' -> {
+                while (i < n && src[i] != '\n') { blank(i); i++ }
+            }
+            // 块注释 /* */
+            c == '/' && i + 1 < n && src[i + 1] == '*' -> {
+                blank(i); blank(i + 1); i += 2
+                while (i < n) {
+                    if (src[i] == '*' && i + 1 < n && src[i + 1] == '/') {
+                        blank(i); blank(i + 1); i += 2
+                        break
+                    }
+                    blank(i); i++
+                }
+            }
+            // 单引号 / 双引号字符串
+            c == '\'' || c == '"' -> {
+                val quote = c
+                blank(i); i++
+                while (i < n) {
+                    if (src[i] == '\\') { blank(i); blank(i + 1); i += 2; continue }
+                    if (src[i] == quote) { blank(i); i++; break }
+                    blank(i); i++
+                }
+            }
+            else -> i++
+        }
+    }
+    return out.toString()
+}
+
+/** 把字符下标换算成 1 起的行号 */
+private fun lineAt(src: String, index: Int): Int {
+    var line = 1
+    for (k in 0 until minOf(index, src.length)) if (src[k] == '\n') line++
+    return line
+}
+
+/**
+ * 执行前检查：把 Rhino 1.7.13 不支持、或者「能跑但结果是错的」写法拦下来。
+ *
+ * ★ 这个函数存在的理由是有一次真实翻车：
+ *   模型写了 `for (const f of files)`，Rhino 只回一句 `syntax error (line 5)`，
+ *   模型完全不知道自己错在哪，只好整个重写一遍 —— 白烧一轮 token。
+ *
+ * ★ 更要命的是模板字符串：`` `a${x}` `` 不报错，
+ *   而是原样返回字符串 "a${x}"。模型会拿这个错值继续算下去，
+ *   最后给用户一个看起来很正常的错误答案。这种必须拦。
+ *
+ * @return null = 放行；非 null = 给模型看的错误说明（含正确写法）
+ */
+private fun ptcPreflight(code: String): String? {
+    val masked = maskJsLiterals(code)
+
+    // ① 模板字符串插值 —— 不报错但结果是错的，必须拦
+    Regex("`[^`]*\\$\\{").find(masked)?.let { m ->
+        return "第 ${lineAt(code, m.range.first)} 行：本沙箱的模板字符串【不会做插值】，" +
+            "`a\${x}` 会被当成普通文本原样保留，算出来的结果是错的。\n" +
+            "请改用字符串拼接：'a' + x。"
+    }
+
+    // ② for (const x of arr) —— const 不能用在 for-of 的循环变量上
+    Regex("""for\s*\(\s*const\b[^)]*\bof\b""").find(masked)?.let { m ->
+        return "第 ${lineAt(code, m.range.first)} 行：for-of 的循环变量不能用 const" +
+            "（本沙箱的 JS 引擎不支持）。\n" +
+            "改成 for (let x of arr)，或者用 for (var i = 0; i < arr.length; i++)。"
+    }
+
+    // ③ 可选链 ?.
+    Regex("""\?\.""").find(masked)?.let { m ->
+        return "第 ${lineAt(code, m.range.first)} 行：不支持可选链 ?.（本沙箱引擎不支持）。\n" +
+            "改成 a && a.b，或者用 if 判断。"
+    }
+
+    // ④ 空值合并 ?? 和 ??=
+    Regex("""\?\?""").find(masked)?.let { m ->
+        return "第 ${lineAt(code, m.range.first)} 行：不支持 ?? / ??=（本沙箱引擎不支持）。\n" +
+            "改成 || （注意 0 和空串也会被当成假值），或者用三元表达式。"
+    }
+
+    // ⑤ 展开/剩余运算符 ...
+    Regex("""\.\.\.""").find(masked)?.let { m ->
+        return "第 ${lineAt(code, m.range.first)} 行：不支持展开运算符 ...（本沙箱引擎不支持）。\n" +
+            "数组合并用 a.concat(b)，对象就用逐个赋值。"
+    }
+
+    return null
+}
+
+/**
+ * run_code 的真实实现。
+ *
+ * 返回给模型的内容分三段：内部调用了什么、print 打了什么、脚本返回了什么。
+ * 这三段是分开的，因为模型排错时最想知道的是「第几步错了」，
+ * 而不是一坨混在一起的文本。
+ */
+internal fun runCode(code: String): ToolExecResult {
+    if (code.isBlank()) {
+        return ToolExecResult(false, "参数错误：code 是空的，一句话都没写。")
+    }
+    if (code.length > RUN_CODE_MAX_CODE) {
+        return ToolExecResult(
+            false,
+            "代码太长：${code.length} 字符，上限 $RUN_CODE_MAX_CODE。请把任务拆成更小的几段。"
+        )
+    }
+
+    // ★ 执行前检查：把这次沙箱引擎不支持的写法挡在前面，并直接给出改法。
+    //   放行的代码再进 JS 引擎 —— 否则引擎只会回一句 "syntax error (line 5)"，
+    //   模型得靠猜。
+    ptcPreflight(code)?.let { return ToolExecResult(false, it) }
+
+    val startedAt = SystemClock.elapsedRealtime()
+    val printed = mutableListOf<String>()      // print() 的输出
+    val innerCalls = mutableListOf<String>()   // 内部工具调用记录
+    var returned: Any? = null
+    var failure: String? = null
+    var failureLine = -1
+
+    runCodeDeadline.set(startedAt + RUN_CODE_TIMEOUT_MS)
+    val cx = PtcContextFactory.enterContext()
+    try {
+        val scope = cx.initStandardObjects()
+
+        /**
+         * 所有工具调用的唯一出口。
+         *
+         * ★ 这里的 enabledTools 判断不能省：PTC 模式下 tools 数组里只有 run_code，
+         *   模型看不到「哪些工具被关了」，只能靠这里拦下来再告诉它。
+         */
+        fun invoke(toolName: String, args: JSONObject): Any {
+            innerCalls += toolName
+            val result = if (toolName !in AppSettings.enabledTools) {
+                ToolExecResult(false, "工具 $toolName 已被用户在设置里关闭，调用被拒绝。")
+            } else {
+                executeTool(toolName, args.toString())
+            }
+            Log.d(TOOL_LOG_TAG, "  [run_code] $toolName ok=${result.ok} len=${result.output.length}")
+            val obj = cx.newObject(scope)
+            ScriptableObject.putProperty(obj, "ok", result.ok)
+            ScriptableObject.putProperty(obj, "output", result.output)
+            return obj
+        }
+
+        // ---------- print ----------
+        ScriptableObject.putProperty(
+            scope,
+            "print",
+            jsHostFunction { _, _, args ->
+                printed += args.joinToString(" ") { jsValuePreview(it) }
+                Undefined.instance
+            }
+        )
+
+        // ---------- tools ----------
+        val tools = cx.newObject(scope)
+        ScriptableObject.putProperty(tools, "listDir", jsHostFunction { _, _, a ->
+            invoke("list_dir", JSONObject().put("path", jsArgStr(a, 0)))
+        })
+        ScriptableObject.putProperty(tools, "searchFiles", jsHostFunction { _, _, a ->
+            invoke(
+                "search_files",
+                JSONObject().put("keyword", jsArgStr(a, 0)).put("path", jsArgStr(a, 1))
+            )
+        })
+        ScriptableObject.putProperty(tools, "readFile", jsHostFunction { _, _, a ->
+            invoke("read_file", JSONObject().put("path", jsArgStr(a, 0)))
+        })
+        ScriptableObject.putProperty(tools, "writeFile", jsHostFunction { _, _, a ->
+            invoke(
+                "write_file",
+                JSONObject().put("path", jsArgStr(a, 0)).put("content", jsArgStr(a, 1))
+            )
+        })
+        ScriptableObject.putProperty(tools, "replaceInFile", jsHostFunction { _, _, a ->
+            invoke(
+                "replace_in_file",
+                JSONObject()
+                    .put("path", jsArgStr(a, 0))
+                    .put("search", jsArgStr(a, 1))
+                    .put("replace", jsArgStr(a, 2))
+                    .put("replace_all", jsArgBool(a, 3))
+            )
+        })
+        ScriptableObject.putProperty(tools, "runShell", jsHostFunction { _, _, a ->
+            invoke("run_shell", JSONObject().put("command", jsArgStr(a, 0)))
+        })
+        ScriptableObject.putProperty(scope, "tools", tools)
+
+        // ---------- 跑 ----------
+        returned = cx.evaluateString(scope, code, "run_code.js", 1, null)
+    } catch (e: Throwable) {
+        failure = e.message ?: e.javaClass.simpleName
+        // Rhino 的 EvaluatorException 带行号，对模型排错非常有用
+        if (e is EvaluatorException) failureLine = e.lineNumber
+        Log.e(TOOL_LOG_TAG, "run_code 执行失败: ${e.message}", e)
+    } finally {
+        runCodeDeadline.remove()
+        RhinoContext.exit()
+    }
+
+    val elapsed = SystemClock.elapsedRealtime() - startedAt
+
+    val sb = StringBuilder()
+    if (failure != null) {
+        sb.append("代码执行失败")
+        if (failureLine > 0) sb.append("（第 $failureLine 行）")
+        sb.append("：").append(failure).append("\n\n")
+    }
+
+    if (innerCalls.isEmpty()) {
+        sb.append("内部工具调用：0 次\n")
+    } else {
+        val summary = innerCalls.groupingBy { it }.eachCount()
+            .entries.joinToString("、") { "${it.key} ×${it.value}" }
+        sb.append("内部工具调用：${innerCalls.size} 次（$summary）\n")
+    }
+
+    if (printed.isNotEmpty()) {
+        sb.append("print 输出：\n").append(printed.joinToString("\n")).append('\n')
+    }
+
+    // 脚本没抛异常、且最后一行表达式确实有值，才展示返回值
+    if (failure == null && returned != null && returned !== Undefined.instance) {
+        sb.append("返回值：").append(jsValuePreview(returned)).append('\n')
+    }
+
+    sb.append("耗时：${elapsed} ms")
+
+    val text = if (sb.length > RUN_CODE_MAX_OUTPUT) {
+        // take() 返回 CharSequence，没有 plus 运算符，必须显式 toString()
+        sb.take(RUN_CODE_MAX_OUTPUT).toString() +
+            "\n…（输出超过 $RUN_CODE_MAX_OUTPUT 字符，已截断）"
+    } else {
+        sb.toString()
+    }
+
+    // ok=false 只在脚本本身挂了的时候给。内部某个工具失败不算 overall 失败 ——
+    // 模型可能在代码里已经判断并补救了，界面不该显示成红色错误。
+    return ToolExecResult(failure == null, text)
+}
+
+internal fun executeTool(name: String, argsJson: String): ToolExecResult {
     Log.d(TOOL_LOG_TAG, "开始执行工具: name=$name, args=$argsJson")
 
     return try {
@@ -2535,6 +3117,17 @@ private fun executeTool(name: String, argsJson: String): ToolExecResult {
                     ToolExecResult(false, "参数错误：缺少 command（要执行的 shell 命令）")
                 } else {
                     runShell(command)
+                }
+            }
+
+            // ★ PTC 模式的唯一入口。code 绝不能过 cleanPath ——
+            //   它会削掉首尾标点，一段以 } 或 " 结尾的代码会被削坏。
+            "run_code" -> {
+                val code = argOf(argsJson, "code")
+                if (code.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 code（要执行的 JavaScript 源码）")
+                } else {
+                    runCode(code)
                 }
             }
 
@@ -4670,6 +5263,37 @@ private fun GeneralTab(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
     ) {
+        // ---------- Agent 模式 ----------
+        // 放最上面，因为它是「决定下面所有工具怎么用」的总开关 ——
+        // 先去调插件开关、再发现预设不对，是很容易踩的顺序坑。
+        item { SectionHeader(stringResource(R.string.section_agent)) }
+        item {
+            ChoiceRow(
+                label = stringResource(R.string.label_preset),
+                options = listOf(
+                    AgentPreset.STANDARD.id to stringResource(R.string.preset_standard),
+                    AgentPreset.PTC.id to stringResource(R.string.preset_ptc),
+                    AgentPreset.MINIMAL.id to stringResource(R.string.preset_minimal)
+                ),
+                selected = AppSettings.preset.id,
+                onSelect = { setPreset(context, AgentPreset.of(it)) }
+            )
+        }
+        item {
+            val desc = when (AppSettings.preset) {
+                AgentPreset.STANDARD -> stringResource(R.string.desc_preset_standard)
+                AgentPreset.PTC -> stringResource(R.string.desc_preset_ptc)
+                AgentPreset.MINIMAL -> stringResource(R.string.desc_preset_minimal)
+            }
+            Text(
+                text = desc,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+        }
+
         item { SectionHeader(stringResource(R.string.section_appearance)) }
         item {
             ChoiceRow(
@@ -5015,6 +5639,30 @@ private fun PluginsTab() {
                 color = cs.onSurfaceVariant,
                 modifier = Modifier.padding(top = 14.dp, bottom = 6.dp, start = 4.dp, end = 4.dp)
             )
+        }
+
+        // ★ 预设和插件是两层开关，容易搞混，这里说清楚它们的关系。
+        //   没有这段提示的话，用户会以为「关掉 read_file」在 PTC 模式下也该消失，
+        //   然后在模型硬写代码调用时报错时一脸问号。
+        if (AppSettings.preset != AgentPreset.STANDARD) {
+            item {
+                Text(
+                    text = when (AppSettings.preset) {
+                        AgentPreset.PTC ->
+                            "当前是 PTC 模式：请求里只发 run_code，" +
+                                "下面这些开关控制的是「代码里能不能调到它们」，\n" +
+                                "关掉的那几个在沙箱里会返回 ok=false。"
+                        AgentPreset.MINIMAL ->
+                            "当前是极简模式：一个工具都不发，下面的开关暂时不起作用。\n" +
+                                "想用工具请回「通用」页把预设切回标准或 PTC。"
+                        AgentPreset.STANDARD -> ""
+                    },
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.primary.copy(alpha = 0.85f),
+                    modifier = Modifier.padding(bottom = 6.dp, start = 4.dp, end = 4.dp)
+                )
+            }
         }
 
         itemsIndexed(ALL_TOOL_NAMES) { _, name ->
@@ -5927,10 +6575,17 @@ private fun parseToolCall(content: String): ToolCallView {
         val name = (root.opt("tool") as? String) ?: "unknown"
 
         val argsNode = root.opt("arguments")
-        val argsText = when (argsNode) {
-            is JSONObject -> argsNode.toString(2)     // 缩进 2 空格，可读性最好
-            is String -> argsNode
-            null, JSONObject.NULL -> "{}"
+        val argsText = when {
+            // ★ run_code 特殊处理：把代码原文取出来直接显示。
+            //   照 JSON 渲染的话会变成一堆 "code": "...\n...\n..." 的转义字符串，
+            //   一个换行都看不见，代码完全没法读。
+            name == "run_code" && argsNode is JSONObject ->
+                (argsNode.opt("code") as? String)?.takeIf { it.isNotBlank() }
+                    ?: argsNode.toString(2)
+
+            argsNode is JSONObject -> argsNode.toString(2)     // 缩进 2 空格，可读性最好
+            argsNode is String -> argsNode
+            argsNode == null || argsNode == JSONObject.NULL -> "{}"
             else -> argsNode.toString()
         }
 
@@ -5984,6 +6639,9 @@ private fun toolVisual(name: String): ToolVisual {
         "list_dir" -> ToolVisual(Icons.AutoMirrored.Filled.List, cs.onSurfaceVariant)  // 列表
         "search_files" -> ToolVisual(Icons.Default.Search, cs.onSurfaceVariant)  // 放大镜
         "run_shell" -> ToolVisual(Icons.Default.PlayArrow, Color(0xFFD29922))    // 琥珀色，提示高权限
+        // PTC 的 run_code：用 Build 图标但染成紫色，和六个原子工具区分开 ——
+        // 它本身不碰磁盘，是「一段代码指挥了很多次调用」
+        "run_code" -> ToolVisual(Icons.Default.Build, Color(0xFFA371F7))
         else -> ToolVisual(Icons.Default.Build, cs.onSurfaceVariant)
     }
 }
