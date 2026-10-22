@@ -71,6 +71,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -231,6 +233,7 @@ import java.util.Calendar
 import javax.net.ssl.SSLException
 import java.util.Locale
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.yield
 
 
 // ============================================================
@@ -4276,6 +4279,46 @@ fun ChatScreen() {
                         attachments = attachments.filterIndexed { i, _ -> i != index }
                     },
                     onSend = {
+                        // ★ 全局拦截器：没配 API Key 就不要发请求。
+                        //
+                        //   为什么拦在这里而不是在引导页强制填：
+                        //   引导页允许「跳过」，用户完全可能先进来看看界面。
+                        //   真到要用的时候才提示，比在门口堵人体验好得多。
+                        //
+                        //   表现方式：插一条 isError = true 的气泡。
+                        //   这样它不会被当成 AI 的回复发给模型（runAgentLoop 里
+                        //   有 `if (msg.isError) continue`），下次请求自动排除。
+                        val currentKey = ApiConfig.apiKey
+                        if (currentKey.isBlank()) {
+                            val sid = if (currentSessionId.isBlank()) newSession() else currentSessionId
+                            val errText = context.getString(R.string.err_no_api_key_bubble)
+                            val nowTs = System.currentTimeMillis()
+                            updateSession(sid) { s ->
+                                s.copy(
+                                    messages = s.messages + ChatMessage(
+                                        sessionId = sid,
+                                        content = errText,
+                                        isUser = false,
+                                        isError = true,
+                                        timestamp = nowTs
+                                    )
+                                )
+                            }
+                            streamScope.launch(Dispatchers.IO) {
+                                dao.insert(
+                                    ChatMessage(
+                                        sessionId = sid,
+                                        content = errText,
+                                        isUser = false,
+                                        isError = true,
+                                        timestamp = nowTs
+                                    )
+                                )
+                            }
+                            Log.w(TAG, "没有 API Key，拦截发送")
+                            return@InputBar
+                        }
+
                         // 只把「已落盘」的附件写进消息 —— 没落盘的不骗模型
                         val ready = attachments.filter {
                             it.state == AttachState.READY && it.path != null
@@ -5063,11 +5106,53 @@ private fun SessionRow(
 // ⚠️ 第 ③ 步刻意不做硬性拦截：Shizuku 需要另外装一个 App、还要电脑激活，
 //    拿它当门槛等于把 90% 的用户挡在门外。
 // ============================================================
+// ============================================================
+// 5.5 首次启动引导（Onboarding）—— 分页版
+//
+// 结构：两页，用 when(currentPage) 直接切换（不用 Pager，原因见页面内的注释），
+//       底部两个小圆点指示器。
+//
+//   第 1 页：选语言
+//     · 大号 Logo + 欢迎语
+//     · 【简体中文】/【English】两个大按钮
+//     · 点了立刻 setLanguage() 并自动滑到第 2 页（不要求用户再点下一步）
+//
+//   第 2 页：基础配置
+//     · API Key 输入（带显示/隐藏）
+//     · 文件访问权限（跳系统设置）
+//     · Shizuku 状态检查（可选）
+//     · 底部【跳过】/【开始使用】
+//
+// ★ 核心原则：引导页【不设强制门槛】。
+//   任何一步没配好，用户都能通过「跳过」进主界面 ——
+//   拦在门口只会让人以为 App 坏了。
+//   真正的兜底在发送那一刻：没 Key 就弹提示，见 ChatScreen 的 onSend。
+//
+// ★ 语言切换的时序坑：
+//   setLanguage() 会改 AppSettings.language，而 MainActivity 里
+//   localizedContext 是 remember(AppSettings.language) 的 ——
+//   所以改完语言整棵树会重组。翻页状态因此【必须】是独立的、可预测的 Int，
+//   不能挂在会被重建的 Pager 内部状态上。
+// ============================================================
 @Composable
 fun OnboardingScreen(onFinish: () -> Unit) {
     val cs = MaterialTheme.colorScheme
     val context = LocalContext.current
 
+    // 当前页。0 = 选语言，1 = 基础配置。
+    // ★ 用 rememberSaveable 而不是 remember：
+    //   旋转屏幕 / 系统重建 Activity 时，用户应该停在原来那一页，
+    //   而不是被弹回第 1 页重新选一次语言。
+    var currentPage by rememberSaveable { mutableIntStateOf(0) }
+    val pageCount = 2
+
+    // 【诊断】把真实页号打出来。排查「首启跳过选语言页」时全靠这行日志：
+    // 如果它一直是 0、界面上却是第 2 页，那就是渲染问题而不是状态问题。
+    LaunchedEffect(currentPage) {
+        Log.d(TAG, "onboarding page = $currentPage / ${pageCount - 1}")
+    }
+
+    // ---------- 第 2 页的状态 ----------
     var draftKey by remember { mutableStateOf(ApiConfig.apiKey) }
     var draftBase by remember { mutableStateOf(ApiConfig.baseUrl) }
     var draftModel by remember { mutableStateOf(ApiConfig.model) }
@@ -5076,8 +5161,10 @@ fun OnboardingScreen(onFinish: () -> Unit) {
     var storageOk by remember { mutableStateOf(hasAllFilesAccess(context)) }
     var shizukuOk by remember { mutableStateOf(isShizukuGranted() && isShizukuRunning()) }
 
-    // 权限是跳到系统设置里给的，回来不会有回调，只能定时问一下
-    LaunchedEffect(Unit) {
+    // 权限是跳到系统设置里给的，回来不会有回调，只能定时问一下。
+    // 只在第 2 页需要轮询，离开这一页就停掉，省电。
+    LaunchedEffect(currentPage) {
+        if (currentPage != 1) return@LaunchedEffect
         while (true) {
             storageOk = hasAllFilesAccess(context)
             shizukuOk = isShizukuGranted() && isShizukuRunning()
@@ -5085,11 +5172,18 @@ fun OnboardingScreen(onFinish: () -> Unit) {
         }
     }
 
-    val keyOk = draftKey.isNotBlank()
-    val canEnter = keyOk && storageOk
-
-    fun finish() {
-        saveApiConfig(context, draftKey, draftBase, draftModel)
+    /**
+     * 收尾并进入主界面。
+     *
+     * ★ 「跳过」和「开始使用」走的是同一条路 —— 区别只在于
+     *   前者不校验 Key，后者也【不】校验（用户可能就是没 Key 想先看看）。
+     *   两者都会把草稿里的配置存下来（空的也无所谓），并记下 onboard_done。
+     */
+    fun finishAndEnter() {
+        // 空 Key 不要覆盖已有配置：万一用户只是重进引导页看了一眼
+        if (draftKey.isNotBlank()) {
+            saveApiConfig(context, draftKey, draftBase, draftModel)
+        }
         // 工作区要在权限拿到之后再建，否则 mkdirs 必失败
         ensureDefaultWorkspace(context)
         setOnboarded(context, true)
@@ -5106,164 +5200,401 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                 .fillMaxSize()
                 .statusBarsPadding()
                 .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 16.dp)
         ) {
-            // ---------- 品牌 ----------
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    Modifier
-                        .size(10.dp)
-                        .clip(RoundedCornerShape(3.dp))
-                        .background(cs.primary)
-                )
-                Spacer(Modifier.width(8.dp))
+            // ★ 这里【不用】HorizontalPager，也不用任何动画容器。
+            //
+            //   踩过的坑：Pager 放在 Column(weight(1f)) 里时，首次组合测到的高度
+            //   是 0，它据此把初始页算成了第 2 页（currentPage 明明是 0，
+            //   界面上却是「基础配置」）。表现为「第一次启动跳过选语言页」，
+            //   而且每次冷启动都可能不一样，极难复现定位。
+            //
+            //   引导页只有两页、也不需要「跟手拖拽」，用 Pager 属于杀鸡用牛刀。
+            //   改成 when(currentPage) 之后：
+            //     · 状态只有一个 Int，不存在测量塌陷
+            //     · 没有动画容器参与测量，切换绝不会乱跳
+            //
+            //   ⚠️ 刻意不加 AnimatedContent / Crossfade：
+            //      它们需要 androidx.compose.animation 依赖，而且同样会引入
+            //      一层额外的测量与重组。引导页第一优先级是「每次打开都停在
+            //      正确的那页」，动画简陋完全可以接受。
+            //
+            //   外面这层 Box(weight(1f)) 是必须的：
+            //     它给页面一个「确定的、被父布局分配好的高度」，
+            //     页面内部的 fillMaxSize() 才有意义。少了它，
+            //     Column 里的可变高度子项会互相挤压。
+            Box(modifier = Modifier.weight(1f)) {
+                when (currentPage) {
+                    0 -> OnboardLanguagePage(
+                        current = AppSettings.language,
+                        onPick = { lang ->
+                            // ① 先落库 + 改全局状态
+                            setLanguage(context, lang)
+                            // ② 再翻页：只改一个 Int，不依赖任何测量结果
+                            currentPage = 1
+                        }
+                    )
+
+                    else -> OnboardConfigPage(
+                        draftKey = draftKey,
+                        draftBase = draftBase,
+                        draftModel = draftModel,
+                        showKey = showKey,
+                        storageOk = storageOk,
+                        shizukuOk = shizukuOk,
+                        onKeyChange = { draftKey = it },
+                        onBaseChange = { draftBase = it },
+                        onModelChange = { draftModel = it },
+                        onToggleShowKey = { showKey = !showKey },
+                        onOpenStorage = { openAllFilesAccessSettings(context) },
+                        onShizukuClick = {
+                            if (isShizukuGranted()) {
+                                bindShizukuUserService(context)
+                            } else {
+                                requestShizukuPermission()
+                            }
+                        },
+                        onSkip = { finishAndEnter() },
+                        onStart = { finishAndEnter() }
+                    )
+                }
+            }
+
+            // ---------- 底部：分页指示器 ----------
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 18.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                repeat(pageCount) { index ->
+                    val active = currentPage == index
+                    Box(
+                        modifier = Modifier
+                            .padding(horizontal = 5.dp)
+                            .size(if (active) 9.dp else 7.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (active) cs.primary
+                                else cs.onSurfaceVariant.copy(alpha = 0.35f)
+                            )
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 引导页第 1 页：选语言。
+ *
+ * 设计上刻意做得「只剩两个选项」—— 大 Logo、一句欢迎语、两个大按钮。
+ * 这一页的目标是让用户 3 秒内做完决定，不给他别的选择。
+ */
+@Composable
+private fun OnboardLanguagePage(
+    current: String,
+    onPick: (String) -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        // ---------- 大号 Logo ----------
+        // 用「圆角方块 + 终端提示符」的极客符号，而不是图片资源：
+        // 这样深色/浅色都能自适应，也不用为多分辨率准备 png。
+        Box(
+            modifier = Modifier
+                .size(88.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .background(cs.primary.copy(alpha = 0.14f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(cs.primary),
+                contentAlignment = Alignment.Center
+            ) {
                 Text(
-                    text = "CoolStream",
+                    text = ">_",
                     fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.titleLarge
+                    style = MaterialTheme.typography.titleLarge,
+                    color = cs.background
                 )
             }
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = stringResource(R.string.ob_subtitle),
-                fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.bodySmall,
-                color = cs.onSurfaceVariant
-            )
-            Spacer(Modifier.height(18.dp))
+        }
 
-            // ---------- ① API Key ----------
-            OnboardStep(index = 1, title = stringResource(R.string.ob_step1_title), done = keyOk) {
-                ConfigField(
-                    label = stringResource(R.string.field_api_base),
-                    value = draftBase,
-                    placeholder = DEFAULT_API_BASE,
-                    helper = "",
-                    onValueChange = { draftBase = it }
-                )
-                ConfigField(
-                    label = stringResource(R.string.field_api_key),
-                    value = draftKey,
-                    placeholder = "sk-...",
-                    helper = stringResource(R.string.ob_key_helper),
-                    masked = !showKey,
-                    trailing = {
-                        TextButton(onClick = { showKey = !showKey }) {
-                            Text(
-                                text = if (showKey) {
+        Spacer(Modifier.height(28.dp))
+
+        Text(
+            text = stringResource(R.string.ob_welcome_title),
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.headlineSmall,
+            color = cs.onSurface
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        Text(
+            text = stringResource(R.string.ob_welcome_sub),
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall,
+            color = cs.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(Modifier.height(44.dp))
+
+        // ---------- 两个大按钮 ----------
+        // 当前语言对应的按钮加一个描边，让用户知道现在选的是什么。
+        LanguageButton(
+            label = stringResource(R.string.ob_lang_zh),
+            selected = current == "zh",
+            onClick = { onPick("zh") }
+        )
+        Spacer(Modifier.height(14.dp))
+        LanguageButton(
+            label = stringResource(R.string.ob_lang_en),
+            selected = current == "en",
+            onClick = { onPick("en") }
+        )
+    }
+}
+
+/** 引导页的语言大按钮：占满宽度、圆角、毛玻璃质感 */
+@Composable
+private fun LanguageButton(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(60.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .clickable { onClick() },
+        shape = RoundedCornerShape(16.dp),
+        color = if (selected) cs.primary.copy(alpha = 0.16f) else glassFill(),
+        border = BorderStroke(
+            1.dp,
+            if (selected) cs.primary else glassEdge()
+        ),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = label,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.titleMedium,
+                color = if (selected) cs.primary else cs.onSurface
+            )
+        }
+    }
+}
+
+/**
+ * 引导页第 2 页：基础配置。
+ *
+ * 三个配置项都是「能跳过」的：
+ *   · API Key  —— 留空也能进主界面，发送时才拦
+ *   · 文件权限 —— 没有就只能聊天，工具全废，但不影响进界面
+ *   · Shizuku  —— 只影响 run_shell，纯可选
+ */
+@Composable
+private fun OnboardConfigPage(
+    draftKey: String,
+    draftBase: String,
+    draftModel: String,
+    showKey: Boolean,
+    storageOk: Boolean,
+    shizukuOk: Boolean,
+    onKeyChange: (String) -> Unit,
+    onBaseChange: (String) -> Unit,
+    onModelChange: (String) -> Unit,
+    onToggleShowKey: () -> Unit,
+    onOpenStorage: () -> Unit,
+    onShizukuClick: () -> Unit,
+    onSkip: () -> Unit,
+    onStart: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 12.dp)
+    ) {
+        Text(
+            text = stringResource(R.string.ob_config_title),
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.headlineSmall,
+            color = cs.onSurface
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = stringResource(R.string.ob_config_sub),
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall,
+            color = cs.onSurfaceVariant
+        )
+        Spacer(Modifier.height(20.dp))
+
+        // ---------- ① API ----------
+        OnboardStep(
+            index = 1,
+            title = stringResource(R.string.ob_step1_title),
+            done = draftKey.isNotBlank()
+        ) {
+            ConfigField(
+                label = stringResource(R.string.field_api_base),
+                value = draftBase,
+                placeholder = DEFAULT_API_BASE,
+                helper = "",
+                onValueChange = onBaseChange
+            )
+            ConfigField(
+                label = stringResource(R.string.field_api_key),
+                value = draftKey,
+                placeholder = "sk-...",
+                helper = stringResource(R.string.ob_key_helper),
+                masked = !showKey,
+                trailing = {
+                    TextButton(onClick = onToggleShowKey) {
+                        Text(
+                            text = if (showKey) {
                                 stringResource(R.string.action_hide)
                             } else {
                                 stringResource(R.string.action_show)
                             },
-                                fontFamily = FontFamily.Monospace,
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        }
-                    },
-                    onValueChange = { draftKey = it }
-                )
-                ConfigField(
-                    label = stringResource(R.string.field_model),
-                    value = draftModel,
-                    placeholder = DEFAULT_MODEL,
-                    helper = stringResource(R.string.ob_model_helper),
-                    onValueChange = { draftModel = it }
-                )
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            // ---------- ② 文件权限 ----------
-            OnboardStep(index = 2, title = stringResource(R.string.ob_step2_title), done = storageOk) {
-                Text(
-                    text = stringResource(R.string.ob_step2_body),
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = cs.onSurfaceVariant
-                )
-                Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = { openAllFilesAccessSettings(context) },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (storageOk) cs.surfaceVariant else cs.primary,
-                        contentColor = if (storageOk) cs.onSurfaceVariant else cs.onPrimary
-                    )
-                ) {
-                    Text(
-                        text = if (storageOk) stringResource(R.string.ob_step2_done) else stringResource(R.string.ob_step2_action),
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            // ---------- ③ Shizuku（可选） ----------
-            OnboardStep(index = 3, title = stringResource(R.string.ob_step3_title), done = shizukuOk) {
-                Text(
-                    text = stringResource(R.string.ob_step3_body),
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = cs.onSurfaceVariant
-                )
-                Spacer(Modifier.height(8.dp))
-                TextButton(
-                    onClick = {
-                        if (isShizukuGranted()) {
-                            bindShizukuUserService(context)
-                        } else {
-                            requestShizukuPermission()
-                        }
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall
+                        )
                     }
-                ) {
-                    Text(
-                        text = if (isShizukuRunning()) {
-                            stringResource(R.string.ob_step3_check)
-                        } else {
-                            stringResource(R.string.ob_step3_not_running)
-                        },
-                        fontFamily = FontFamily.Monospace,
-                        style = MaterialTheme.typography.labelSmall
-                    )
-                }
-            }
+                },
+                onValueChange = onKeyChange
+            )
+            ConfigField(
+                label = stringResource(R.string.field_model),
+                value = draftModel,
+                placeholder = DEFAULT_MODEL,
+                helper = stringResource(R.string.ob_model_helper),
+                onValueChange = onModelChange
+            )
+        }
 
-            Spacer(Modifier.height(22.dp))
+        Spacer(Modifier.height(12.dp))
 
-            // ---------- 进入 ----------
+        // ---------- ② 文件权限 ----------
+        OnboardStep(
+            index = 2,
+            title = stringResource(R.string.ob_step2_title),
+            done = storageOk
+        ) {
+            Text(
+                text = stringResource(R.string.ob_step2_body),
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant
+            )
+            Spacer(Modifier.height(8.dp))
             Button(
-                onClick = { finish() },
-                enabled = canEnter,
-                modifier = Modifier.fillMaxWidth(),
+                onClick = onOpenStorage,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (storageOk) cs.surfaceVariant else cs.primary,
+                    contentColor = if (storageOk) cs.onSurfaceVariant else cs.onPrimary
+                )
+            ) {
+                Text(
+                    text = if (storageOk) {
+                        stringResource(R.string.ob_step2_done)
+                    } else {
+                        stringResource(R.string.ob_step2_action)
+                    },
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        // ---------- ③ Shizuku（可选） ----------
+        OnboardStep(
+            index = 3,
+            title = stringResource(R.string.ob_step3_title),
+            done = shizukuOk
+        ) {
+            Text(
+                text = stringResource(R.string.ob_step3_body),
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant
+            )
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = onShizukuClick) {
+                Text(
+                    text = if (shizukuOk) {
+                        stringResource(R.string.ob_step3_check)
+                    } else {
+                        stringResource(R.string.ob_step3_not_running)
+                    },
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
+
+        Spacer(Modifier.height(26.dp))
+
+        // ---------- 底部：跳过 / 开始使用 ----------
+        //
+        // ★ 两个按钮都不做「必填校验」。
+        //   用户没 Key 也能进 —— 真要用的时候在发送那一刻才提示。
+        //   把人拦在门口只会让他以为 App 坏了。
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TextButton(
+                onClick = onSkip,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    // 用短版「跳过」：原有的 ob_skip 带「（工具将不可用）」的说明，
+                    // 放在分页引导的按钮里太长，会把两个按钮挤变形。
+                    text = stringResource(R.string.ob_skip_short),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = cs.onSurfaceVariant
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Button(
+                onClick = onStart,
+                modifier = Modifier.weight(1.6f),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = cs.primary,
                     contentColor = cs.onPrimary
                 )
             ) {
                 Text(
-                    text = if (canEnter) stringResource(R.string.ob_enter) else stringResource(R.string.ob_need_two),
+                    text = stringResource(R.string.ob_start),
                     fontFamily = FontFamily.Monospace
                 )
             }
-
-            // 兜底出口：极少数机型给不了「所有文件访问权限」，
-            // 没有这个按钮用户就永远卡在引导页上了。
-            if (keyOk && !storageOk) {
-                TextButton(
-                    onClick = { finish() },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = stringResource(R.string.ob_skip),
-                        fontFamily = FontFamily.Monospace,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = cs.onSurfaceVariant
-                    )
-                }
-            }
-            Spacer(Modifier.height(20.dp))
         }
+
+        Spacer(Modifier.height(20.dp))
     }
 }
 

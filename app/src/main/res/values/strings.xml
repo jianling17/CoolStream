@@ -197,4 +197,17 @@
     <string name="err_no_api_key">还没有配置 API Key。\n请到「设置 → 模型与 API」里填入，或者点这里重新走一遍引导。</string>
     <string name="err_too_many_rounds">工具调用超过 %1$d 轮，已停止</string>
     <string name="err_empty_response">服务器返回了空内容</string>
+
+    <!-- ============ 分页引导（Onboarding）============ -->
+    <string name="ob_welcome_title">欢迎使用 CoolStream</string>
+    <string name="ob_welcome_sub">一个跑在你手机上的本地 Agent。\n先选个语言，两步就能开始。</string>
+    <string name="ob_pick_language">选择语言</string>
+    <string name="ob_lang_zh">简体中文</string>
+    <string name="ob_lang_en">English</string>
+    <string name="ob_config_title">基础配置</string>
+    <string name="ob_config_sub">API Key 可以稍后再填，先跑起来也行。</string>
+    <string name="ob_start">开始使用</string>
+    <string name="ob_skip_short">跳过</string>
+    <string name="ob_page_of">第 %1$d / %2$d 页</string>
+    <string name="err_no_api_key_bubble">请先在设置中配置 API Key</string>
 </resources>

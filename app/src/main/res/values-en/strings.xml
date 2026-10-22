@@ -197,4 +197,17 @@
     <string name="err_no_api_key">No API key configured yet.\nFill it in under Settings → Model &amp; API, or tap here to run onboarding again.</string>
     <string name="err_too_many_rounds">Tool calls exceeded %1$d rounds, stopped</string>
     <string name="err_empty_response">The server returned an empty response</string>
+
+    <!-- ============ Paged onboarding ============ -->
+    <string name="ob_welcome_title">Welcome to CoolStream</string>
+    <string name="ob_welcome_sub">A local agent that runs on your phone.\nPick a language, then you\'re two steps away.</string>
+    <string name="ob_pick_language">Choose your language</string>
+    <string name="ob_lang_zh">简体中文</string>
+    <string name="ob_lang_en">English</string>
+    <string name="ob_config_title">Basic setup</string>
+    <string name="ob_config_sub">You can add the API key later — it\'s fine to start first.</string>
+    <string name="ob_start">Start</string>
+    <string name="ob_skip_short">Skip</string>
+    <string name="ob_page_of">Page %1$d / %2$d</string>
+    <string name="err_no_api_key_bubble">Please configure your API key in Settings first</string>
 </resources>
