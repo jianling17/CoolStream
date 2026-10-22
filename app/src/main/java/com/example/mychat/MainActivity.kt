@@ -4575,6 +4575,9 @@ fun Sidebar(
     // 重命名弹窗的目标 + 输入内容
     var renameTarget by remember { mutableStateOf<SidebarSession?>(null) }
     var renameText by remember { mutableStateOf("") }
+    // 删除确认框的目标。
+    // ★ 刻意和 menuTarget 分开：菜单只是「选动作」，真正下手前必须再问一次。
+    var deleteTarget by remember { mutableStateOf<SidebarSession?>(null) }
 
     // ★ 注意 remember 的 key 是 state.sessions（内容比较），
     //   不是整个 ChatSession。流式刷新不会让它重算。
@@ -4735,6 +4738,16 @@ fun Sidebar(
     }
 
     // ---------- 长按菜单：重命名 / 删除 ----------
+    //
+    // ★ 这里原来有个很反人类的设计，已经改掉：
+    //   旧代码把「删除」挂在 dismissButton 上 —— 而 AlertDialog 里
+    //   dismissButton 就长在左边的「取消位」。用户以为自己点的是取消，
+    //   结果会话直接被删，而且没有任何二次确认。
+    //
+    //   现在的做法：
+    //     · 两个动作都是并排的普通文本按钮，谁也不占「确认 / 取消」的位置，
+    //       点哪里就发生什么事，不存在「位置暗示」和实际行为相反的情况
+    //     · 删除只负责打开 deleteTarget 确认框，真正的 onDelete 在确认框里调
     menuTarget?.let { target ->
         AlertDialog(
             onDismissRequest = { menuTarget = null },
@@ -4749,21 +4762,73 @@ fun Sidebar(
                 )
             },
             text = {
-                Text("对这个会话做什么？", style = MaterialTheme.typography.bodySmall)
+                Column {
+                    Text(
+                        text = stringResource(R.string.session_menu_title),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    TextButton(
+                        onClick = {
+                            renameText = target.title
+                            renameTarget = target
+                            menuTarget = null
+                        },
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
+                    ) {
+                        Text(stringResource(R.string.action_rename))
+                    }
+                    TextButton(
+                        onClick = {
+                            // ★ 这里绝不能直接 onDelete —— 只是把确认框顶起来
+                            deleteTarget = target
+                            menuTarget = null
+                        },
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = stringResource(R.string.action_delete),
+                            color = Color(0xFFF85149)
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { menuTarget = null }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            }
+        )
+    }
+
+    // ---------- 删除确认：删了就没了，必须单独问一次 ----------
+    deleteTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            containerColor = glassDrawer(),
+            titleContentColor = cs.onSurface,
+            textContentColor = cs.onSurfaceVariant,
+            title = { Text(stringResource(R.string.delete_session_title)) },
+            text = {
+                Text(
+                    // 把会话名带进去 —— 用户能确认自己删的是哪一个
+                    text = stringResource(R.string.delete_session_body, target.title),
+                    style = MaterialTheme.typography.bodySmall
+                )
             },
             confirmButton = {
                 TextButton(onClick = {
-                    renameText = target.title
-                    renameTarget = target
-                    menuTarget = null
-                }) { Text("重命名") }
+                    onDelete(target.id)
+                    deleteTarget = null
+                }) {
+                    Text(
+                        text = stringResource(R.string.action_delete),
+                        color = Color(0xFFF85149)
+                    )
+                }
             },
             dismissButton = {
-                TextButton(onClick = {
-                    onDelete(target.id)
-                    menuTarget = null
-                }) {
-                    Text("删除", color = Color(0xFFF85149))
+                TextButton(onClick = { deleteTarget = null }) {
+                    Text(stringResource(R.string.action_cancel))
                 }
             }
         )

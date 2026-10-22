@@ -113,6 +113,15 @@
     <string name="drawer_open">打开侧边栏</string>
     <string name="new_chat">新建对话</string>
     <string name="search_chats">搜索会话</string>
+
+    <!-- ============ 会话长按菜单 ============ -->
+    <string name="session_menu_title">对这个会话做什么？</string>
+    <string name="action_rename">重命名</string>
+    <string name="action_delete">删除</string>
+    <string name="action_cancel">取消</string>
+    <string name="delete_session_title">删除会话？</string>
+    <string name="delete_session_body">「%1$s」和它的全部消息会一起删除，无法恢复。</string>
+
     <string name="section_version">版本</string>
     <string name="section_stack">组成</string>
     <string name="section_notes">说明</string>

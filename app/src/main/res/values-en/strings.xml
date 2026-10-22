@@ -113,6 +113,15 @@
     <string name="drawer_open">Open drawer</string>
     <string name="new_chat">New chat</string>
     <string name="search_chats">Search chats</string>
+
+    <!-- ============ Session long-press menu ============ -->
+    <string name="session_menu_title">What do you want to do with this chat?</string>
+    <string name="action_rename">Rename</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="delete_session_title">Delete this chat?</string>
+    <string name="delete_session_body">“%1$s” and all of its messages will be deleted. This cannot be undone.</string>
+
     <string name="section_version">Version</string>
     <string name="section_stack">Built with</string>
     <string name="section_notes">Notes</string>
