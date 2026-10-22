@@ -47,7 +47,7 @@
 | 模型 | 默认 `deepseek-flash`，接口 `https://api.deepseek.com/chat/completions` |
 | APK 体积 | 11.9 MB（12492445 字节，debug 无混淆） |
 | 单元测试 | 37 条，全绿，纯 JVM，0.8 秒 |
-| 版本号 | `0.yyMMddHHmm` 自动生成，versionCode = `yyMMddHH` |
+| 版本号 | `主版本+build.yyMMddHHmm`（如 `1.0.2+build.2610222321`），versionCode = `yyMMddHH` |
 
 ---
 
@@ -733,7 +733,7 @@ git diff --unified=0 -- README.md | grep -E "^[-+]" | grep -E "!\[|&#x|\\\\&|log
 | 工具卡片持久化 + 时间戳分层 | ✅ | 重启后卡片还在、顺序正确 |
 | 中英双语基础设施 + 主要界面文案 | 🟡 约 75% | 见下 |
 | 首次启动引导 + API Key 加密存储 + 自定义接口地址 | ✅ | — |
-| 自动版本号 `0.yyMMddHHmm` | ✅ | 关于页 |
+| 版本号 `主版本+build.yyMMddHHmm`（tag 与 APK 对齐） | ✅ | 关于页 / 侧边栏 |
 | 多模态图片上传（降采样 + data URL） | ✅ | HTTP 200，模型准确描述截图 |
 | 非图片附件走 `read_file` 指引 | ✅ | 新会话验证，读出 `BANANA-7742` |
 | 附件 Chip 三态 + 落盘 + 时间戳防覆盖 | ✅ | 第二次选择落地为 `attachtest-1792664822047.txt` |
@@ -850,11 +850,30 @@ tree，删除项 `sha: null`）→ `POST /git/commits`（原样带 author/commit
 
 推送成功后要手动同步本地跟踪引用：`git update-ref refs/remotes/origin/main <sha>`。
 
-### 9.3 版本标签
+### 9.3 版本标签与发版流程
 
-远程**已删除** `v0.261022`（用 `DELETE /git/refs/tags/v0.261022`，返回 204）。
-GitHub Releases 数量为 **0**。也就是说：**目前没有任何"已发布版本"的对外标记**，
-因为作者认为 1.0 的功能还没做完（i18n、签名包等），不应对外宣称发布。
+> 2026-10-22 之后的现状：已发布 `v1.0.1`（安全修复）、`v1.0.2`（权限跳转修复）。
+> 更早的 `v0.261022` 曾被删除（那份包里的 versionName 与 tag 对不上）。
+
+**版本号规则**（`app/build.gradle.kts` 的 `defaultConfig`）：
+
+```
+versionName = "1.0.2+build.2610222321"
+               └主版本┘ └构建时间戳，自动┘
+versionCode = 26102223        // yyMMddHH，只到小时
+```
+
+主版本写在 `build.gradle.kts` 里那一行 `val appBaseVersion = "1.0.2"`，
+**发版时只改这一行**，然后：
+
+1. 改 `appBaseVersion` → 构建 `./gradlew assembleRelease`
+2. **必扫**：`powershell -File tools/check-apk-secrets.ps1`，必须 0 命中
+3. 真机装上，跑一遍 §8.2 的手动清单
+4. `git commit` → `git tag -a v<主版本> -F <说明文件>`（tag 名 = 主版本）
+5. 推 tag + 建 Release，附上 APK
+
+这样 tag `v1.0.2`、APK 里 `versionName=1.0.2+build.xxx`、
+关于页显示的文字三者一致，用户下载后不会困惑。
 
 ### 9.4 打包备份（含 `.git`）
 

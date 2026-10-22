@@ -61,27 +61,41 @@ android {
         targetSdk = 36
 
         // ============================================================
-        // ★ 自动版本号：0.yyMMddHHmm
+        // ★ 版本号：主版本手工定 + build 号自动追加
         //
-        //   2026-10-22 12:00 → versionName = "0.2610221200"
+        //   versionName = "1.0.2+build.2610222311"
+        //                  └主版本┘ └── 构建时间戳（自动） ──┘
+        //
+        //   为什么改成这样：
+        //     以前 versionName 是 "0.yyMMddHHmm"，而 Git tag 是 "v1.0.2"，
+        //     两者对不上 —— 用户下载后看到的版本号跟发布页写的不是一个东西。
+        //
+        //   现在：
+        //     · 主版本  → 发版时只改下面 appBaseVersion 这一行
+        //     · build 号 → 自动取构建时间，保证唯一且可排序
+        //     · 和 tag 的关系：tag 应该等于主版本（v1.0.2 ↔ 1.0.2+...）
         //
         //   ⚠️ 这里必须显式指定 Locale.US。
         //      SimpleDateFormat 默认跟随系统语言，某些语言环境下
         //      "yyMMddHH" 会输出非 ASCII 数字，下面的 toInt() 会直接抛
         //      NumberFormatException，整个构建在 configure 阶段就挂掉。
         //
-        //   ⚠️ versionCode 只精确到【小时】，不是分钟。
-        //      versionCode 必须是 32 位正整数（上限约 21 亿）。
-        //      yyMMddHHmm 是 10 位数字（2610221200 ≈ 26 亿），会溢出成负数，
+        //   ⚠️ versionCode 只精确到【小时】，且必须是 32 位正整数。
+        //      yyMMddHHmm 是 10 位数字（2610222311 ≈ 26 亿），会溢出成负数，
         //      Android 会直接拒绝安装。截到小时是 8 位（最大 99123123），安全。
         //      代价：同一小时内多次构建，versionCode 不变 ——
         //           调试覆盖安装没问题，正式发版时一小时只能出一个包。
         // ============================================================
+
+        // ▼▼▼ 发版时改这一行 ▼▼▼
+        val appBaseVersion = "1.0.2"
+
         val nowDate = Date()
         val versionStamp = SimpleDateFormat("yyMMddHHmm", Locale.US).format(nowDate)
         val versionCodeHour = SimpleDateFormat("yyMMddHH", Locale.US).format(nowDate).toInt()
 
-        versionName = "0.$versionStamp"
+        // 例：1.0.2+build.2610222311
+        versionName = "$appBaseVersion+build.$versionStamp"
         versionCode = versionCodeHour
 
         // ★★★ 发布包绝不能含 API Key ★★★
