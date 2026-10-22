@@ -42,7 +42,6 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.items
@@ -71,6 +70,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
@@ -114,6 +114,9 @@ import java.io.InputStreamReader
 import java.io.ByteArrayOutputStream
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import androidx.core.content.ContextCompat
+import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import android.content.Context
@@ -168,10 +171,8 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -233,7 +234,6 @@ import java.util.Calendar
 import javax.net.ssl.SSLException
 import java.util.Locale
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.yield
 
 
 // ============================================================
@@ -252,6 +252,9 @@ import kotlinx.coroutines.yield
  * 模型就会直接回答「我没有权限读取文件」，一个 tool_call 都不会发。
  * 这是"授权了还是说没权限"的真正原因 —— 不是权限问题，是模型不知道自己能动。
  */
+// 提示词里的 /sdcard 是写给模型看的示例路径，不是运行时代码，
+// 必须保持字面量，所以这里抑制 SdCardPath 检查。
+@Suppress("SdCardPath")
 val SYSTEM_PROMPT = """
 你是 CoolStream，运行在用户安卓手机上的本地助手。
 
@@ -409,25 +412,56 @@ private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 // 在 Manifest 里声明只是「有资格申请」，真正的开关在系统设置里，
 // 必须跳到 Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION 让用户手动打开。
 // 所以在 App 启动时要检查一次，没开就弹窗引导。
+//
+// ★★ 这里是全项目最容易崩的地方，改动前务必读完 ★★
+//
+//   Environment.isExternalStorageManager() 是 API 30（Android 11）才加的方法。
+//   minSdk 是 24 —— 在 Android 7~10 的机器上直接调它会抛
+//   NoSuchMethodError，而且是在 Application 启动路径上，
+//   表现就是「一打开就闪退」，堆栈还指不到业务代码，极难定位。
+//
+//   所以：所有调用点都必须先判 SDK_INT >= R。
+//   为了不让人漏掉，统一走下面这两个函数，不要在外面直接调 Environment。
+//
+//   Android 10 及以下没有「所有文件访问权限」这个概念，
+//   它们走的是老的运行时权限模型：WRITE_EXTERNAL_STORAGE。
 // ============================================================
-private fun hasAllFilesAccess(context: Context): Boolean =
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+
+/**
+ * 有没有「能读写整个外部存储」的权限。
+ *
+ * - Android 11+：查 MANAGE_EXTERNAL_STORAGE（所有文件访问权限）
+ * - Android 10 及以下：查 WRITE_EXTERNAL_STORAGE 运行时权限
+ *   （这些系统上 Manifest 里的 maxSdkVersion 限定让它只在老系统生效）
+ *
+ * ⚠️ 这个函数在 Application 启动路径上被调用，绝不能抛异常。
+ */
+private fun hasAllFilesAccess(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        // Android 11+：系统级开关，只能由用户在设置里打开
         Environment.isExternalStorageManager()
     } else {
-        // Android 10 及以下走老的存储模型，这里不处理
-        true
+        // Android 10 及以下：老存储模型，查运行时权限。
+        // 用 ContextCompat 而不是 context.checkSelfPermission()，
+        // 后者本身也是 API 23+ 的方法（虽然 minSdk 24 够用，
+        // 但 ContextCompat 在部分定制 ROM 上更稳，且能统一处理权限被撤销的情况）。
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
     }
+}
 
 private fun openAllFilesAccessSettings(context: Context) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
 
     // 优先跳到「本应用」的授权页
     val direct = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-        data = Uri.parse("package:${context.packageName}")
+        data = "package:${context.packageName}".toUri()
     }
     try {
         context.startActivity(direct)
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         // 部分机型不认带 package 的那个 action，退回全局列表
         context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
     }
@@ -452,14 +486,14 @@ private const val SHIZUKU_REQUEST_CODE = 1001
 /** Shizuku 服务是否在跑（App 装没装、有没有启动） */
 private fun isShizukuRunning(): Boolean = try {
     Shizuku.pingBinder()
-} catch (e: Exception) {
+} catch (_: Exception) {
     false
 }
 
 /** 是否已经拿到 Shizuku 授权 */
 private fun isShizukuGranted(): Boolean = try {
     Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-} catch (e: Exception) {
+} catch (_: Exception) {
     false
 }
 
@@ -947,7 +981,7 @@ private fun parseDelta(json: String): String? {
         // ③ 不能是字面量 "null"（双重保险）
         (content as? String)?.takeIf { it.isNotEmpty() && it != "null" }
 
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         // 有些服务会插入心跳包或非标准行，忽略即可
         null
     }
@@ -1008,7 +1042,7 @@ private fun parseDeltaFull(json: String): DeltaInfo? {
             }
         }
         DeltaInfo(content, pieces)
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         // 心跳包 / 非标准行，忽略
         null
     }
@@ -1403,9 +1437,7 @@ private fun loadWorkspace(context: Context): String {
 
 private fun saveWorkspace(context: Context, path: String) {
     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        .edit()
-        .putString(KEY_WORKSPACE, path)
-        .apply()
+        .edit { putString(KEY_WORKSPACE, path) }
     currentWorkspace = path
 }
 
@@ -1497,6 +1529,9 @@ private val PTC_TOOL_DEFINITION = """
 """.trim()
 
 /** PTC 模式的系统提示词。工具清单在这里，不在「规则」里 —— 混着写模型容易漏 */
+// 提示词里的 /sdcard 是写给模型看的示例路径，不是运行时代码，
+// 必须保持字面量，所以这里抑制 SdCardPath 检查。
+@Suppress("SdCardPath")
 private val PTC_SYSTEM_PROMPT = """
 你是 CoolStream，运行在用户安卓手机上的本地助手。
 
@@ -1551,6 +1586,9 @@ private val PTC_SYSTEM_PROMPT = """
  * 这段提示词的作用是「不误导」：既然一个工具都没有，
  * 就必须明确说清楚，否则模型会沿用训练里的习惯，声称自己去读文件了。
  */
+// 提示词里的 /sdcard 是写给模型看的示例路径，不是运行时代码，
+// 必须保持字面量，所以这里抑制 SdCardPath 检查。
+@Suppress("SdCardPath")
 private val MINIMAL_SYSTEM_PROMPT = """
 你是 CoolStream，运行在用户安卓手机上的对话助手。
 
@@ -1582,7 +1620,10 @@ internal object AppSettings {
     var themeMode by mutableStateOf("system")
 
     /** 字号倍率，只缩放文字，不缩放 dp */
-    var fontScale by mutableStateOf(1f)
+    // ★ 用 mutableFloatStateOf 而不是 mutableStateOf(1f)：
+    //   后者会把 Float 装箱成 java.lang.Float，每次读写都产生一次装箱/拆箱。
+    //   这个值在重组时会被反复读取，属于 Compose 官方明确建议避免的开销。
+    var fontScale by mutableFloatStateOf(1f)
 
     /** 工具卡片首次渲染时是否展开 */
     var cardExpanded by mutableStateOf(false)
@@ -1637,34 +1678,34 @@ internal fun loadAppSettings(context: Context) {
 
 /** 切换 Agent 预设。下一次请求立刻生效，不需要重启 */
 internal fun setPreset(context: Context, preset: AgentPreset) {
-    prefsOf(context).edit().putString(KEY_PRESET, preset.id).apply()
+    prefsOf(context).edit { putString(KEY_PRESET, preset.id) }
     AppSettings.preset = preset
     Log.d(TAG, "Agent 预设切换为: ${preset.id}")
 }
 
 internal fun setThemeMode(context: Context, mode: String) {
-    prefsOf(context).edit().putString(KEY_THEME_MODE, mode).apply()
+    prefsOf(context).edit { putString(KEY_THEME_MODE, mode) }
     AppSettings.themeMode = mode
 }
 
 internal fun setFontScale(context: Context, scale: Float) {
-    prefsOf(context).edit().putFloat(KEY_FONT_SCALE, scale).apply()
+    prefsOf(context).edit { putFloat(KEY_FONT_SCALE, scale) }
     AppSettings.fontScale = scale
 }
 
 internal fun setLanguage(context: Context, lang: String) {
-    prefsOf(context).edit().putString(KEY_LANGUAGE, lang).apply()
+    prefsOf(context).edit { putString(KEY_LANGUAGE, lang) }
     AppSettings.language = lang
 }
 
 internal fun setCardExpanded(context: Context, expanded: Boolean) {
-    prefsOf(context).edit().putBoolean(KEY_CARD_EXPANDED, expanded).apply()
+    prefsOf(context).edit { putBoolean(KEY_CARD_EXPANDED, expanded) }
     AppSettings.cardExpanded = expanded
 }
 
 /** 开关某个工具。内存镜像立刻更新，持久化异步写盘 */
 internal fun setToolEnabled(context: Context, name: String, enabled: Boolean) {
-    prefsOf(context).edit().putBoolean(KEY_TOOL_PREFIX + name, enabled).apply()
+    prefsOf(context).edit { putBoolean(KEY_TOOL_PREFIX + name, enabled) }
     AppSettings.enabledTools = if (enabled) {
         AppSettings.enabledTools + name
     } else {
@@ -1763,9 +1804,6 @@ private object ApiConfig {
     var apiKey by mutableStateOf("")
     var baseUrl by mutableStateOf(DEFAULT_API_BASE)
     var model by mutableStateOf(DEFAULT_MODEL)
-
-    /** 有没有可用的 Key —— 引导页的放行条件之一 */
-    val configured: Boolean get() = apiKey.isNotBlank()
 }
 
 internal fun loadApiConfig(context: Context) {
@@ -1794,11 +1832,11 @@ internal fun saveApiConfig(context: Context, key: String, base: String, model: S
     if (p == null) {
         Log.e(TAG, "加密存储不可用，API 配置无法持久化")
     } else {
-        p.edit()
-            .putString(SEC_KEY_API_KEY, k)
-            .putString(SEC_KEY_BASE_URL, b)
-            .putString(SEC_KEY_MODEL, m)
-            .apply()
+        p.edit {
+            putString(SEC_KEY_API_KEY, k)
+            putString(SEC_KEY_BASE_URL, b)
+            putString(SEC_KEY_MODEL, m)
+        }
     }
 
     ApiConfig.apiKey = k
@@ -1830,7 +1868,7 @@ internal fun isOnboarded(context: Context): Boolean {
 }
 
 internal fun setOnboarded(context: Context, done: Boolean) {
-    prefsOf(context).edit().putBoolean(KEY_ONBOARD_DONE, done).apply()
+    prefsOf(context).edit { putBoolean(KEY_ONBOARD_DONE, done) }
 }
 
 /**
@@ -1857,7 +1895,8 @@ internal fun needsOnboarding(context: Context): Boolean {
  */
 internal fun ensureDefaultWorkspace(context: Context): String? {
     if (currentWorkspace.isNotBlank()) return currentWorkspace
-    if (!Environment.isExternalStorageManager()) {
+    // ★ 走统一入口，不要直接调 Environment.isExternalStorageManager()
+    if (!hasAllFilesAccess(context)) {
         Log.w(TAG, "没有存储权限，跳过默认工作区创建")
         return null
     }
@@ -1964,11 +2003,15 @@ private fun readTextFile(path: String): ToolExecResult {
     workspaceViolation(path)?.let { return ToolExecResult(false, it) }
 
     val file = File(path)
+    // ⚠️ 这里刻意不打印 allFilesAccess：
+    //   查它需要 Context（Environment.isExternalStorageManager() 是 API 30+，
+    //   且必须判版本），而本函数是纯函数、被单元测试直接调用，
+    //   不能为了打日志把 Context 拖进来。
+    //   前面已经有 canRead，排查权限问题时看它更直接。
     Log.d(
         TOOL_LOG_TAG,
         "read_file path=$path, exists=${file.exists()}, isFile=${file.isFile}, " +
-            "canRead=${file.canRead()}, length=${file.length()}, " +
-            "allFilesAccess=${Environment.isExternalStorageManager()}"
+            "canRead=${file.canRead()}, length=${file.length()}"
     )
 
     return when {
@@ -2066,11 +2109,12 @@ internal fun writeTextFile(path: String, content: String): ToolExecResult {
     val parent = file.parentFile
         ?: return ToolExecResult(false, "路径不合法（取不到父目录）：$path")
 
+    // 同上：不打印 allFilesAccess，理由见 readTextFile 里的注释
     Log.d(
         TOOL_LOG_TAG,
         "write_file path=$path, bytes=${bytes.size}, exists=${file.exists()}, " +
             "isDirectory=${file.isDirectory}, parent=${parent.absolutePath}, " +
-            "parentExists=${parent.exists()}, allFilesAccess=${Environment.isExternalStorageManager()}"
+            "parentExists=${parent.exists()}"
     )
 
     // ④ 目标是个目录 → 提前拒绝。
@@ -3053,6 +3097,11 @@ internal fun runCode(code: String): ToolExecResult {
     } catch (e: Throwable) {
         failure = e.message ?: e.javaClass.simpleName
         // Rhino 的 EvaluatorException 带行号，对模型排错非常有用
+        //
+        // ⚠️ lineNumber 在 Rhino 1.7.13 里被标了 @Deprecated，
+        //    但它是拿「脚本第几行出错」最直接的公开 API；
+        //    替代方案（解析 message 字符串）更脆弱。所以这里显式抑制。
+        @Suppress("DEPRECATION")
         if (e is EvaluatorException) failureLine = e.lineNumber
         Log.e(TOOL_LOG_TAG, "run_code 执行失败: ${e.message}", e)
     } finally {
@@ -3305,7 +3354,7 @@ private fun parseUsage(json: String): UsageStats? {
             cacheHitTokens = u.optInt("prompt_cache_hit_tokens", 0),
             completionTokens = u.optInt("completion_tokens", 0)
         )
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         null
     }
 }
@@ -3771,7 +3820,10 @@ data class ChatSession(
 // ============================================================
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
-    val dao: ChatDao = AppDatabase.get(app).chatDao()
+    // ★ 这里刻意不放 dao：
+    //   ChatScreen 里已经有 val dao = remember { AppDatabase.get(context).chatDao() }，
+    //   ViewModel 再存一份只是重复引用，而且从来没人用过。
+    //   （留这行注释是为了说明「不是漏了」，是刻意删的。）
 
     // ---------- 状态（界面通过 by 委托读取/写入） ----------
     val sessions = mutableStateListOf<ChatSession>()
@@ -4137,7 +4189,7 @@ fun ChatScreen() {
                     val listState = rememberLazyListState()
                     val itemCount = currentMessages.size
                     val lastLen = currentMessages.lastOrNull()?.content?.length ?: 0
-                    var prevCount by remember { mutableStateOf(0) }
+                    var prevCount by remember { mutableIntStateOf(0) }
 
                     // 「最后一条是否已经露在屏幕里」。用 index 判断而不是精确偏移，
                     // 是因为流式输出的气泡经常比屏幕还高，精确偏移反而判不准。
@@ -4468,7 +4520,7 @@ fun ChatScreen() {
                                             put("ok", JSONObject.NULL)   // JSON null = 还在执行
                                             put("output", "")
                                         }.toString()
-                                    } catch (e: Exception) {
+                                    } catch (_: Exception) {
                                         // 参数不是合法 JSON 也要能显示出来
                                         JSONObject().apply {
                                             put("tool", toolName)
@@ -4521,7 +4573,7 @@ fun ChatScreen() {
                                             put("ok", ok)
                                             put("output", output)
                                         }.toString()
-                                    } catch (e: Exception) {
+                                    } catch (_: Exception) {
                                         current
                                     }
 
@@ -5685,7 +5737,7 @@ fun SettingsScreen(
         }
     }
 
-    var tab by remember { mutableStateOf(0) }
+    var tab by remember { mutableIntStateOf(0) }
     val tabTitles = listOf(
         stringResource(R.string.tab_general),
         stringResource(R.string.tab_model),
@@ -6586,7 +6638,7 @@ fun MessageBubble(
     // ---------- 长按复制 ----------
     var menuOpen by remember { mutableStateOf(false) }
     // 气泡高度：菜单要贴着气泡下沿弹出，所以得先量一下
-    var bubbleHeight by remember { mutableStateOf(0) }
+    var bubbleHeight by remember { mutableIntStateOf(0) }
     // 代码块只在正文变化时重新抽一次，重组时不重复扫描
     val codeBlocks = remember(message.content) { extractCodeBlocks(displayContent(message.content)) }
 
@@ -7167,7 +7219,7 @@ private fun parseToolCall(content: String): ToolCallView {
         }
 
         ToolCallView(name, argsText, ok, (root.opt("output") as? String) ?: "", diff)
-    } catch (e: Exception) {
+    } catch (_: Exception) {
         // 不是合法 JSON 就原样显示，绝不让界面崩
         ToolCallView("unknown", content, null, "")
     }
@@ -7542,7 +7594,8 @@ private const val ATTACH_DIR = "attachments"
 private fun persistAttachment(context: Context, uri: Uri, name: String): Result<File> {
     return try {
         val workspaceRoot = currentWorkspace.ifBlank {
-            if (Environment.isExternalStorageManager()) DEFAULT_WORKSPACE else ""
+            // ★ 走统一入口，不要直接调 Environment.isExternalStorageManager()
+            if (hasAllFilesAccess(context)) DEFAULT_WORKSPACE else ""
         }
         val dir = if (workspaceRoot.isNotBlank()) {
             File(workspaceRoot, ATTACH_DIR)
@@ -7985,3 +8038,4 @@ fun MessageBubblePreview() {
         }
     }
 }
+
