@@ -77,6 +77,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
+import java.io.IOException
 import java.io.InputStreamReader
 import android.content.Context
 import androidx.compose.material3.TextButton
@@ -110,7 +111,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
@@ -124,6 +129,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import java.util.UUID
@@ -201,6 +207,7 @@ val SYSTEM_PROMPT = """
 - list_dir(path)：列出某个目录下的文件和文件夹名称。
 - search_files(keyword, path)：在某个目录下递归搜索文件名包含 keyword 的文件，返回绝对路径（最多 20 条）。
 - read_file(path)：读取文本文件的纯文本内容。
+- write_file(path, content)：把文本内容写入文件（不存在就新建，已存在就整份覆盖）。父目录会自动创建。
 - run_shell(command)：通过 Shizuku 以 shell 权限执行命令，返回输出。需要用户先在 App 里授权 Shizuku。
 
 严格遵守以下规则：
@@ -220,11 +227,18 @@ val SYSTEM_PROMPT = """
 7. 回答简洁、分点，不要长篇大论。
 8. run_shell 权限很高，要严格把关：
    - 只有用户明确要求"执行命令 / 跑一下 shell / 看看进程列表"时才用；
-   - 单纯读写文件请用 read_file / list_dir / search_files，不要用 run_shell 绕；
+   - 单纯读写文件请用 read_file / write_file / list_dir / search_files，不要用 run_shell 绕；
    - 破坏性命令（rm、mv、格式化、pm uninstall 等）一律先向用户确认，不要直接执行。
 9. 系统对 run_shell 装了黑名单：rm、pm uninstall、reboot、mkfs、dd 写块设备、
    改系统设置等会被直接拦截。一旦收到「安全拦截」，不要换一种写法重试，
    直接告诉用户这个操作被系统禁止了。
+10. write_file 会把 content 原样写入（UTF-8），已存在的文件会被整份覆盖，不是追加：
+   - 用户说「新建 / 写一份 / 生成 / 保存成文件 / 改一下」时才用；
+   - 覆盖一个已存在的文件之前，先用 read_file 看清原内容，避免把用户的东西冲掉；
+     如果原文件很重要而你不确定，就先问用户一句再写；
+   - 只能写纯文本。生成 pptx / docx / xlsx / 图片 / 压缩包等二进制文件不是它能做的事，
+     遇到这种要求要如实说明，不要假装写成功了；
+   - 写完把最终路径和字节数如实报告，不要说"应该已经写好了"这种含糊话。
 """.trim()
 
 /**
@@ -236,11 +250,11 @@ val SYSTEM_PROMPT = """
 private fun systemPromptWithWorkspace(): String {
     val ws = currentWorkspace
     return if (ws.isBlank()) {
-        SYSTEM_PROMPT + "\n\n10. 用户还没有设置工作区，暂时不限制路径范围。"
+        SYSTEM_PROMPT + "\n\n11. 用户还没有设置工作区，暂时不限制路径范围。"
     } else {
         SYSTEM_PROMPT +
-            "\n\n10. 你的工作区是：$ws" +
-            "\n    所有工具操作（读文件、列目录、搜索、shell）都必须严格限制在这个目录下，严禁越界。" +
+            "\n\n11. 你的工作区是：$ws" +
+            "\n    所有工具操作（读文件、写文件、列目录、搜索、shell）都必须严格限制在这个目录下，严禁越界。" +
             "\n    越界的操作会被代码层直接拦截并返回「工作区越界」，不要换路径反复重试。"
     }
 }
@@ -965,6 +979,27 @@ private val TOOL_DEFINITIONS = """
   {
     "type": "function",
     "function": {
+      "name": "write_file",
+      "description": "把文本内容写入一个文件：文件不存在就新建，已存在就整份覆盖。用于创建或修改笔记、代码、Markdown、配置等纯文本文件。不能写二进制文件。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "要写入的文件绝对路径，必须带文件名，例如 /sdcard/Documents/notes.md。父目录不存在会自动创建。"
+          },
+          "content": {
+            "type": "string",
+            "description": "要写入的完整文本内容（UTF-8）。注意这是整份内容，不是追加到原文件后面。"
+          }
+        },
+        "required": ["path", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "run_shell",
       "description": "通过 Shizuku 以 shell 权限执行一条命令，返回标准输出和错误输出。权限很高，只在用户明确要求执行命令时使用。",
       "parameters": {
@@ -1000,6 +1035,22 @@ private const val MAX_TOOL_ROUNDS = 5
  * 超过就明确告诉模型"文件太大"，比让它把 App 搞崩要好。
  */
 private const val MAX_FILE_BYTES = 5_242_880L
+
+/**
+ * 单次 write_file 允许写入的最大字节数：2 MB。
+ *
+ * 比读取上限小，是因为模型一次输出 2MB 文本几乎不可能（上下文窗口也不够），
+ * 真到这个量级基本是模型把 content 参数写歪了。拦下来比让 App 卡死好。
+ */
+private const val MAX_WRITE_BYTES = 2_097_152L
+
+/**
+ * 覆盖已有文件时，原文件超过这个大小就不留 .bak 备份。
+ *
+ * 备份是为了防止模型手滑把用户文件冲掉；但原文件很大时再复制一份
+ * 会让磁盘占用翻倍，所以只在 1MB 以内备份。
+ */
+private const val MAX_BACKUP_BYTES = 1_048_576L
 
 /** 单次 search_files 最多返回多少条匹配 */
 private const val MAX_SEARCH_HITS = 20
@@ -1116,6 +1167,20 @@ private fun treeUriToPath(uri: Uri): String? {
 }
 
 /**
+ * 取规范路径；万一 canonicalPath 抛异常（权限不足之类），退回 absolutePath 保底。
+ *
+ * canonicalPath 会真正解析掉 ".." 和符号链接 —— 这是判断"是否在工作区内"的前提。
+ */
+private fun safeCanonicalPath(file: File): String {
+    return try {
+        file.canonicalPath
+    } catch (e: Exception) {
+        Log.e(TOOL_LOG_TAG, "canonicalPath 失败，退回 absolutePath: ${file.absolutePath}", e)
+        file.absolutePath
+    }
+}
+
+/**
  * 检查某个路径是否在工作区内。
  * @return null = 放行；非 null = 越界说明（直接作为工具结果回传给模型）
  */
@@ -1123,10 +1188,17 @@ private fun workspaceViolation(path: String): String? {
     val ws = currentWorkspace
     if (ws.isBlank()) return null          // 没设工作区 → 不限制
 
-    val target = File(path).absolutePath
-    val root = File(ws).absolutePath.trimEnd('/')
+    // ⚠️⚠️ 这里必须用 canonicalPath，不能用 absolutePath。
+    //      File.absolutePath 只做「相对路径 → 绝对路径」的拼接，**不会消掉 ".."**。
+    //      于是 /ws/../../../data/data/com.xxx/f 依旧以 "/ws/" 开头，
+    //      会被判成「在工作区内」—— 这是路径前缀判断最容易被忽略的绕过方式。
+    //      canonicalPath 会真正解析 ".." 和符号链接，得到落盘时的真实路径。
+    //      （write_file 上线后这条从"理论风险"变成了"能删掉系统文件"，
+    //        所以必须用 canonical 而不是 absolute。）
+    val target = safeCanonicalPath(File(path))
+    val root = safeCanonicalPath(File(ws)).trimEnd('/')
 
-    // ⚠️ 不能直接写 target.startsWith(root)：
+    // ⚠️ 也不能直接写 target.startsWith(root)：
     //    "/storage/emulated/0/DocumentsX" 也以 "/storage/emulated/0/Documents" 开头，
     //    这是路径前缀判断的经典误判。必须比「root + 分隔符」。
     val inside = target == root || target.startsWith("$root/")
@@ -1208,6 +1280,136 @@ private fun readTextFile(path: String): ToolExecResult {
                 ToolExecResult(true, text)
             }
         }
+    }
+}
+
+/**
+ * write_file：把文本写进文件（不存在就新建，已存在就整份覆盖）。
+ *
+ * 安全检查的顺序不能调：
+ *   ① 工作区越界 → ② 路径合法性 → ③ 内容大小 → ④ 目标是不是目录
+ *   → ⑤ 父目录 → ⑥ 覆盖前备份 → ⑦ 真正写入
+ *
+ * ★ 为什么每一步都要单独判、单独给话术：
+ *   模型拿到"执行失败"这四个字只会重复调用，拿到"父目录不存在且创建失败"
+ *   才知道该换路径。错误信息就是 Agent 的观测值，写得越具体，它越不容易钻牛角尖。
+ */
+private fun writeTextFile(path: String, content: String): ToolExecResult {
+    // ① 工作区越界检查（必须在碰任何文件之前）
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+
+    // ② 路径合法性：写入必须落到具体文件上
+    if (path.endsWith("/")) {
+        return ToolExecResult(
+            false,
+            "路径不能以 / 结尾：$path。请给出包含文件名的完整路径，例如 /sdcard/Documents/a.txt"
+        )
+    }
+
+    val bytes = content.toByteArray(Charsets.UTF_8)
+    if (bytes.size > MAX_WRITE_BYTES) {
+        return ToolExecResult(
+            false,
+            "内容太大（${bytes.size} 字节），超过 ${MAX_WRITE_BYTES / 1024 / 1024}MB 上限，未写入。" +
+                "请拆成几个文件写，或者只写真正需要的那部分。"
+        )
+    }
+
+    val file = File(path)
+    val parent = file.parentFile
+        ?: return ToolExecResult(false, "路径不合法（取不到父目录）：$path")
+
+    Log.d(
+        TOOL_LOG_TAG,
+        "write_file path=$path, bytes=${bytes.size}, exists=${file.exists()}, " +
+            "isDirectory=${file.isDirectory}, parent=${parent.absolutePath}, " +
+            "parentExists=${parent.exists()}, allFilesAccess=${Environment.isExternalStorageManager()}"
+    )
+
+    // ④ 目标是个目录 → 提前拒绝。
+    //    ｜ 不判的话 writeBytes 会抛 FileNotFoundException("Is a directory")，
+    //    ｜ 模型看到 "FileNotFoundException" 只会以为是"文件不存在"，然后反复重试。
+    if (file.isDirectory) {
+        return ToolExecResult(
+            false,
+            "目标是一个目录，不能当文件写：$path。请换一个带文件名的路径，例如 $path/note.txt"
+        )
+    }
+
+    // ⑤ 父目录不存在就创建（模型经常写到一个还不存在的新目录）
+    var createdDirs = false
+    if (!parent.exists()) {
+        parent.mkdirs()
+        if (!parent.isDirectory) {
+            Log.e(TOOL_LOG_TAG, "父目录创建失败: ${parent.absolutePath}")
+            return ToolExecResult(
+                false,
+                "父目录不存在且创建失败：${parent.absolutePath}。" +
+                    "请确认路径拼写是否正确，或者换一个已经存在的目录。"
+            )
+        }
+        createdDirs = true
+        Log.d(TOOL_LOG_TAG, "已创建父目录: ${parent.absolutePath}")
+    }
+
+    // ⑥ 覆盖前备份：只在原文件不太大时做，避免磁盘占用翻倍
+    val existedBefore = file.exists() && file.isFile
+    val oldSize = if (existedBefore) file.length() else 0L
+    var backupNote = ""
+    if (existedBefore && oldSize in 1..MAX_BACKUP_BYTES && !path.endsWith(".bak")) {
+        try {
+            val bak = File("$path.bak")
+            file.copyTo(bak, overwrite = true)
+            backupNote = "，原文件已备份到 ${bak.name}"
+        } catch (e: Exception) {
+            // 备份失败不阻断写入，但要让模型和用户都知道这次没有后悔药
+            Log.e(TOOL_LOG_TAG, "备份失败（继续写入）: ${e.message}", e)
+            backupNote = "，原文件备份失败（${e.javaClass.simpleName}）"
+        }
+    }
+
+    // ⑦ 真正写入
+    return try {
+        file.writeBytes(bytes)
+
+        // 落盘后复查长度：writeBytes 正常不会少写，
+        // 但存储满时有些实现会"写成功"却只落了一部分，这里兜一层。
+        val newSize = file.length()
+        if (newSize != bytes.size.toLong()) {
+            Log.e(TOOL_LOG_TAG, "写入长度不符: 期望 ${bytes.size}，实际 $newSize")
+            return ToolExecResult(
+                false,
+                "写入不完整：期望 ${bytes.size} 字节，实际只写进 $newSize 字节。" +
+                    "多半是手机存储空间不足，请让用户清一下空间再试。"
+            )
+        }
+
+        val dirNote = if (createdDirs) "，并创建了目录 ${parent.absolutePath}" else ""
+        val msg = if (existedBefore) {
+            "已覆盖文件：$path（原 $oldSize 字节 → 现 $newSize 字节，UTF-8）$backupNote$dirNote"
+        } else {
+            "已创建文件：$path（$newSize 字节，UTF-8）$dirNote"
+        }
+        Log.d(TOOL_LOG_TAG, "写入成功: $path, $newSize 字节")
+        ToolExecResult(true, msg)
+    } catch (e: SecurityException) {
+        Log.e(TOOL_LOG_TAG, "没有写入权限: $path", e)
+        ToolExecResult(
+            false,
+            "没有写入权限：$path。请到系统设置里确认本应用已获得「所有文件访问权限」。"
+        )
+    } catch (e: IOException) {
+        // 把内核 errno 翻译成人话，否则模型只会看到一串 "EACCES (Permission denied)"
+        val raw = (e.message ?: "").lowercase()
+        val friendly = when {
+            "enospc" in raw || "no space" in raw -> "存储空间不足，写入失败"
+            "eacces" in raw || "permission denied" in raw ->
+                "没有写入权限（这个目录可能属于其它应用）"
+            "erofs" in raw -> "目标位置是只读的，无法写入"
+            else -> "写入失败"
+        }
+        Log.e(TOOL_LOG_TAG, "$friendly: $path（${e.message}）", e)
+        ToolExecResult(false, "$friendly：$path（${e.javaClass.simpleName}: ${e.message}）")
     }
 }
 
@@ -1545,6 +1747,30 @@ private fun executeTool(name: String, argsJson: String): ToolExecResult {
                     )
                 } else {
                     readTextFile(path)
+                }
+            }
+
+            "write_file" -> {
+                val path = cleanPath(argOf(argsJson, "path"))
+
+                // ★ content 绝对不能过 cleanPath：
+                //   cleanPath 会削掉首尾的引号 / 逗号 / 句号 —— 对路径是必要的，
+                //   对正文是毁灭性的（一段以 " 结尾的代码、一句以。结尾的中文都会被吃掉）。
+                val content = argOf(argsJson, "content")
+
+                when {
+                    path.isBlank() -> ToolExecResult(
+                        false,
+                        "参数错误：缺少 path。请给出要写入的文件绝对路径，例如 /sdcard/Documents/a.txt"
+                    )
+
+                    content.isEmpty() -> ToolExecResult(
+                        false,
+                        "参数错误：content 是空的，一个字都没写。" +
+                            "如果确实想创建一个空文件，请把 content 传成 \"\\n\"。"
+                    )
+
+                    else -> writeTextFile(path, content)
                 }
             }
 
@@ -3747,6 +3973,33 @@ private fun parseToolCall(content: String): ToolCallView {
 /** 展开时最多显示多少字符的结果（完整内容已经发给模型了，这里只是别再压垮界面） */
 private const val MAX_TOOL_OUTPUT_PREVIEW = 4000
 
+/**
+ * 每种工具配一个图标 + 主色。
+ *
+ * 目的很实在：读和写是两种性质完全不同的操作 ——
+ *   read_file  = 灰色扳手，只看不动
+ *   write_file = 绿色钢笔，会改磁盘
+ * 一眼能分清，就不会把"我让它写个文件"和"它读了个文件"看混。
+ *
+ * ⚠️ 只用了 material-icons-core 自带的图标（Build / Edit / List / Search / PlayArrow）。
+ *    想换成 Folder / Terminal / Save 那些更贴切的，得先加 material-icons-extended 依赖
+ *    （几千个图标、好几 MB），为五个图标不值得 —— R8 虽然能裁，但没必要开这个口子。
+ */
+private data class ToolVisual(val icon: ImageVector, val tint: Color)
+
+@Composable
+private fun toolVisual(name: String): ToolVisual {
+    val cs = MaterialTheme.colorScheme
+    return when (name) {
+        "read_file" -> ToolVisual(Icons.Default.Build, cs.onSurfaceVariant)      // 扳手
+        "write_file" -> ToolVisual(Icons.Default.Edit, Color(0xFF3FB950))        // 绿色钢笔
+        "list_dir" -> ToolVisual(Icons.AutoMirrored.Filled.List, cs.onSurfaceVariant)  // 列表
+        "search_files" -> ToolVisual(Icons.Default.Search, cs.onSurfaceVariant)  // 放大镜
+        "run_shell" -> ToolVisual(Icons.Default.PlayArrow, Color(0xFFD29922))    // 琥珀色，提示高权限
+        else -> ToolVisual(Icons.Default.Build, cs.onSurfaceVariant)
+    }
+}
+
 @Composable
 private fun ToolCallCard(
     message: ChatMessage,
@@ -3789,7 +4042,13 @@ private fun ToolCallCard(
         ) {
             // ---------- 标题行 ----------
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(text = "🔧", fontFamily = FontFamily.Monospace)
+                val visual = toolVisual(view.name)
+                Icon(
+                    imageVector = visual.icon,
+                    contentDescription = null,      // 工具名就在右边文字里，重复朗读没意义
+                    tint = visual.tint,
+                    modifier = Modifier.size(16.dp)
+                )
                 Spacer(Modifier.width(8.dp))
                 Text(
                     text = title,
