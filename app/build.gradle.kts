@@ -27,6 +27,30 @@ if (localPropsFile.exists()) {
 val deepSeekApiKey: String = localProps.getProperty("DEEPSEEK_API_KEY") ?: ""
 // =====================================================
 
+// ===== 读取 release 签名配置（同样来自 local.properties）=====
+//
+// ★ 为什么不把口令硬编码在这个文件里：
+//   build.gradle.kts 是要进 Git 的，硬编码等于把签名口令公开。
+//   放进 local.properties（已被 .gitignore 忽略）之后，
+//   仓库里只有「怎么读」，没有「读到的值」。
+//
+// ★ 换电脑/重装时：把 .keystore/coolstream-release.jks 和 local.properties
+//   里那 4 个 RELEASE_* 键一起搬过去，否则打不出可覆盖安装的包。
+//
+// ★ 缺配置时的处理：不让构建直接失败，而是把 signingConfig 留空 ——
+//   这样 `assembleDebug`、单元测试这些日常操作在任何机器上都能跑，
+//   只有真正要出 release 包时才需要密钥库。
+val releaseStoreFile: String? = localProps.getProperty("RELEASE_STORE_FILE")
+val releaseStorePassword: String? = localProps.getProperty("RELEASE_STORE_PASSWORD")
+val releaseKeyAlias: String? = localProps.getProperty("RELEASE_KEY_ALIAS")
+val releaseKeyPassword: String? = localProps.getProperty("RELEASE_KEY_PASSWORD")
+
+// 四项齐全、且密钥库文件真实存在，才算「签名可用」
+val hasReleaseSigning: Boolean = listOf(
+    releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword
+).all { !it.isNullOrBlank() } && rootProject.file(releaseStoreFile!!).exists()
+// =====================================================
+
 android {
     namespace = "com.example.mychat"
     compileSdk = 36
@@ -69,13 +93,57 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // ===== 签名配置 =====
+    //
+    // 只有 local.properties 里四项齐全时才会真正创建这个 signingConfig。
+    // 缺任何一项就不创建 —— 此时 release 包会是未签名状态（打得出，装不上），
+    // 但 debug 包和单元测试完全不受影响。
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = rootProject.file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+
+                // v1/v2 都开：minSdk 24 的老机器只认 v1（JAR 签名），
+                // Android 7+ 优先用 v2。少一个就会出现「有的手机装不上」。
+                enableV1Signing = true
+                enableV2Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // ===== R8 混淆 + 资源压缩 =====
+            //
+            // ★ 打开这两个之后，任何「靠反射/字符串找类」的代码都可能被删掉，
+            //   所以 proguard-rules.pro 里的 keep 规则不是可选项，是保命的。
+            //   本项目有四个高危点（见 proguard-rules.pro 的注释）：
+            //     · Rhino 的 JS 引擎（反射创建解释器与作用域）
+            //     · Shizuku 的 AIDL（跨进程按类名实例化 RemoteShellService）
+            //     · Room 生成的 _Impl（按类名反射加载）
+            //     · ShizukuProvider（Manifest 声明，系统反射实例化）
+            isMinifyEnabled = true
+            isShrinkResources = true
+
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+
+            // 有密钥库就用它签，没有就退回 debug 签名（保证能装上自己测）
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
+
+            // 保留行号信息：线上崩溃堆栈要能定位到源码行，
+            // 配合下面的 -renamesourcefileattribute 隐藏真实文件名。
+            // 体积代价很小（约 1%），排查价值极大。
+            isDebuggable = false
         }
     }
 
@@ -144,6 +212,10 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    // HorizontalPager（首次启动引导的分页容器）在 foundation 里。
+    // material3 会传递带入 foundation，但 Pager 是 foundation 自己的 API，
+    // 显式声明一份可以避免「哪天 material3 改了传递依赖」时突然编译不过。
+    implementation("androidx.compose.foundation:foundation")
     testImplementation(libs.junit)
     // ★ 单元测试必须用真的 org.json。
     //   测试跑在 JVM 上，classpath 里那份 org.json 来自 android.jar 的桩实现，

@@ -27,3 +27,10 @@ local.properties
 
 # adb uiautomator dump 的临时文件（调试时可能落在项目根目录）
 /u.xml
+
+# ===== 签名密钥库 =====
+# ⚠️ 绝对不能进仓库：拿到 .jks + 口令就能以你的名义发布覆盖包。
+#    口令写在 local.properties（同样已被忽略），换机器时要手动搬这两个东西。
+/.keystore/
+*.jks
+*.keystore

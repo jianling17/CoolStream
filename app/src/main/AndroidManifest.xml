@@ -61,10 +61,18 @@
             Shizuku 会把这个 Service 跑在「shell 权限」的进程里，
             我们的 App 通过 AIDL 接口把命令丢过去执行。
             exported 必须是 false —— 只让 Shizuku 绑，不让别的 App 绑。
+
+            ⚠️ tools:ignore="Instantiatable" 是必需的，不是偷懒：
+               lint 要求 <service> 声明的类必须 extends android.app.Service，
+               但 Shizuku 的 UserService 走的是另一套 —— 它必须 extends
+               IRemoteShell.Stub（AIDL 生成类），然后由 Shizuku 在它自己的
+               进程里 new 出来。改成继承 Service 反而会让 AIDL 绑不上。
+               这是 Shizuku 官方推荐的写法，lint 不认识这种模式，故精确豁免。
         -->
         <service
             android:name=".RemoteShellService"
-            android:exported="false" />
+            android:exported="false"
+            tools:ignore="Instantiatable" />
 
         <!--
             Shizuku 的 provider。
