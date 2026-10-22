@@ -30,6 +30,18 @@ It also ships a real **agent loop** — tool calling, local execution, result fe
 
 ---
 
+## Screenshots
+
+Captured on a Pixel 9 Pro emulator (Android 17), dark theme.
+
+| Chat — tool cards & code blocks | Navigation drawer | Settings |
+|:---:|:---:|:---:|
+| ![Chat interface with a tool-call card and a Kotlin code block](docs/screenshot-chat.png) | ![Navigation drawer with search, grouped sessions and the CoolStream brand row](docs/screenshot-drawer.png) | ![Full-screen settings with workspace path and build version](docs/screenshot-settings.png) |
+
+The first shot is the part worth looking at: a **tool-call card** (`已执行: read_file`, green status dot) sitting between the user's request and the answer, plus a **fenced code block** rendered with a dark background and forced monospace. The bottom bar shows the per-turn cost estimate and context usage read straight from the API's `usage` field.
+
+---
+
 ## What This Is
 
 ### The problem
@@ -370,6 +382,18 @@ CoolStream 是一个**完全原生 Jetpack Compose** 实现的 DeepSeek 安卓�
 它还带一套**真实的 Agent 闭环**——工具调用、本地执行、结果回填、二次请求——其中包括通过 **Shizuku** 提权执行的 `run_shell`。
 
 > **下结论前请先看[「说明与局限」](#说明与局限)。** 这是一份实验记录，不是产品。批处理优化的只是「UI 重绘」这一块，不涉及屏幕背光，也不涉及射频。
+
+---
+
+## 界面截图
+
+在 Pixel 9 Pro 模拟器（Android 17）上截取，深色主题。
+
+| 聊天 —— 工具卡片与代码块 | 侧边栏 | 设置页 |
+|:---:|:---:|:---:|
+| ![聊天界面：工具调用卡片 + Kotlin 代码块](docs/screenshot-chat.png) | ![侧边栏：搜索、按日期分组的会话列表、CoolStream 品牌行](docs/screenshot-drawer.png) | ![全屏设置页：工作区路径与版本号](docs/screenshot-settings.png) |
+
+第一张是重点：用户提问和 AI 回答之间插着一张**工具调用卡片**（`已执行: read_file`，右侧绿点），下面是**围栏代码块**——深色底 + 强制等宽字体。底部那一行是每轮费用估算和上下文用量，数据直接来自 API 返回的 `usage` 字段。
 
 ---
 

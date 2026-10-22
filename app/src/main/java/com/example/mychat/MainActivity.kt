@@ -2872,6 +2872,36 @@ fun Sidebar(
                 .fillMaxSize()
                 .padding(horizontal = 12.dp, vertical = 12.dp)
         ) {
+            // ---------- 品牌行：CoolStream + 版本号 ----------
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 8.dp, end = 8.dp, top = 2.dp, bottom = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // 一个小的方形标记，像终端提示符，比纯文字更有极客感
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(cs.primary)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "CoolStream",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = cs.onSurface
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = BuildConfig.BUILD_VERSION_NAME,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = cs.onSurfaceVariant
+                )
+            }
+
             // ---------- 顶部：搜索胶囊（毛玻璃） ----------
             Surface(
                 shape = RoundedCornerShape(24.dp),

@@ -24,3 +24,6 @@ local.properties
 
 # Android Studio 自己的 App Insights 配置，机器相关
 /.idea/appInsightsSettings.xml
+
+# adb uiautomator dump 的临时文件（调试时可能落在项目根目录）
+/u.xml
