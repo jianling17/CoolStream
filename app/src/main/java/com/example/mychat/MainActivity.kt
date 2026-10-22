@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.IBinder
 import android.os.SystemClock
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -215,6 +216,24 @@ val SYSTEM_PROMPT = """
    改系统设置等会被直接拦截。一旦收到「安全拦截」，不要换一种写法重试，
    直接告诉用户这个操作被系统禁止了。
 """.trim()
+
+/**
+ * 实际发给模型的系统提示词 = 静态规则 + 当前工作区约束。
+ *
+ * 工作区是**运行时**才确定的（用户在设置页里选的），没法写死在 SYSTEM_PROMPT 里，
+ * 所以每次请求前拼上去。
+ */
+private fun systemPromptWithWorkspace(): String {
+    val ws = currentWorkspace
+    return if (ws.isBlank()) {
+        SYSTEM_PROMPT + "\n\n10. 用户还没有设置工作区，暂时不限制路径范围。"
+    } else {
+        SYSTEM_PROMPT +
+            "\n\n10. 你的工作区是：$ws" +
+            "\n    所有工具操作（读文件、列目录、搜索、shell）都必须严格限制在这个目录下，严禁越界。" +
+            "\n    越界的操作会被代码层直接拦截并返回「工作区越界」，不要换路径反复重试。"
+    }
+}
 
 /** 日志标签，Logcat 里用 tag:MyChatPerf 过滤 */
 private const val TAG = "MyChatPerf"
@@ -1025,8 +1044,96 @@ private fun cleanPath(raw: String): String {
     )
 }
 
+// ============================================================
+// 3.25 工作区（Workspace）
+//
+// 用一个目录把 Agent 圈起来：文件操作只能在这个目录内。
+//
+// ⚠️ 这是「防手滑」，不是「安全边界」：
+//    · run_shell 是 shell 权限，一条 `cat /data/xxx` 就出去了，代码层拦不住
+//    · 真正的隔离要靠操作系统级沙箱
+//    但 read_file / search_files / list_dir 这三个走 java.io.File 的工具，可以硬拦。
+// ============================================================
+private const val PREFS_NAME = "coolstream_prefs"
+private const val KEY_WORKSPACE = "workspace_path"
+
+/** 当前工作区绝对路径。空串 = 未设置，不做限制。 */
+@Volatile
+private var currentWorkspace: String = ""
+
+private fun loadWorkspace(context: Context): String {
+    return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        .getString(KEY_WORKSPACE, "")
+        ?: ""
+}
+
+private fun saveWorkspace(context: Context, path: String) {
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putString(KEY_WORKSPACE, path)
+        .apply()
+    currentWorkspace = path
+}
+
+/**
+ * 把 content:// 的 tree Uri 转成绝对路径。
+ *
+ * 例：content://com.android.externalstorage.documents/tree/primary%3ADocuments%2FWS
+ *     → documentId = "primary:Documents/WS"
+ *     → /storage/emulated/0/Documents/WS
+ *
+ * 外置 SD 卡的 volume 形如 "1A2B-3C4D"，对应 /storage/1A2B-3C4D/...
+ */
+private fun treeUriToPath(uri: Uri): String? {
+    return try {
+        val docId = DocumentsContract.getTreeDocumentId(uri)
+        val parts = docId.split(":", limit = 2)
+        if (parts.size != 2) {
+            null
+        } else {
+            val volume = parts[0]
+            val relative = parts[1]
+            if (volume.equals("primary", ignoreCase = true)) {
+                "/storage/emulated/0/$relative"
+            } else {
+                "/storage/$volume/$relative"
+            }
+        }
+    } catch (e: Exception) {
+        Log.e(TOOL_LOG_TAG, "treeUriToPath 失败: ${e.message}", e)
+        null
+    }
+}
+
+/**
+ * 检查某个路径是否在工作区内。
+ * @return null = 放行；非 null = 越界说明（直接作为工具结果回传给模型）
+ */
+private fun workspaceViolation(path: String): String? {
+    val ws = currentWorkspace
+    if (ws.isBlank()) return null          // 没设工作区 → 不限制
+
+    val target = File(path).absolutePath
+    val root = File(ws).absolutePath.trimEnd('/')
+
+    // ⚠️ 不能直接写 target.startsWith(root)：
+    //    "/storage/emulated/0/DocumentsX" 也以 "/storage/emulated/0/Documents" 开头，
+    //    这是路径前缀判断的经典误判。必须比「root + 分隔符」。
+    val inside = target == root || target.startsWith("$root/")
+
+    return if (inside) {
+        null
+    } else {
+        Log.e(TOOL_LOG_TAG, "工作区越界: path=$target, workspace=$root")
+        "工作区越界：$path 不在当前工作区（$ws）内，已拒绝执行。请在「设置 → 工作区」里调整工作区。"
+    }
+}
+
 /** read_file：文本就返回内容；二进制就明确告诉模型读不了 */
 private fun readTextFile(path: String): ToolExecResult {
+    // ★ 工作区越界检查（在碰文件之前）
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+
     val file = File(path)
     Log.d(
         TOOL_LOG_TAG,
@@ -1096,6 +1203,9 @@ private fun readTextFile(path: String): ToolExecResult {
 
 /** list_dir：列出目录内容（目录在前、文件在后） */
 private fun listDirectory(path: String): ToolExecResult {
+    // ★ 工作区越界检查
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+
     val dir = File(path)
     Log.d(
         TOOL_LOG_TAG,
@@ -1139,6 +1249,9 @@ private fun listDirectory(path: String): ToolExecResult {
 
 /** search_files：递归搜索「文件名包含关键词」的文件 */
 private fun searchFiles(keyword: String, rootPath: String): ToolExecResult {
+    // ★ 工作区越界检查：连搜索根目录都不许出界
+    workspaceViolation(rootPath)?.let { return ToolExecResult(false, it) }
+
     val root = File(rootPath)
     Log.d(
         TOOL_LOG_TAG,
@@ -1506,7 +1619,8 @@ fun runAgentLoop(
             if (SYSTEM_PROMPT.isNotEmpty()) {
                 messages.put(JSONObject().apply {
                     put("role", "system")
-                    put("content", SYSTEM_PROMPT)
+                    // ★ 带上当前工作区约束
+                    put("content", systemPromptWithWorkspace())
                 })
             }
 
@@ -1850,6 +1964,16 @@ fun ChatScreen() {
     // AppDatabase.get(...) 是单例，调多少次都只会创建一个数据库实例。
     val context = LocalContext.current
     val dao = remember { AppDatabase.get(context).chatDao() }
+
+    // ===== 工作区（Settings 页里选，存 SharedPreferences，重启不丢） =====
+    var workspace by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        workspace = loadWorkspace(context)
+        // ★ 同步给顶层的工具层：executeTool 是普通函数，读不到 Compose 状态，
+        //   所以用一个 @Volatile 的全局变量传递。
+        currentWorkspace = workspace
+        Log.d(TAG, "已加载工作区: ${workspace.ifBlank { "(未设置)" }}")
+    }
 
     // ===== 工具：按 id 更新某个会话 =====
     // ⚠️ 关键设计：流式回调里必须按"发送那一刻记下的 sessionId"更新，
@@ -2390,6 +2514,11 @@ fun ChatScreen() {
     if (showSettings) {
         SettingsScreen(
             shizukuGranted = shizukuGranted,
+            workspace = workspace,
+            onWorkspaceChanged = { path ->
+                workspace = path
+                // saveWorkspace() 已经在 SettingsScreen 里调过了，这里只同步界面状态
+            },
             onBack = { showSettings = false }
         )
     }
@@ -2628,6 +2757,8 @@ private fun SessionRow(
 @Composable
 fun SettingsScreen(
     shizukuGranted: Boolean,
+    workspace: String,
+    onWorkspaceChanged: (String) -> Unit,
     onBack: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
@@ -2635,6 +2766,24 @@ fun SettingsScreen(
 
     // 系统返回键 = 关闭设置页
     BackHandler(onBack = onBack)
+
+    // ===== 系统文件夹选择器 =====
+    // OpenDocumentTree 会弹出系统的「选择目录」界面，回调里给一个 content:// 的 tree Uri。
+    // 结果是【异步】回来的，所以要先转成绝对路径、落盘，再更新界面。
+    val folderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            val path = treeUriToPath(uri)
+            if (path.isNullOrBlank()) {
+                Log.e(TAG, "无法把 Uri 转成绝对路径: $uri")
+            } else {
+                saveWorkspace(context, path)     // 写 SharedPreferences + 更新全局 currentWorkspace
+                onWorkspaceChanged(path)         // 更新 Compose 状态，界面立刻刷新
+                Log.d(TAG, "工作区已设置: $path")
+            }
+        }
+    }
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -2680,6 +2829,46 @@ fun SettingsScreen(
                 item { InfoRow("接口", API_URL) }
                 item { InfoRow("批处理", "${FLUSH_INTERVAL_MS}ms") }
                 item { InfoRow("上下文", "最近 $MAX_HISTORY_MESSAGES 条") }
+
+                // ---------- 工作区 ----------
+                item { SectionHeader("工作区") }
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(6.dp))
+                            // 点一下弹系统的「选择目录」，选完自动转成绝对路径并保存
+                            .clickable { folderPicker.launch(null) }
+                            .padding(vertical = 8.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "工作区设置",
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = cs.onSurface,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (workspace.isBlank()) "选择目录" else "点击更换",
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = cs.onSurfaceVariant
+                            )
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = workspace.ifBlank { "未设置（不限制路径）" },
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (workspace.isBlank()) {
+                                cs.onSurfaceVariant
+                            } else {
+                                Color(0xFF3FB950)
+                            }
+                        )
+                    }
+                }
 
                 // ---------- 权限 ----------
                 item { SectionHeader("权限") }
