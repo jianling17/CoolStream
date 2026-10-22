@@ -6,9 +6,16 @@
 
 ## [Unreleased]
 
-### 进行中
-- **国际化（i18n）**：把界面文案抽到 `res/values/strings.xml` 与 `res/values-en/strings.xml`，
-  支持跟随系统语言 + 手动强制中/英。目前**尚未完成**，界面仍为中文硬编码。
+### 已实现
+- **国际化（i18n）基础设施**：`res/values/strings.xml`（中文）+ `res/values-en/strings.xml`（英文），
+  默认跟随系统语言；设置 → 通用 → 语言 可强制 中文 / English。
+  实现方式是用 `createConfigurationContext` 换掉 `LocalContext`，没有引入 appcompat。
+
+### 尚未完成（i18n 覆盖度约 65%）
+- 已迁移：引导页全部文案、设置页外壳与「通用」页、模型与 API 页的字段标签、
+  聊天页空状态/输入框/思考中、工具卡片标题、长按复制菜单、错误气泡标题
+- **仍是中文硬编码**：侧边栏分组、插件页说明、关于页正文、模型页「运行时/计费口径」正文、
+  以及全部网络/HTTP 错误文案（它们在非 Composable 的协程里，需要改成传 Context 才能取资源）
 
 ---
 

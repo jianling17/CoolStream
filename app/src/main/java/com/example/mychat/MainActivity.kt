@@ -7,6 +7,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -100,6 +101,7 @@ import android.content.Context
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -1315,6 +1317,7 @@ private const val KEY_THEME_MODE = "theme_mode"      // system / light / dark
 private const val KEY_FONT_SCALE = "font_scale"      // 0.9 / 1.0 / 1.15
 private const val KEY_CARD_EXPANDED = "tool_card_expanded"
 private const val KEY_TOOL_PREFIX = "tool_enabled_"
+private const val KEY_LANGUAGE = "language"   // system / zh / en
 
 /**
  * 全局设置的内存镜像。
@@ -1334,6 +1337,9 @@ private object AppSettings {
 
     /** 当前开启的工具名集合 */
     var enabledTools by mutableStateOf(ALL_TOOL_NAMES.toSet())
+
+    /** 界面语言：system / zh / en */
+    var language by mutableStateOf("system")
 }
 
 /**
@@ -1355,6 +1361,7 @@ internal fun loadAppSettings(context: Context) {
     AppSettings.themeMode = p.getString(KEY_THEME_MODE, "system") ?: "system"
     AppSettings.fontScale = p.getFloat(KEY_FONT_SCALE, 1f)
     AppSettings.cardExpanded = p.getBoolean(KEY_CARD_EXPANDED, false)
+    AppSettings.language = p.getString(KEY_LANGUAGE, "system") ?: "system"
     // 没写过的工具默认开启
     AppSettings.enabledTools = ALL_TOOL_NAMES.filter {
         p.getBoolean(KEY_TOOL_PREFIX + it, true)
@@ -1374,6 +1381,11 @@ internal fun setThemeMode(context: Context, mode: String) {
 internal fun setFontScale(context: Context, scale: Float) {
     prefsOf(context).edit().putFloat(KEY_FONT_SCALE, scale).apply()
     AppSettings.fontScale = scale
+}
+
+internal fun setLanguage(context: Context, lang: String) {
+    prefsOf(context).edit().putString(KEY_LANGUAGE, lang).apply()
+    AppSettings.language = lang
 }
 
 internal fun setCardExpanded(context: Context, expanded: Boolean) {
@@ -1855,6 +1867,22 @@ internal fun writeTextFile(path: String, content: String): ToolExecResult {
 // ============================================================
 // 3.26 文件改写：备份、定位、局部替换
 // ============================================================
+
+/**
+ * 返回一个「按指定语言」的 Context。
+ *
+ * ★ 为什么不引 appcompat 的 setApplicationLocales：
+ *   那要为了一行语言切换拖进一个几 MB 的库，还得改 Activity 基类。
+ *   这里只需要让 stringResource 读到正确的资源 —— 而它读的是 LocalContext，
+ *   所以造一个换了 locale 的 Context 塞下去就够了。
+ */
+private fun Context.withAppLocale(lang: String): Context {
+    if (lang == "system") return this
+    val locale = if (lang == "en") Locale.ENGLISH else Locale.SIMPLIFIED_CHINESE
+    val config = Configuration(resources.configuration)
+    config.setLocale(locale)
+    return createConfigurationContext(config)
+}
 
 /** 判断"空白差异"用的正则（缩进、空格、CRLF 全归一到单个空格） */
 private val WHITESPACE_RE = Regex("\\s+")
@@ -2922,7 +2950,14 @@ class MainActivity : ComponentActivity() {
             //   已经引导过（或用户点过「跳过」）就不再拦。
             var onboarded by remember { mutableStateOf(!needsOnboarding(this@MainActivity)) }
 
+            // 语言：跟随系统 / 强制中文 / 强制英文
+            val baseContext = LocalContext.current
+            val localizedContext = remember(AppSettings.language) {
+                baseContext.withAppLocale(AppSettings.language)
+            }
+
             CompositionLocalProvider(
+                LocalContext provides localizedContext,
                 LocalIsDark provides dark,
                 LocalDensity provides Density(baseDensity.density, AppSettings.fontScale)
             ) {
@@ -3326,7 +3361,7 @@ fun ChatScreen() {
                     },
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                            Icon(Icons.Default.Menu, contentDescription = "打开侧边栏")
+                            Icon(Icons.Default.Menu, contentDescription = stringResource(R.string.drawer_open))
                         }
                     },
                     actions = {
@@ -3345,7 +3380,7 @@ fun ChatScreen() {
                             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                 Icon(
                                     imageVector = Icons.Default.Add,
-                                    contentDescription = "新建对话",
+                                    contentDescription = stringResource(R.string.new_chat),
                                     tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(20.dp)
                                 )
@@ -3377,7 +3412,7 @@ fun ChatScreen() {
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "你好，我是 CoolStream",
+                            text = stringResource(R.string.chat_greeting),
                             style = MaterialTheme.typography.headlineMedium,
                             color = MaterialTheme.colorScheme.onBackground,
                             textAlign = TextAlign.Center,
@@ -3938,7 +3973,7 @@ fun Sidebar(
                             Box {
                                 if (query.isEmpty()) {
                                     Text(
-                                        text = "搜索会话",
+                                        text = stringResource(R.string.search_chats),
                                         fontFamily = FontFamily.Monospace,
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = cs.onSurfaceVariant
@@ -4231,7 +4266,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                text = "三步就能用起来。全部在本机完成，不经过任何服务器。",
+                text = stringResource(R.string.ob_subtitle),
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.bodySmall,
                 color = cs.onSurfaceVariant
@@ -4239,19 +4274,19 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             Spacer(Modifier.height(18.dp))
 
             // ---------- ① API Key ----------
-            OnboardStep(index = 1, title = "填入 API Key", done = keyOk) {
+            OnboardStep(index = 1, title = stringResource(R.string.ob_step1_title), done = keyOk) {
                 ConfigField(
-                    label = "API 地址",
+                    label = stringResource(R.string.field_api_base),
                     value = draftBase,
                     placeholder = DEFAULT_API_BASE,
                     helper = "",
                     onValueChange = { draftBase = it }
                 )
                 ConfigField(
-                    label = "API Key",
+                    label = stringResource(R.string.field_api_key),
                     value = draftKey,
                     placeholder = "sk-...",
-                    helper = "在 platform.deepseek.com 申请，只存在本机的加密存储里",
+                    helper = stringResource(R.string.ob_key_helper),
                     masked = !showKey,
                     trailing = {
                         TextButton(onClick = { showKey = !showKey }) {
@@ -4265,10 +4300,10 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     onValueChange = { draftKey = it }
                 )
                 ConfigField(
-                    label = "模型名称",
+                    label = stringResource(R.string.field_model),
                     value = draftModel,
                     placeholder = DEFAULT_MODEL,
-                    helper = "不确定就保持默认",
+                    helper = stringResource(R.string.ob_model_helper),
                     onValueChange = { draftModel = it }
                 )
             }
@@ -4276,10 +4311,9 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             Spacer(Modifier.height(12.dp))
 
             // ---------- ② 文件权限 ----------
-            OnboardStep(index = 2, title = "允许访问文件", done = storageOk) {
+            OnboardStep(index = 2, title = stringResource(R.string.ob_step2_title), done = storageOk) {
                 Text(
-                    text = "读文件、写文件、改代码、跑命令都依赖这个权限。" +
-                        "不开的话只能纯聊天，工具全部不可用。",
+                    text = stringResource(R.string.ob_step2_body),
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.bodySmall,
                     color = cs.onSurfaceVariant
@@ -4293,7 +4327,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     )
                 ) {
                     Text(
-                        text = if (storageOk) "已授权" else "去授权",
+                        text = if (storageOk) stringResource(R.string.ob_step2_done) else stringResource(R.string.ob_step2_action),
                         fontFamily = FontFamily.Monospace
                     )
                 }
@@ -4302,9 +4336,9 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             Spacer(Modifier.height(12.dp))
 
             // ---------- ③ Shizuku（可选） ----------
-            OnboardStep(index = 3, title = "Shizuku（可选）", done = shizukuOk) {
+            OnboardStep(index = 3, title = stringResource(R.string.ob_step3_title), done = shizukuOk) {
                 Text(
-                    text = "只有 run_shell 需要它。不装也不影响其它功能，以后想用再回来开。",
+                    text = stringResource(R.string.ob_step3_body),
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.bodySmall,
                     color = cs.onSurfaceVariant
@@ -4320,7 +4354,11 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     }
                 ) {
                     Text(
-                        text = if (isShizukuRunning()) "检查授权" else "Shizuku 服务未运行",
+                        text = if (isShizukuRunning()) {
+                            stringResource(R.string.ob_step3_check)
+                        } else {
+                            stringResource(R.string.ob_step3_not_running)
+                        },
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.labelSmall
                     )
@@ -4340,7 +4378,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                 )
             ) {
                 Text(
-                    text = if (canEnter) "进入 CoolStream" else "请先完成上面两步",
+                    text = if (canEnter) stringResource(R.string.ob_enter) else stringResource(R.string.ob_need_two),
                     fontFamily = FontFamily.Monospace
                 )
             }
@@ -4353,7 +4391,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        text = "跳过（工具将不可用，只能聊天）",
+                        text = stringResource(R.string.ob_skip),
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.labelSmall,
                         color = cs.onSurfaceVariant
@@ -4409,7 +4447,7 @@ private fun OnboardStep(
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    text = if (done) "已完成" else "待完成",
+                    text = if (done) stringResource(R.string.common_done) else stringResource(R.string.common_pending),
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelSmall,
                     color = if (done) accent else cs.onSurfaceVariant
@@ -4453,7 +4491,12 @@ fun SettingsScreen(
     }
 
     var tab by remember { mutableStateOf(0) }
-    val tabTitles = listOf("通用", "模型", "插件", "关于")
+    val tabTitles = listOf(
+        stringResource(R.string.tab_general),
+        stringResource(R.string.tab_model),
+        stringResource(R.string.tab_plugins),
+        stringResource(R.string.tab_about)
+    )
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -4478,11 +4521,11 @@ fun SettingsScreen(
                 IconButton(onClick = onBack) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "返回"
+                        contentDescription = stringResource(R.string.action_back)
                     )
                 }
                 Text(
-                    text = "设置",
+                    text = stringResource(R.string.settings_title),
                     style = MaterialTheme.typography.titleMedium
                 )
             }
@@ -4538,14 +4581,26 @@ private fun GeneralTab(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
     ) {
-        item { SectionHeader("外观") }
+        item { SectionHeader(stringResource(R.string.section_appearance)) }
         item {
             ChoiceRow(
-                label = "主题",
+                label = stringResource(R.string.label_language),
                 options = listOf(
-                    "system" to "跟随系统",
-                    "light" to "浅色",
-                    "dark" to "深色"
+                    "system" to stringResource(R.string.lang_system),
+                    "zh" to stringResource(R.string.lang_zh),
+                    "en" to stringResource(R.string.lang_en)
+                ),
+                selected = AppSettings.language,
+                onSelect = { setLanguage(context, it) }
+            )
+        }
+        item {
+            ChoiceRow(
+                label = stringResource(R.string.label_theme),
+                options = listOf(
+                    "system" to stringResource(R.string.theme_system),
+                    "light" to stringResource(R.string.theme_light),
+                    "dark" to stringResource(R.string.theme_dark)
                 ),
                 selected = AppSettings.themeMode,
                 onSelect = { setThemeMode(context, it) }
@@ -4553,24 +4608,28 @@ private fun GeneralTab(
         }
         item {
             ChoiceRow(
-                label = "字号",
-                options = listOf("0.9" to "小", "1.0" to "标准", "1.15" to "大"),
+                label = stringResource(R.string.label_font),
+                options = listOf(
+                    "0.9" to stringResource(R.string.font_small),
+                    "1.0" to stringResource(R.string.font_normal),
+                    "1.15" to stringResource(R.string.font_large)
+                ),
                 selected = AppSettings.fontScale.toString(),
                 onSelect = { setFontScale(context, it.toFloat()) }
             )
         }
 
-        item { SectionHeader("工具卡片") }
+        item { SectionHeader(stringResource(R.string.section_tool_card)) }
         item {
             SettingSwitchRow(
-                label = "默认展开",
-                desc = "新出现的工具调用卡片自动展开参数与结果",
+                label = stringResource(R.string.label_card_expanded),
+                desc = stringResource(R.string.desc_card_expanded),
                 checked = AppSettings.cardExpanded,
                 onChange = { setCardExpanded(context, it) }
             )
         }
 
-        item { SectionHeader("工作区") }
+        item { SectionHeader(stringResource(R.string.section_workspace)) }
         item {
             Column(
                 modifier = Modifier
@@ -4582,14 +4641,14 @@ private fun GeneralTab(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "工作区设置",
+                        text = stringResource(R.string.label_workspace),
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.bodySmall,
                         color = cs.onSurface,
                         modifier = Modifier.weight(1f)
                     )
                     Text(
-                        text = if (workspace.isBlank()) "选择目录" else "点击更换",
+                        text = if (workspace.isBlank()) stringResource(R.string.action_pick_dir) else stringResource(R.string.action_change),
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.bodySmall,
                         color = cs.onSurfaceVariant
@@ -4597,7 +4656,7 @@ private fun GeneralTab(
                 }
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = workspace.ifBlank { "未设置（不限制路径）" },
+                    text = workspace.ifBlank { stringResource(R.string.workspace_unset) },
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.bodySmall,
                     color = if (workspace.isBlank()) cs.onSurfaceVariant else Color(0xFF3FB950)
@@ -4605,12 +4664,12 @@ private fun GeneralTab(
             }
         }
 
-        item { SectionHeader("权限") }
+        item { SectionHeader(stringResource(R.string.section_permission)) }
         item {
             val storageOk = hasAllFilesAccess(context)
             PermissionRow(
-                label = "文件权限",
-                status = if (storageOk) "已开启" else "未开启",
+                label = stringResource(R.string.label_storage_perm),
+                status = if (storageOk) stringResource(R.string.common_on) else stringResource(R.string.common_off),
                 ok = storageOk,
                 onClick = { openAllFilesAccessSettings(context) }
             )
@@ -4618,11 +4677,11 @@ private fun GeneralTab(
         item {
             val running = isShizukuRunning()
             PermissionRow(
-                label = "Shizuku",
+                label = stringResource(R.string.label_shizuku),
                 status = when {
-                    !running -> "服务未运行"
-                    shizukuGranted -> "已授权"
-                    else -> "点此授权"
+                    !running -> stringResource(R.string.shizuku_not_running)
+                    shizukuGranted -> stringResource(R.string.shizuku_granted)
+                    else -> stringResource(R.string.shizuku_tap_grant)
                 },
                 ok = shizukuGranted,
                 onClick = {
@@ -4665,7 +4724,7 @@ private fun ModelTab() {
 
         item {
             ConfigField(
-                label = "API 地址",
+                label = stringResource(R.string.field_api_base),
                 value = draftBase,
                 placeholder = DEFAULT_API_BASE,
                 helper = "只填 https://api.deepseek.com 也行，会自动补 /chat/completions",
@@ -4675,7 +4734,7 @@ private fun ModelTab() {
 
         item {
             ConfigField(
-                label = "API Key",
+                label = stringResource(R.string.field_api_key),
                 value = draftKey,
                 placeholder = "sk-...",
                 helper = if (keyOk) {
@@ -4699,7 +4758,7 @@ private fun ModelTab() {
 
         item {
             ConfigField(
-                label = "模型名称",
+                label = stringResource(R.string.field_model),
                 value = draftModel,
                 placeholder = DEFAULT_MODEL,
                 helper = "例：deepseek-flash / deepseek-v4-pro",
@@ -4753,7 +4812,7 @@ private fun ModelTab() {
             )
         }
 
-        item { SectionHeader("运行时") }
+        item { SectionHeader(stringResource(R.string.section_runtime)) }
         item { InfoRow("批处理", "${FLUSH_INTERVAL_MS}ms") }
         item {
             // 1_000_000 显示成「1M」比「1000K」好读
@@ -4904,7 +4963,7 @@ private fun AboutTab() {
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
     ) {
-        item { SectionHeader("版本") }
+        item { SectionHeader(stringResource(R.string.section_version)) }
         item {
             // ★ 版本号来自 BuildConfig.BUILD_VERSION_NAME，
             //   由 build.gradle.kts 在【编译时】按「0.yyMMddHHmm」生成。
@@ -4918,14 +4977,14 @@ private fun AboutTab() {
             )
         }
 
-        item { SectionHeader("组成") }
+        item { SectionHeader(stringResource(R.string.section_stack)) }
         item { InfoRow("界面", "Jetpack Compose + Material 3") }
         item { InfoRow("网络", "OkHttp 4.12（手写 SSE 解析）") }
         item { InfoRow("数据", "Room v3 本地数据库") }
         item { InfoRow("提权", "Shizuku 13（AIDL UserService）") }
         item { InfoRow("工具", "${ALL_TOOL_NAMES.size} 个本地工具，见「插件」页") }
 
-        item { SectionHeader("说明") }
+        item { SectionHeader(stringResource(R.string.section_notes)) }
         item {
             Text(
                 text = "CoolStream 是个人项目，不是产品。\n" +
@@ -5278,7 +5337,7 @@ fun MessageBubble(
                             )
                             Spacer(Modifier.width(6.dp))
                             Text(
-                                text = "出错了",
+                                text = stringResource(R.string.error_title),
                                 fontFamily = FontFamily.Monospace,
                                 style = MaterialTheme.typography.labelMedium,
                                 color = errorAccent
@@ -5308,7 +5367,7 @@ fun MessageBubble(
                     )
                 } else {
                     Text(
-                        text = if (placeholder) "正在思考…" else message.content,
+                        text = if (placeholder) stringResource(R.string.thinking) else message.content,
                         color = textColor,
                         // 等宽字体：极客风的关键
                         fontFamily = FontFamily.Monospace,
@@ -5390,13 +5449,13 @@ private fun CopyMenu(
         tonalElevation = 0.dp
     ) {
         Column(Modifier.padding(6.dp)) {
-            GlassMenuItem("复制全文") { onCopy(fullText) }
+            GlassMenuItem(stringResource(R.string.menu_copy_all)) { onCopy(fullText) }
 
             if (codeBlocks.isNotEmpty()) {
                 val label = if (codeBlocks.size > 1) {
-                    "复制代码（${codeBlocks.size} 段）"
+                    stringResource(R.string.menu_copy_code_multi, codeBlocks.size)
                 } else {
-                    "复制代码"
+                    stringResource(R.string.menu_copy_code)
                 }
                 GlassMenuItem(label) { onCopy(codeBlocks.joinToString("\n\n")) }
             }
@@ -5856,9 +5915,9 @@ private fun ToolCallCard(
     val view = remember(message.content) { parseToolCall(message.content) }
 
     val title = when (view.ok) {
-        null -> "正在调用工具：${view.name}"
-        true -> "已执行：${view.name}"
-        false -> "执行失败：${view.name}"
+        null -> stringResource(R.string.tool_running, view.name)
+        true -> stringResource(R.string.tool_done, view.name)
+        false -> stringResource(R.string.tool_failed, view.name)
     }
 
     // 状态点的颜色：执行中灰、成功绿、失败红
@@ -6184,7 +6243,7 @@ fun InputBar(
                     Box {
                         if (text.isEmpty()) {
                             Text(
-                                text = if (enabled) "输入消息…" else "正在回复…",
+                                text = stringResource(R.string.input_hint),
                                 fontFamily = FontFamily.Monospace,
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = cs.onSurfaceVariant

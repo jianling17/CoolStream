@@ -1,0 +1,110 @@
+<resources>
+    <string name="app_name">CoolStream</string>
+
+    <!-- ============ Common ============ -->
+    <string name="common_done">Done</string>
+    <string name="common_pending">Pending</string>
+    <string name="common_on">Granted</string>
+    <string name="common_off">Not granted</string>
+    <string name="action_show">Show</string>
+    <string name="action_hide">Hide</string>
+    <string name="action_save">Save</string>
+    <string name="action_back">Back</string>
+
+    <!-- ============ Fields ============ -->
+    <string name="field_api_base">API base URL</string>
+    <string name="field_api_key">API Key</string>
+    <string name="field_model">Model name</string>
+
+    <!-- ============ Onboarding ============ -->
+    <string name="ob_subtitle">Three steps and you\'re in. Everything runs on this device — nothing goes through any server of ours.</string>
+    <string name="ob_step1_title">Enter your API Key</string>
+    <string name="ob_step2_title">Allow file access</string>
+    <string name="ob_step3_title">Shizuku (optional)</string>
+    <string name="ob_key_helper">Get one at platform.deepseek.com. Stored only in this device\'s encrypted storage.</string>
+    <string name="ob_model_helper">Leave it as is if you\'re not sure</string>
+    <string name="ob_step2_body">Reading, writing, editing files and running commands all need this. Without it you can only chat — every tool stays disabled.</string>
+    <string name="ob_step2_action">Grant access</string>
+    <string name="ob_step2_done">Granted</string>
+    <string name="ob_step3_body">Only run_shell needs it. Skipping it doesn\'t affect anything else — you can enable it later.</string>
+    <string name="ob_step3_check">Check permission</string>
+    <string name="ob_step3_not_running">Shizuku service is not running</string>
+    <string name="ob_enter">Enter CoolStream</string>
+    <string name="ob_need_two">Finish the two steps above first</string>
+    <string name="ob_skip">Skip (tools will be unavailable, chat only)</string>
+
+    <!-- ============ Settings ============ -->
+    <string name="settings_title">Settings</string>
+    <string name="tab_general">General</string>
+    <string name="tab_model">Model &amp; API</string>
+    <string name="tab_plugins">Tools</string>
+    <string name="tab_about">About</string>
+
+    <string name="section_appearance">Appearance</string>
+    <string name="label_language">Language</string>
+    <string name="lang_system">System</string>
+    <string name="lang_zh">中文</string>
+    <string name="lang_en">English</string>
+    <string name="label_theme">Theme</string>
+    <string name="theme_system">System</string>
+    <string name="theme_light">Light</string>
+    <string name="theme_dark">Dark</string>
+    <string name="label_font">Font size</string>
+    <string name="font_small">Small</string>
+    <string name="font_normal">Normal</string>
+    <string name="font_large">Large</string>
+
+    <string name="section_tool_card">Tool cards</string>
+    <string name="label_card_expanded">Expand by default</string>
+    <string name="desc_card_expanded">New tool-call cards open automatically with arguments and result</string>
+
+    <string name="section_workspace">Workspace</string>
+    <string name="label_workspace">Workspace folder</string>
+    <string name="action_pick_dir">Pick a folder</string>
+    <string name="action_change">Tap to change</string>
+    <string name="workspace_unset">Not set (no path restriction)</string>
+
+    <string name="section_permission">Permissions</string>
+    <string name="label_storage_perm">File access</string>
+    <string name="label_shizuku">Shizuku</string>
+    <string name="shizuku_not_running">Service not running</string>
+    <string name="shizuku_granted">Granted</string>
+    <string name="shizuku_tap_grant">Tap to grant</string>
+
+    <string name="section_model_api">Model &amp; API</string>
+    <string name="api_base_helper">https://api.deepseek.com is enough — /chat/completions is appended automatically</string>
+    <string name="api_key_empty">Get one at platform.deepseek.com</string>
+    <string name="api_key_saved">%1$d characters; kept in encrypted storage, never logged or backed up</string>
+    <string name="model_helper">e.g. deepseek-flash / deepseek-v4-pro</string>
+    <string name="save_ok">Saved — takes effect on the next turn</string>
+    <string name="save_key_required">Key cannot be empty</string>
+    <string name="save_no_change">Already up to date</string>
+    <string name="save_dirty">Unsaved changes</string>
+    <string name="full_url">Full endpoint: %1$s</string>
+
+    <string name="section_runtime">Runtime</string>
+    <string name="label_batching">Batching</string>
+    <string name="label_context">Context</string>
+    <string name="label_history">History</string>
+    <string name="history_value">last %1$d messages</string>
+    <string name="label_max_rounds">Max rounds</string>
+    <string name="rounds_value">%1$d rounds</string>
+
+    <!-- ============ Chat ============ -->
+    <string name="chat_greeting">Hi, I\'m CoolStream</string>
+    <string name="input_hint">Message…</string>
+    <string name="thinking">Thinking…</string>
+    <string name="error_title">Something went wrong</string>
+    <string name="menu_copy_all">Copy all</string>
+    <string name="menu_copy_code">Copy code</string>
+    <string name="menu_copy_code_multi">Copy code (%1$d blocks)</string>
+    <string name="tool_running">Calling: %1$s</string>
+    <string name="tool_done">Done: %1$s</string>
+    <string name="tool_failed">Failed: %1$s</string>
+    <string name="drawer_open">Open drawer</string>
+    <string name="new_chat">New chat</string>
+    <string name="search_chats">Search chats</string>
+    <string name="section_version">Version</string>
+    <string name="section_stack">Built with</string>
+    <string name="section_notes">Notes</string>
+</resources>

@@ -1,3 +1,110 @@
 <resources>
-    <string name="app_name">MyChat</string>
+    <string name="app_name">CoolStream</string>
+
+    <!-- ============ 通用 ============ -->
+    <string name="common_done">已完成</string>
+    <string name="common_pending">待完成</string>
+    <string name="common_on">已开启</string>
+    <string name="common_off">未开启</string>
+    <string name="action_show">显示</string>
+    <string name="action_hide">隐藏</string>
+    <string name="action_save">保存</string>
+    <string name="action_back">返回</string>
+
+    <!-- ============ 字段 ============ -->
+    <string name="field_api_base">API 地址</string>
+    <string name="field_api_key">API Key</string>
+    <string name="field_model">模型名称</string>
+
+    <!-- ============ 引导页 ============ -->
+    <string name="ob_subtitle">三步就能用起来。全部在本机完成，不经过任何服务器。</string>
+    <string name="ob_step1_title">填入 API Key</string>
+    <string name="ob_step2_title">允许访问文件</string>
+    <string name="ob_step3_title">Shizuku（可选）</string>
+    <string name="ob_key_helper">在 platform.deepseek.com 申请，只存在本机的加密存储里</string>
+    <string name="ob_model_helper">不确定就保持默认</string>
+    <string name="ob_step2_body">读文件、写文件、改代码、跑命令都依赖这个权限。不开的话只能纯聊天，工具全部不可用。</string>
+    <string name="ob_step2_action">去授权</string>
+    <string name="ob_step2_done">已授权</string>
+    <string name="ob_step3_body">只有 run_shell 需要它。不装也不影响其它功能，以后想用再回来开。</string>
+    <string name="ob_step3_check">检查授权</string>
+    <string name="ob_step3_not_running">Shizuku 服务未运行</string>
+    <string name="ob_enter">进入 CoolStream</string>
+    <string name="ob_need_two">请先完成上面两步</string>
+    <string name="ob_skip">跳过（工具将不可用，只能聊天）</string>
+
+    <!-- ============ 设置页 ============ -->
+    <string name="settings_title">设置</string>
+    <string name="tab_general">通用</string>
+    <string name="tab_model">模型与 API</string>
+    <string name="tab_plugins">插件</string>
+    <string name="tab_about">关于</string>
+
+    <string name="section_appearance">外观</string>
+    <string name="label_language">语言</string>
+    <string name="lang_system">跟随系统</string>
+    <string name="lang_zh">中文</string>
+    <string name="lang_en">English</string>
+    <string name="label_theme">主题</string>
+    <string name="theme_system">跟随系统</string>
+    <string name="theme_light">浅色</string>
+    <string name="theme_dark">深色</string>
+    <string name="label_font">字号</string>
+    <string name="font_small">小</string>
+    <string name="font_normal">标准</string>
+    <string name="font_large">大</string>
+
+    <string name="section_tool_card">工具卡片</string>
+    <string name="label_card_expanded">默认展开</string>
+    <string name="desc_card_expanded">新出现的工具调用卡片自动展开参数与结果</string>
+
+    <string name="section_workspace">工作区</string>
+    <string name="label_workspace">工作区设置</string>
+    <string name="action_pick_dir">选择目录</string>
+    <string name="action_change">点击更换</string>
+    <string name="workspace_unset">未设置（不限制路径）</string>
+
+    <string name="section_permission">权限</string>
+    <string name="label_storage_perm">文件权限</string>
+    <string name="label_shizuku">Shizuku</string>
+    <string name="shizuku_not_running">服务未运行</string>
+    <string name="shizuku_granted">已授权</string>
+    <string name="shizuku_tap_grant">点此授权</string>
+
+    <string name="section_model_api">模型与 API</string>
+    <string name="api_base_helper">只填 https://api.deepseek.com 也行，会自动补 /chat/completions</string>
+    <string name="api_key_empty">去 platform.deepseek.com 申请</string>
+    <string name="api_key_saved">已填写 %1$d 位；保存在加密存储里，不写日志、不进备份</string>
+    <string name="model_helper">例：deepseek-flash / deepseek-v4-pro</string>
+    <string name="save_ok">已保存，下一轮对话生效</string>
+    <string name="save_key_required">Key 不能为空</string>
+    <string name="save_no_change">当前配置已是最新</string>
+    <string name="save_dirty">有未保存的修改</string>
+    <string name="full_url">完整请求地址：%1$s</string>
+
+    <string name="section_runtime">运行时</string>
+    <string name="label_batching">批处理</string>
+    <string name="label_context">上下文</string>
+    <string name="label_history">历史</string>
+    <string name="history_value">最近 %1$d 条</string>
+    <string name="label_max_rounds">轮次上限</string>
+    <string name="rounds_value">%1$d 轮</string>
+
+    <!-- ============ 聊天页 ============ -->
+    <string name="chat_greeting">你好，我是 CoolStream</string>
+    <string name="input_hint">输入消息…</string>
+    <string name="thinking">正在思考…</string>
+    <string name="error_title">出错了</string>
+    <string name="menu_copy_all">复制全文</string>
+    <string name="menu_copy_code">复制代码</string>
+    <string name="menu_copy_code_multi">复制代码（%1$d 段）</string>
+    <string name="tool_running">正在调用工具：%1$s</string>
+    <string name="tool_done">已执行：%1$s</string>
+    <string name="tool_failed">执行失败：%1$s</string>
+    <string name="drawer_open">打开侧边栏</string>
+    <string name="new_chat">新建对话</string>
+    <string name="search_chats">搜索会话</string>
+    <string name="section_version">版本</string>
+    <string name="section_stack">组成</string>
+    <string name="section_notes">说明</string>
 </resources>
