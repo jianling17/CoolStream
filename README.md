@@ -14,7 +14,7 @@
 
 </div>
 
-> 📝 **[Changelog / 更新日志](CHANGELOG.md)** —— 当前版本 **v1.0.0**
+> 📝 **[Changelog / 更新日志](CHANGELOG.md)** —— 开发中，**尚未发布正式版**
 
 ---
 
