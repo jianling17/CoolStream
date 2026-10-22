@@ -8,6 +8,9 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Base64
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -94,6 +97,7 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
+import java.io.ByteArrayOutputStream
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import androidx.security.crypto.EncryptedSharedPreferences
@@ -725,7 +729,8 @@ fun sendToDeepSeek(
 
                 messagesArray.put(JSONObject().apply {
                     put("role", if (msg.isUser) "user" else "assistant")
-                    put("content", msg.content)
+                    // 带附件的消息在这里展开成数组 / 追加 read_file 指令
+                    put("content", contentForApi(msg))
                 })
             }
 
@@ -2689,7 +2694,8 @@ fun runAgentLoop(
                 if (msg.type == MessageType.TOOL_CALL) continue
                 messages.put(JSONObject().apply {
                     put("role", if (msg.isUser) "user" else "assistant")
-                    put("content", msg.content)
+                    // 带附件的消息在这里展开成数组 / 追加 read_file 指令
+                    put("content", contentForApi(msg))
                 })
             }
 
@@ -3502,33 +3508,45 @@ fun ChatScreen() {
                 var attachments by remember { mutableStateOf<List<Attachment>>(emptyList()) }
                 var showAttachSheet by remember { mutableStateOf(false) }
 
+                val attachScope = rememberCoroutineScope()
+
+                // 选中后立刻把 content:// 落盘，拿到真实绝对路径。
+                // 图片和文件走同一条路，区别只在 isImage 标记。
+                fun addAttachment(uri: Uri, isImage: Boolean) {
+                    val name = displayNameOf(ctx, uri)
+                    val att = Attachment(uri = uri, name = name, isImage = isImage)
+                    attachments = attachments + att
+                    attachScope.launch(Dispatchers.IO) {
+                        val result = persistAttachment(ctx, uri, name)
+                        withContext(Dispatchers.Main) {
+                            attachments = attachments.map {
+                                if (it.uri == uri) {
+                                    it.copy(
+                                        state = if (result.isSuccess) {
+                                            AttachState.READY
+                                        } else {
+                                            AttachState.FAILED
+                                        },
+                                        path = result.getOrNull()?.absolutePath,
+                                        error = result.exceptionOrNull()?.message
+                                    )
+                                } else {
+                                    it
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 系统相册（Android 13+ 走照片选择器，不需要读存储权限）
                 val imagePicker = rememberLauncherForActivityResult(
                     ActivityResultContracts.PickVisualMedia()
-                ) { uri ->
-                    if (uri != null) {
-                        attachments = attachments + Attachment(
-                            uri = uri,
-                            name = displayNameOf(ctx, uri),
-                            isImage = true
-                        )
-                        Log.d(TAG, "选择图片: $uri")
-                    }
-                }
+                ) { uri -> if (uri != null) addAttachment(uri, isImage = true) }
 
                 // 系统文件管理器，不限 MIME 类型
                 val filePicker = rememberLauncherForActivityResult(
                     ActivityResultContracts.OpenDocument()
-                ) { uri ->
-                    if (uri != null) {
-                        attachments = attachments + Attachment(
-                            uri = uri,
-                            name = displayNameOf(ctx, uri),
-                            isImage = false
-                        )
-                        Log.d(TAG, "选择文件: $uri")
-                    }
-                }
+                ) { uri -> if (uri != null) addAttachment(uri, isImage = false) }
 
                 // ---------- 附件选择弹层 ----------
                 if (showAttachSheet) {
@@ -3564,13 +3582,18 @@ fun ChatScreen() {
                         attachments = attachments.filterIndexed { i, _ -> i != index }
                     },
                     onSend = {
-                        // 附件只记文件名，真正的文件内容还没接入请求
-                        val attachNote = if (attachments.isEmpty()) {
+                        // 只把「已落盘」的附件写进消息 —— 没落盘的不骗模型
+                        val ready = attachments.filter {
+                            it.state == AttachState.READY && it.path != null
+                        }
+                        val attachBlock = if (ready.isEmpty()) {
                             ""
                         } else {
-                            "\n\n📎 附件：" + attachments.joinToString("、") { it.name }
+                            "\n\n" + ready.joinToString("\n") { att ->
+                                "<<ATTACH:${if (att.isImage) "image" else "file"}|${att.path}>>"
+                            }
                         }
-                        val trimmed = (inputText.trim() + attachNote).trim()
+                        val trimmed = (inputText.trim() + attachBlock).trim()
 
                         // 空消息不发；正在流式回复时也不发
                         if (trimmed.isNotEmpty() && !isStreaming) {
@@ -5342,19 +5365,22 @@ fun MessageBubble(
     }
     val textColor = if (isUser && !isErr) cs.onPrimary else cs.onSurface
 
+    // 界面上不显示 <<ATTACH:...>> 这些内部标记
+    val shownContent = remember(message.content) { displayContent(message.content) }
+
     // 正文为空说明 AI 还在思考（占位行），或者上次流式中断了
-    val placeholder = message.content.isBlank() && !isUser
+    val placeholder = shownContent.isBlank() && !isUser
 
     // ★ 只有「AI 的、非错误的、非空的」正文才走 Markdown。
     //   用户自己打的内容不解释成 Markdown —— 免得他打了 # 或 ** 被吃掉。
-    val useMarkdown = markdown && !isUser && !message.isError && message.content.isNotBlank()
+    val useMarkdown = markdown && !isUser && !message.isError && shownContent.isNotBlank()
 
     // ---------- 长按复制 ----------
     var menuOpen by remember { mutableStateOf(false) }
     // 气泡高度：菜单要贴着气泡下沿弹出，所以得先量一下
     var bubbleHeight by remember { mutableStateOf(0) }
     // 代码块只在正文变化时重新抽一次，重组时不重复扫描
-    val codeBlocks = remember(message.content) { extractCodeBlocks(message.content) }
+    val codeBlocks = remember(message.content) { extractCodeBlocks(displayContent(message.content)) }
 
     // 外层 Box 负责"靠左还是靠右"
     Box(
@@ -5383,12 +5409,7 @@ fun MessageBubble(
                     .combinedClickable(
                         onClick = { /* 单击暂时不做任何事，留给以后编辑/重发 */ },
                         onLongClick = {
-                            Log.d(
-                                TAG,
-                                "长按气泡: userId=${message.id}, 正文 ${message.content.length} 字, " +
-                                    "抽到代码块 ${codeBlocks.size} 段, 含围栏=${message.content.contains("```")}"
-                            )
-                            if (message.content.isNotBlank()) menuOpen = true
+                            if (shownContent.isNotBlank()) menuOpen = true
                         }
                     )
             ) {
@@ -5413,7 +5434,7 @@ fun MessageBubble(
                         Text(
                             // 老数据里存的是「错误: xxx」，渲染时把前缀去掉，
                             // 标题已经在上面写着了，正文只留原因
-                            text = message.content
+                            text = shownContent
                                 .removePrefix("错误: ")
                                 .removePrefix("错误："),
                             color = cs.onSurface,
@@ -5423,7 +5444,7 @@ fun MessageBubble(
                     }
                 } else if (useMarkdown) {
                     MarkdownText(
-                        content = message.content,
+                        content = shownContent,
                         textColor = textColor,
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                         onCodeLongPress = {
@@ -5433,7 +5454,7 @@ fun MessageBubble(
                     )
                 } else {
                     Text(
-                        text = if (placeholder) stringResource(R.string.thinking) else message.content,
+                        text = if (placeholder) stringResource(R.string.thinking) else shownContent,
                         color = textColor,
                         // 等宽字体：极客风的关键
                         fontFamily = FontFamily.Monospace,
@@ -5453,7 +5474,7 @@ fun MessageBubble(
                     properties = PopupProperties(focusable = true)
                 ) {
                     CopyMenu(
-                        fullText = message.content,
+                        fullText = shownContent,
                         codeBlocks = codeBlocks,
                         onCopy = { text ->
                             copyToClipboard(context, text)
@@ -6258,8 +6279,171 @@ fun InfoBar(usage: UsageStats, isStreaming: Boolean) {
 // ============================================================
 // 7. 底部输入区
 // ============================================================
-/** 输入区里挂着的附件。uri 是 content://，真正读取时才解析 */
-data class Attachment(val uri: Uri, val name: String, val isImage: Boolean)
+/** 附件的落盘状态 */
+enum class AttachState { COPYING, READY, FAILED }
+
+/**
+ * 输入区里挂着的附件。
+ *
+ * uri 是 content:// —— 这个 URI 只有 ContentResolver 能读，java.io.File 打不开，
+ * 所以选中之后会立刻把流复制到工作区，拿一个真实的绝对路径（path）。
+ * Agent 的 read_file 走的是 File，只有 path 才有用。
+ */
+data class Attachment(
+    val uri: Uri,
+    val name: String,
+    val isImage: Boolean,
+    val state: AttachState = AttachState.COPYING,
+    val path: String? = null,
+    val error: String? = null
+)
+
+/** 附件在消息正文里的标记格式：<<ATTACH:image|/abs/path>> */
+private val ATTACH_MARK_RE = Regex("""<<ATTACH:(image|file)\|([^>]+)>>""")
+
+/** 落盘目录名 */
+private const val ATTACH_DIR = "attachments"
+
+/**
+ * 把 content:// 的内容复制成一个真实文件，返回绝对路径。
+ *
+ * 优先落到「工作区/attachments」，这样 Agent 用 read_file 就能读；
+ * 没设工作区又没存储权限时退回应用私有 cacheDir —— 模型照样能读，
+ * 只是用户自己在文件管理器里看不到。
+ */
+private fun persistAttachment(context: Context, uri: Uri, name: String): Result<File> {
+    return try {
+        val workspaceRoot = currentWorkspace.ifBlank {
+            if (Environment.isExternalStorageManager()) DEFAULT_WORKSPACE else ""
+        }
+        val dir = if (workspaceRoot.isNotBlank()) {
+            File(workspaceRoot, ATTACH_DIR)
+        } else {
+            File(context.cacheDir, ATTACH_DIR)
+        }
+        if (!dir.exists() && !dir.mkdirs()) {
+            error("创建目录失败：${dir.absolutePath}")
+        }
+
+        // 重名不覆盖，加时间戳后缀
+        var target = File(dir, name)
+        if (target.exists()) {
+            val stem = name.substringBeforeLast('.', name)
+            val ext = name.substringAfterLast('.', "")
+            val suffix = if (ext.isEmpty() || ext == name) "" else ".$ext"
+            target = File(dir, "$stem-${System.currentTimeMillis()}$suffix")
+        }
+
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            target.outputStream().use { output -> input.copyTo(output) }
+        } ?: error("打不开输入流（URI 可能已失效）")
+
+        Log.d(TAG, "附件已落盘: ${target.absolutePath} (${target.length()} 字节)")
+        Result.success(target)
+    } catch (e: Exception) {
+        Log.e(TAG, "附件落盘失败: $name", e)
+        Result.failure(e)
+    }
+}
+
+/**
+ * 图片 → data URL（base64）。
+ *
+ * 先按 inSampleSize 降采样到最长边 ≤1280，再 JPEG 80 压一遍。
+ * 手机拍的原图动辄 4000×3000、几 MB，直接 base64 会让请求体爆炸，
+ * 而且模型那边的图片分辨率也不需要这么高。
+ */
+private fun imageToDataUrl(path: String): String? {
+    return try {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            Log.e(TAG, "图片解码失败（不是有效图片？）: $path")
+            return null
+        }
+
+        var sample = 1
+        while (bounds.outWidth / sample > 1280 || bounds.outHeight / sample > 1280) {
+            sample *= 2
+        }
+
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        val bmp = BitmapFactory.decodeFile(path, opts) ?: return null
+        val out = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
+        bmp.recycle()
+
+        val b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        Log.d(
+            TAG,
+            "图片编码完成: ${File(path).name}, 原 ${bounds.outWidth}x${bounds.outHeight} " +
+                "→ sample=$sample, ${out.size()} 字节, base64 ${b64.length} 字符"
+        )
+        "data:image/jpeg;base64,$b64"
+    } catch (e: Exception) {
+        Log.e(TAG, "图片编码失败: $path", e)
+        null
+    }
+}
+
+/**
+ * 把一条历史消息转成 API 要的 content。
+ *
+ * 普通消息：原样返回字符串。
+ * 带附件：解析标记，图片转 image_url 数组，文件则补一句「请调用 read_file」。
+ *
+ * ★ 为什么在发请求时现算，而不是落库时就把 base64 存下来：
+ *   一张图 base64 后是几百 KB 到几 MB，存进 Room 会让数据库和每次读取都变慢，
+ *   而且重启后还要重新拼。只存路径，用的时候现编码，是最省的。
+ */
+private fun contentForApi(msg: ChatMessage): Any {
+    if (!msg.isUser || !msg.content.contains("<<ATTACH:")) return msg.content
+
+    val matches = ATTACH_MARK_RE.findAll(msg.content).toList()
+    if (matches.isEmpty()) return msg.content
+
+    val textOnly = ATTACH_MARK_RE.replace(msg.content, "").trim()
+    val images = matches.filter { it.groupValues[1] == "image" }.map { it.groupValues[2] }
+    val files = matches.filter { it.groupValues[1] == "file" }.map { it.groupValues[2] }
+
+    val textPart = buildString {
+        if (textOnly.isNotEmpty()) append(textOnly)
+        files.forEach { path ->
+            if (isNotEmpty()) append("\n\n")
+            append("用户上传了一个文件，路径是：").append(path)
+            append("\n请调用你的 read_file 工具读取并分析它。")
+        }
+    }
+
+    if (images.isEmpty()) {
+        return textPart.ifBlank { "（用户上传了附件）" }
+    }
+
+    val parts = JSONArray()
+    parts.put(JSONObject().put("type", "text").put("text", textPart.ifBlank { "请看这张图片。" }))
+    var encoded = 0
+    images.forEach { path ->
+        imageToDataUrl(path)?.let { url ->
+            parts.put(
+                JSONObject()
+                    .put("type", "image_url")
+                    .put("image_url", JSONObject().put("url", url))
+            )
+            encoded++
+        }
+    }
+    if (encoded == 0) {
+        // 一张都没编码成功，退化成纯文本，别让整个请求挂掉
+        return textPart.ifBlank { "（用户上传了图片，但本地解码失败）" }
+    }
+    return parts
+}
+
+/** 界面上展示用的正文：去掉附件标记 */
+private fun displayContent(raw: String): String {
+    if (!raw.contains("<<ATTACH:")) return raw
+    return ATTACH_MARK_RE.replace(raw, "").trim()
+}
 
 /** 从 content:// 取出文件名；取不到就退回路径末段 */
 private fun displayNameOf(context: Context, uri: Uri): String {
@@ -6309,7 +6493,7 @@ fun InputBar(
     modifier: Modifier = Modifier
 ) {
     val cs = MaterialTheme.colorScheme
-    val canSend = text.isNotBlank() && enabled
+    val canSend = (text.isNotBlank() || attachments.any { it.state == AttachState.READY }) && enabled
 
     Column(modifier = modifier.fillMaxWidth()) {
         // ---------- 附件：胶囊正上方 ----------
@@ -6439,8 +6623,15 @@ private fun AttachmentChip(att: Attachment, onRemove: () -> Unit) {
 
     Surface(
         shape = RoundedCornerShape(14.dp),
-        color = glassFill(),
-        border = BorderStroke(1.dp, glassEdge()),
+        color = if (att.state == AttachState.FAILED) {
+            Color(0xFFF85149).copy(alpha = 0.14f)
+        } else {
+            glassFill()
+        },
+        border = BorderStroke(
+            1.dp,
+            if (att.state == AttachState.FAILED) Color(0xFFF85149).copy(alpha = 0.5f) else glassEdge()
+        ),
         shadowElevation = 0.dp,
         tonalElevation = 0.dp
     ) {
@@ -6448,11 +6639,21 @@ private fun AttachmentChip(att: Attachment, onRemove: () -> Unit) {
             modifier = Modifier.padding(start = 10.dp, end = 2.dp, top = 2.dp, bottom = 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // 落盘状态：复制中 / 已就绪 / 失败
+            Text(
+                text = when (att.state) {
+                    AttachState.COPYING -> "⋯"
+                    AttachState.READY -> "✅"
+                    AttachState.FAILED -> "⚠️"
+                },
+                style = MaterialTheme.typography.labelSmall
+            )
+            Spacer(Modifier.width(4.dp))
             Text(
                 text = if (att.isImage) "IMG" else "FILE",
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.labelSmall,
-                color = cs.primary
+                color = if (att.state == AttachState.FAILED) Color(0xFFF85149) else cs.primary
             )
             Spacer(Modifier.width(6.dp))
             Text(
