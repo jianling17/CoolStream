@@ -64,6 +64,7 @@ import com.example.mychat.ui.theme.MyChatTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -163,6 +164,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import java.util.Calendar
+import java.util.Locale
 
 
 // ============================================================
@@ -1580,6 +1582,97 @@ private fun executeTool(name: String, argsJson: String): ToolExecResult {
 
 
 // ============================================================
+// 3.25 Token 用量与费用估算
+//
+// 单价来源：DeepSeek 官方文档（2026-08-17 起的峰谷定价）
+//   https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+//   deepseek-flash = DeepSeek-V4.1-Flash-1017
+//
+//   元 / 百万 tokens          空闲时段   高峰时段
+//   输入（缓存命中）            0.02      0.04
+//   输入（缓存未命中）          1         2
+//   输出                        4         8
+//
+//   高峰 = 北京时间 周一至周五（不含法定节假日）09:00-12:00、14:00-18:00
+//
+// ⚠️ 这是「估算」，不是账单：
+//    · 法定节假日无法在客户端判断（需要一张节假日表），那几天会按高峰价算，偏高
+//    · 官方随时可能调价，单价写死在代码里就有过期风险
+// ============================================================
+private const val CONTEXT_WINDOW_TOKENS = 1_000_000   // deepseek-flash 上下文长度 1M
+
+/** 一轮对话累计的 token 用量（多轮工具调用会逐轮累加） */
+data class UsageStats(
+    val promptTokens: Int = 0,
+    val cacheHitTokens: Int = 0,
+    val completionTokens: Int = 0
+) {
+    val cacheMissTokens: Int get() = (promptTokens - cacheHitTokens).coerceAtLeast(0)
+    val totalTokens: Int get() = promptTokens + completionTokens
+
+    operator fun plus(other: UsageStats) = UsageStats(
+        promptTokens + other.promptTokens,
+        cacheHitTokens + other.cacheHitTokens,
+        completionTokens + other.completionTokens
+    )
+
+    companion object {
+        val EMPTY = UsageStats()
+    }
+}
+
+/** 现在是高峰时段吗？ */
+private fun isPeakHour(): Boolean {
+    val cal = Calendar.getInstance()
+    val dow = cal.get(Calendar.DAY_OF_WEEK)
+    if (dow == Calendar.SATURDAY || dow == Calendar.SUNDAY) return false
+    val hour = cal.get(Calendar.HOUR_OF_DAY)
+    return hour in 9..11 || hour in 14..17
+}
+
+/** 按官方峰谷单价算出这一轮花了多少元 */
+private fun costCny(u: UsageStats): Double {
+    val peak = isPeakHour()
+    val hitPrice = if (peak) 0.04 else 0.02
+    val missPrice = if (peak) 2.0 else 1.0
+    val outPrice = if (peak) 8.0 else 4.0
+    return (u.cacheHitTokens * hitPrice +
+        u.cacheMissTokens * missPrice +
+        u.completionTokens * outPrice) / 1_000_000.0
+}
+
+/** 费用显示：不到 1 分钱就给 4 位小数，否则 2 位 */
+private fun formatCny(v: Double): String =
+    if (v < 0.01) {
+        String.format(Locale.US, "¥%.4f", v)
+    } else {
+        String.format(Locale.US, "¥%.2f", v)
+    }
+
+/** token 数显示：1.2K / 3.4M */
+private fun formatTokens(n: Int): String = when {
+    n >= 1_000_000 -> String.format(Locale.US, "%.1fM", n / 1_000_000.0)
+    n >= 1_000 -> String.format(Locale.US, "%.1fK", n / 1_000.0)
+    else -> n.toString()
+}
+
+/** 从任意一条 SSE 数据里尝试抠出 usage（DeepSeek 通常放在最后一条，且那一条 choices 为空） */
+private fun parseUsage(json: String): UsageStats? {
+    return try {
+        val u = JSONObject(json).optJSONObject("usage") ?: return null
+        if (u.length() == 0) return null
+        UsageStats(
+            promptTokens = u.optInt("prompt_tokens", 0),
+            cacheHitTokens = u.optInt("prompt_cache_hit_tokens", 0),
+            completionTokens = u.optInt("completion_tokens", 0)
+        )
+    } catch (e: Exception) {
+        null
+    }
+}
+
+
+// ============================================================
 // 3.3 ★★★ Agent 执行闭环（带工具调用）★★★
 //
 // 和 sendToDeepSeek 的关系：
@@ -1599,10 +1692,11 @@ fun runAgentLoop(
     onToolCallStarted: (id: String, name: String, argsJson: String) -> Unit,
     onToolCallFinished: (id: String, ok: Boolean, output: String) -> Unit,
     onFlush: (String) -> Unit,
+    onUsage: (UsageStats) -> Unit,
     onDone: (totalChars: Int) -> Unit,
     onError: (String) -> Unit
-) {
-    scope.launch(Dispatchers.IO) {
+): Job {
+    return scope.launch(Dispatchers.IO) {
         try {
             // ---------- 1. 检查 API Key ----------
             val apiKey = BuildConfig.DEEPSEEK_API_KEY
@@ -1637,6 +1731,8 @@ fun runAgentLoop(
             val toolsArray = JSONArray(TOOL_DEFINITIONS)
             var totalChars = 0
             var round = 0
+            // 多轮工具调用会把 token 用量逐轮累加
+            var accUsage = UsageStats.EMPTY
 
             while (round < MAX_TOOL_ROUNDS) {
                 round++
@@ -1645,6 +1741,9 @@ fun runAgentLoop(
                 val bodyJson = JSONObject().apply {
                     put("model", MODEL_NAME)
                     put("stream", true)
+                    // ★ 关键：不加这个，流式响应里【根本不会返回 usage】
+                    //   DeepSeek 默认只在非流式请求里给 usage
+                    put("stream_options", JSONObject().put("include_usage", true))
                     put("messages", messages)
                     put("tools", toolsArray)
                     put("thinking", JSONObject().put("type", "disabled"))
@@ -1696,6 +1795,11 @@ fun runAgentLoop(
 
                     val payload = line.removePrefix("data:").trim()
                     if (payload.isEmpty() || payload == "[DONE]") continue
+
+                    // ★ usage 要【先于】delta 解析：
+                    //   最后那条 usage 数据的 choices 是空数组，parseDeltaFull 会返回 null 被跳过，
+                    //   要是放在后面就永远读不到 usage 了。
+                    parseUsage(payload)?.let { accUsage += it }
 
                     val delta = parseDeltaFull(payload) ?: continue
 
@@ -1750,8 +1854,20 @@ fun runAgentLoop(
                 // ---------- 没有工具调用：这一轮就是最终回答 ----------
                 if (pending.isEmpty()) {
                     totalChars += roundChars
-                    Log.d(TAG, "agent done: round=$round, chars=$totalChars")
-                    withContext(Dispatchers.Main) { onDone(totalChars) }
+
+                    val spend = costCny(accUsage)
+                    Log.d(
+                        TAG,
+                        "agent done: round=$round, chars=$totalChars, " +
+                            "prompt=${accUsage.promptTokens}(cacheHit=${accUsage.cacheHitTokens}), " +
+                            "completion=${accUsage.completionTokens}, " +
+                            "费用≈${formatCny(spend)}（${if (isPeakHour()) "高峰" else "空闲"}时段）"
+                    )
+
+                    withContext(Dispatchers.Main) {
+                        onUsage(accUsage)
+                        onDone(totalChars)
+                    }
                     return@launch
                 }
 
@@ -1974,6 +2090,16 @@ fun ChatScreen() {
         currentWorkspace = workspace
         Log.d(TAG, "已加载工作区: ${workspace.ifBlank { "(未设置)" }}")
     }
+
+    // ===== 流式任务 / 费用统计 / 停止生成 =====
+    // 当前正在跑的流式任务。点「停止」时靠它 cancel。
+    var streamJob by remember { mutableStateOf<Job?>(null) }
+    // 最近一轮的 token 用量，InfoBar 显示用
+    var lastUsage by remember { mutableStateOf(UsageStats.EMPTY) }
+    // AI 占位行在数据库里的 id。停止时要靠它把已收到的文字写回去。
+    val aiRowId = remember { AtomicInteger(0) }
+    // 本轮属于哪个会话（停止时要用）
+    var activeSessionId by remember { mutableStateOf("") }
 
     // ===== 工具：按 id 更新某个会话 =====
     // ⚠️ 关键设计：流式回调里必须按"发送那一刻记下的 sessionId"更新，
@@ -2243,10 +2369,16 @@ fun ChatScreen() {
                     }
                 }
 
+                // ---------- 底部：InfoBar（本轮费用 + 上下文用量） ----------
+                if (lastUsage.totalTokens > 0) {
+                    InfoBar(usage = lastUsage, isStreaming = isStreaming)
+                }
+
                 // ---------- 底部：输入区 ----------
                 InputBar(
                     text = inputText,
                     enabled = !isStreaming,        // ★ 发送中禁止再发，防止重复请求
+                    isStreaming = isStreaming,
                     onTextChange = { inputText = it },
                     onSend = {
                         val trimmed = inputText.trim()
@@ -2305,7 +2437,8 @@ fun ChatScreen() {
                             //
                             //   aiRowId 用 AtomicInteger 装：写库在 IO 线程，
                             //   读它发生在 onDone，普通 var 跨线程不安全。
-                            val aiRowId = AtomicInteger(0)
+                            // aiRowId 用的是 ChatScreen 级的那个（停止生成时要读它），这里不再重新声明
+                            activeSessionId = sessionId
                             val dbJob = scope.launch(Dispatchers.IO) {
                                 // 标题变了才更新（会话行本身在 newSession() 时已经插过）
                                 if (newTitle != null) {
@@ -2362,7 +2495,7 @@ fun ChatScreen() {
                             //      这样 messages.last() 永远还是占位气泡，onFlush 才不会写错地方。
                             val toolCardSlots = HashMap<String, Int>()
 
-                            runAgentLoop(
+                            streamJob = runAgentLoop(
                                 history = historyForApi,
                                 scope = scope,
 
@@ -2451,9 +2584,13 @@ fun ChatScreen() {
                                     }
                                 },
 
+                                // token 用量回来了：更新 InfoBar
+                                onUsage = { u -> lastUsage = u },
+
                                 onDone = { total ->
                                     Log.d(TAG, "onDone: total=$total")
                                     isStreaming = false
+                                    streamJob = null
 
                                     // ★ 流结束，这才是唯一需要写"正文"的时刻。
                                     //   要是每个 50ms 都写库，900 个碎片就是几十次磁盘操作，
@@ -2501,8 +2638,31 @@ fun ChatScreen() {
                                         }
                                     }
                                     isStreaming = false
+                                    streamJob = null
                                 }
                             )
+                        }
+                    },
+                    // ★★ 停止生成 ★★
+                    //   cancel() 之后 runAgentLoop 里的 CancellationException 会被重新抛出，
+                    //   协程结束；但 onDone 不会触发，所以「落库」必须在这里自己补上。
+                    onStop = {
+                        val job = streamJob
+                        streamJob = null
+                        job?.cancel()
+                        isStreaming = false
+
+                        val sid = activeSessionId
+                        val partial = sessions.firstOrNull { it.id == sid }
+                            ?.messages?.lastOrNull()?.content ?: ""
+                        val rowId = aiRowId.get()
+
+                        Log.d(TAG, "用户停止生成: 已收到 ${partial.length} 字符, rowId=$rowId")
+
+                        if (rowId > 0) {
+                            scope.launch(Dispatchers.IO) {
+                                dao.updateContent(rowId, partial, false)
+                            }
                         }
                     }
                 )
@@ -3483,14 +3643,62 @@ private fun CodeSurface(text: String) {
 
 
 // ============================================================
+// 6.5 InfoBar —— 本轮费用 + 上下文用量
+//
+// 数据全部来自 API 返回的 usage 字段（需要请求里带 stream_options.include_usage）。
+// 费用按 DeepSeek 官方峰谷单价估算，见前面 3.25 节。
+// ============================================================
+@Composable
+fun InfoBar(usage: UsageStats, isStreaming: Boolean) {
+    val cs = MaterialTheme.colorScheme
+    val cost = costCny(usage)
+    val ctxPercent = usage.promptTokens.toDouble() / CONTEXT_WINDOW_TOKENS * 100
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 22.dp, end = 22.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "本轮 ≈ ${formatCny(cost)}",
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.labelSmall,
+            color = cs.onSurfaceVariant
+        )
+        Spacer(Modifier.width(12.dp))
+        Text(
+            text = "上下文 ${formatTokens(usage.promptTokens)} / " +
+                "${formatTokens(CONTEXT_WINDOW_TOKENS)}  " +
+                String.format(Locale.US, "%.1f%%", ctxPercent),
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.labelSmall,
+            color = cs.onSurfaceVariant,
+            modifier = Modifier.weight(1f)
+        )
+        if (isStreaming) {
+            Text(
+                text = "生成中…",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.primary
+            )
+        }
+    }
+}
+
+
+// ============================================================
 // 7. 底部输入区
 // ============================================================
 @Composable
 fun InputBar(
     text: String,
     enabled: Boolean,
+    isStreaming: Boolean,
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
+    onStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val cs = MaterialTheme.colorScheme
@@ -3545,21 +3753,40 @@ fun InputBar(
                 }
             )
 
-            // 正圆形发送按钮
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(CircleShape)
-                    .background(if (canSend) cs.primary else cs.outline)
-                    .clickable(enabled = canSend) { onSend() },
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.Send,
-                    contentDescription = "发送",
-                    tint = if (canSend) cs.onPrimary else cs.onSurfaceVariant,
-                    modifier = Modifier.size(18.dp)
-                )
+            if (isStreaming) {
+                // ★ 流式输出中：发送按钮变成「停止」——正圆底 + 正中间的方块
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(cs.primary)
+                        .clickable { onStop() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(cs.onPrimary)
+                    )
+                }
+            } else {
+                // 正圆形发送按钮
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(if (canSend) cs.primary else cs.outline)
+                        .clickable(enabled = canSend) { onSend() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "发送",
+                        tint = if (canSend) cs.onPrimary else cs.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
             }
         }
     }
