@@ -748,6 +748,70 @@ It quoted our UI path back at us — that sentence came from the prompt line, no
 
 ---
 
+---
+
+### 3.15 Attachments: from a pretty chip to actual pixels in the context window
+
+A file picker that only draws a chip is a lie. The chip said "✅ ready" while the model received nothing. Closing that gap took three steps, and two of them were architectural decisions rather than code.
+
+**The `content://` problem.** Android hands back a `content://` URI. `java.io.File` cannot open it, and every tool in this app (`read_file`, `replace_in_file`, `run_shell`) is built on `File`. So the URI is useless to the agent.
+
+The fix is to copy the stream out immediately, while we still have permission:
+
+```kotlin
+context.contentResolver.openInputStream(uri)?.use { input ->
+    target.outputStream().use { output -> input.copyTo(output) }
+}
+```
+
+Target: `<workspace>/attachments/`, falling back to `cacheDir/attachments` when no workspace is set. Name collisions get a timestamp suffix rather than overwriting — verified: the second pick of the same file landed as `attachtest-1792664822047.txt`.
+
+**Decision 1: store the path, never the Base64.**
+
+The obvious shortcut is to Base64 the image at pick time and stuff it into the message row. That would put 60 KB–several MB of Base64 into SQLite for every image, slow every history load, and require re-encoding after any restore.
+
+Instead the message body carries a marker:
+
+```
+<<ATTACH:image|/storage/emulated/0/.../attachments/97.png>>
+```
+
+…and `contentForApi()` expands it at request-build time. The database stays small, the UI strips the marker with `displayContent()`, and the original file keeps existing on disk for later turns.
+
+**Decision 2: downsample before encoding.**
+
+A phone photo is 4000×3000 and several MB. Base64 inflates by ~33 %. Feeding that to the API would bloat every request and gain nothing — the model does not need more than ~1280 px.
+
+`BitmapFactory` with `inJustDecodeBounds` reads only the header for dimensions, then a power-of-two `inSampleSize` decodes a smaller bitmap, then JPEG 80:
+
+```
+图片编码完成: 97.png, 原 1280x2856 → sample=4, 45169 字节, base64 60228 字符
+```
+
+**Routing on send.** Images become a content *array*:
+
+```json
+[{"type":"text","text":"..."},
+ {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]
+```
+
+Everything else stays a plain string with one extra sentence — "用户上传了一个文件，路径是 X，请调用 read_file 读取并分析它" — which lets the existing agent loop do the work it already knows how to do.
+
+**`deepseek-flash` does accept images.** Verified against the live API: `HTTP 200`, and the model described a screenshot accurately — the 9:00 clock, the 5G indicator, the `create app.conf` title, the blue **+** button, the placeholder text in the input box. That is reading pixels, not guessing.
+
+**A trap worth recording: the model trusts its own old messages more than a fresh tool result.**
+
+Same file, same instruction, two conversations:
+
+| Conversation | Result |
+|---|---|
+| Continuing an old chat where the model had earlier said *"read_file is not in my current toolset"* | Ran `read_file`, got the contents (68 chars), then answered **"我无法读取这个文件"** and repeated the stale claim |
+| Fresh conversation | Ran `read_file`, answered with the exact secret code |
+
+`本次启用工具 6 个` and `读取成功: 68 字符` in the log both confirm the tool ran and returned data. The model simply preferred its own earlier sentence. **No amount of code fixes that** — but it is worth knowing that long sessions can poison tool use, and that "start a new chat" is a real workaround.
+
+---
+
 ## 4. Environment & Build (the most time-consuming section)
 
 ### ⚠️ Auto timestamp versioning: two traps
@@ -1774,6 +1838,70 @@ diff 一眼就把它照出来了：
 
 它把我们自己的界面路径原样念了出来 —— 这句来自提示词，不是训练数据。
 把开关拨回去，立刻恢复 `6 个`，不用重启。
+
+---
+
+---
+
+### 3.15 附件：从「画个 Chip」到「像素真的进了上下文」
+
+一个只会画 Chip 的附件功能是骗人的。Chip 上写着「✅ 已就绪」，模型那边什么都没收到。补上这个缺口用了三步，其中两步是架构决策而不是写代码。
+
+**先说 `content://` 这个坑。** Android 给回来的是 `content://` URI，`java.io.File` 打不开它，而这个 App 的每一个工具（`read_file`、`replace_in_file`、`run_shell`）都是建立在 `File` 上的。也就是说，这个 URI 对 Agent 毫无用处。
+
+解法是趁权限还在，立刻把流复制出来：
+
+```kotlin
+context.contentResolver.openInputStream(uri)?.use { input ->
+    target.outputStream().use { output -> input.copyTo(output) }
+}
+```
+
+目标是 `<工作区>/attachments/`，没设工作区就退回 `cacheDir/attachments`。重名加时间戳而不是覆盖——实测第二次选同一个文件，落成了 `attachtest-1792664822047.txt`。
+
+**决策一：只存路径，绝不存 Base64。**
+
+最省事的做法是选完就 Base64 塞进消息行。代价是每张图几百 KB 到几 MB 的 Base64 进 SQLite，每次读历史都变慢，恢复备份后还得重新编码。
+
+所以消息正文里只放一个标记：
+
+```
+<<ATTACH:image|/storage/emulated/0/.../attachments/97.png>>
+```
+
+由 `contentForApi()` 在**组装请求时**展开。数据库保持轻量，界面用 `displayContent()` 把标记抹掉，原文件留在磁盘上，后面几轮还能继续用。
+
+**决策二：先降采样再编码。**
+
+手机原图 4000×3000、几 MB，Base64 还要再涨约 33%。直接发出去只会让每个请求都臃肿，而模型根本不需要超过 ~1280px。
+
+`BitmapFactory` 先用 `inJustDecodeBounds` 只读文件头拿尺寸，再用 2 的幂的 `inSampleSize` 解出小图，最后 JPEG 80：
+
+```
+图片编码完成: 97.png, 原 1280x2856 → sample=4, 45169 字节, base64 60228 字符
+```
+
+**发送时分流。** 图片变成 content **数组**：
+
+```json
+[{"type":"text","text":"..."},
+ {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]
+```
+
+其它文件保持普通字符串，只在末尾补一句「用户上传了一个文件，路径是 X，请调用 read_file 读取并分析它」——把活交给本来就会干的 Agent Loop。
+
+**`deepseek-flash` 确实能吃图片。** 对真实 API 验证过：`HTTP 200`，而且模型准确描述了截图里的内容——9:00 的时间、5G 标识、`create app.conf` 标题、蓝色 **+** 按钮、输入框占位文字。这是真在读像素，不是猜。
+
+**一个值得记下来的坑：模型更相信自己的历史发言，而不是刚拿到的工具结果。**
+
+同一个文件、同一句指令，两个会话，两种结果：
+
+| 会话 | 结果 |
+|---|---|
+| 继续一个旧对话，而模型早前在里面说过「read_file 不在我当前的可用工具列表里」 | 执行了 `read_file`，拿到 68 字符内容，然后回答 **「我无法读取这个文件」**，重复那句旧话 |
+| 全新会话 | 执行 `read_file`，直接答出密钥 |
+
+日志里 `本次启用工具 6 个` 和 `读取成功: 68 字符` 都证明工具跑了、数据也回来了。模型只是选择相信它自己上一句话。**这个用代码修不了**，但值得知道：长会话会让工具调用「中毒」，而「开个新对话」是真正有效的解法。
 
 ---
 
