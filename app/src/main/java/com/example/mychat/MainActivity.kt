@@ -3,6 +3,7 @@ package com.example.mychat
 import android.Manifest
 import android.app.Application
 import android.content.ComponentName
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
@@ -125,6 +126,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -133,6 +135,8 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -455,16 +459,50 @@ private fun hasAllFilesAccess(context: Context): Boolean {
 private fun openAllFilesAccessSettings(context: Context) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
 
-    // 优先跳到「本应用」的授权页
-    val direct = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-        data = "package:${context.packageName}".toUri()
+    // ★ 必须加 FLAG_ACTIVITY_NEW_TASK。
+    //
+    //   这里传进来的 context 是【不是 Activity】的 Context ——
+    //   界面层用的是 withAppLocale() 包装过的 createConfigurationContext()，
+    //   它没有 Activity 的任务栈，直接 startActivity 会抛：
+    //     AndroidRuntimeException: Calling startActivity() from outside of
+    //     an Activity context requires the FLAG_ACTIVITY_NEW_TASK flag
+    //
+    //   这个坑在模拟器上测不出来（模拟器某些路径拿到的是 Activity context），
+    //   一到真机点「授予文件访问权限」就必崩回桌面。
+    //
+    //   加了 NEW_TASK 之后，系统会从应用的任务栈起一个新的设置页，
+    //   返回时仍能回到我们的 App（因为都没设 CLEAR_TASK）。
+    //
+    // 返回 true = 这个 intent 已经被成功派发；false = 当前 ROM 不认，试下一级。
+    fun fire(intent: Intent): Boolean = try {
+        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        true
+    } catch (_: ActivityNotFoundException) {
+        // 最常见的一级失败：某些 ROM 没有这个 Activity，
+        // 或者带 package 的那个 action 不被支持。
+        false
+    } catch (e: Exception) {
+        // 极少数情况（权限被系统策略拦截等）：记一笔，别让用户看到闪退。
+        Log.w(TAG, "打开权限设置页失败: ${e.javaClass.simpleName}", e)
+        false
     }
-    try {
-        context.startActivity(direct)
-    } catch (_: Exception) {
-        // 部分机型不认带 package 的那个 action，退回全局列表
-        context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-    }
+
+    // ① 带包名，直跳本应用的「所有文件访问」页（用户少点两下）
+    if (fire(
+            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                .setData("package:${context.packageName}".toUri())
+        )
+    ) return
+
+    // ② 全局「所有文件访问」列表，用户自己找本应用
+    if (fire(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))) return
+
+    // ③ 最后的退路：应用详情页。虽然要多点两下，但至少能手动找到权限开关，
+    //    总比点了没反应强。
+    fire(
+        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            .setData("package:${context.packageName}".toUri())
+    )
 }
 
 
@@ -5224,15 +5262,42 @@ fun OnboardingScreen(onFinish: () -> Unit) {
     var storageOk by remember { mutableStateOf(hasAllFilesAccess(context)) }
     var shizukuOk by remember { mutableStateOf(isShizukuGranted() && isShizukuRunning()) }
 
-    // 权限是跳到系统设置里给的，回来不会有回调，只能定时问一下。
-    // 只在第 2 页需要轮询，离开这一页就停掉，省电。
-    LaunchedEffect(currentPage) {
-        if (currentPage != 1) return@LaunchedEffect
-        while (true) {
-            storageOk = hasAllFilesAccess(context)
-            shizukuOk = isShizukuGranted() && isShizukuRunning()
-            delay(800)
+    // ★ 权限状态刷新：监听 ON_RESUME，不再用定时轮询。
+    //
+    //   旧的写法是 while (true) { 查一次; delay(800) } —— 两个问题：
+    //     1. App 退到后台它照样每 800ms 醒一次，和本项目「不发热」的第一优先级冲突
+    //     2. 用户从系统设置页返回后，最多要等 800ms 界面才变，手感像卡住
+    //
+    //   改成 LifecycleEventObserver：只在「第 2 页可见」时挂监听，
+    //   ON_RESUME 那一刻立刻重查 —— 返回的瞬间就刷新，且后台零唤醒。
+    //
+    //   注意 key 里带了 currentPage：离开第 2 页就自动解绑，
+    //   不会在别的页面上做无用检查。
+    // ⚠️ LocalLifecycleOwner 在 compose-ui 里已标记 deprecated，
+    //    官方建议换到 androidx.lifecycle.compose 那个 —— 但那需要新引入
+    //    lifecycle-runtime-compose 依赖。这里只是挂一个观察者，行为完全一致，
+    //    不值得为一个 deprecation 多拉一个库，故显式抑制。
+    @Suppress("DEPRECATION")
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, currentPage) {
+        if (currentPage != 1) {
+            return@DisposableEffect onDispose { }
         }
+
+        // 进入第 2 页先查一次：用户可能早就授权过了，不该显示「待完成」
+        storageOk = hasAllFilesAccess(context)
+        shizukuOk = isShizukuGranted() && isShizukuRunning()
+
+        val observer = LifecycleEventObserver { _, event ->
+            // 从系统设置页切回来 → 立刻重查，绝不沿用旧缓存
+            if (event == Lifecycle.Event.ON_RESUME) {
+                storageOk = hasAllFilesAccess(context)
+                shizukuOk = isShizukuGranted() && isShizukuRunning()
+                Log.d(TAG, "onResume 重查权限: storage=$storageOk, shizuku=$shizukuOk")
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     /**
@@ -5835,6 +5900,25 @@ private fun GeneralTab(
 ) {
     val cs = MaterialTheme.colorScheme
 
+    // ★ 权限状态刷新：从系统设置页回来时立刻重算。
+    //
+    //   权限行原来是在组合时直接调 hasAllFilesAccess(context) ——
+    //   看着没问题，但用户去系统设置打开权限再返回时，Compose 不一定重组，
+    //   于是「权限明明开了，这里还显示未开启」。
+    //
+    //   加一个 ON_RESUME 计数当 key：切回来的瞬间 tick+1 → 相关 remember 失效
+    //   → 立刻重新查权限。和引导页用的是同一套思路。
+    var resumeTick by remember { mutableIntStateOf(0) }
+    @Suppress("DEPRECATION")
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) resumeTick++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
@@ -5955,7 +6039,8 @@ private fun GeneralTab(
 
         item { SectionHeader(stringResource(R.string.section_permission)) }
         item {
-            val storageOk = hasAllFilesAccess(context)
+            // key 带上 resumeTick：从系统设置切回来时自动重算，不必等用户手动刷新
+            val storageOk = remember(resumeTick) { hasAllFilesAccess(context) }
             PermissionRow(
                 label = stringResource(R.string.label_storage_perm),
                 status = if (storageOk) stringResource(R.string.common_on) else stringResource(R.string.common_off),
