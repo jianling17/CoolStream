@@ -499,12 +499,57 @@ git diff --unified=0 -- README.md | grep -E "^[-+]" | grep -E "!\[|&#x|\\\\&|log
 
 有命中就先 `cp` 备份 → `git checkout HEAD -- <file>` → 重新用精确替换的方式改一遍。
 
-### 铁律 12：发版前必须清空 `local.properties` 的 Key
+### 铁律 12：发布包里绝不能有 API Key —— 而且不能靠人记
 
-历史事故：打出来的 APK 里，`classes3.dex` 明文含有 `sk-0a1fde5d…`。因为
-`buildConfigField` 会把 Key 编进 `BuildConfig`。分发前必须：
-清空 `local.properties` 的 Key → 重新 `assembleDebug/Release` → 用 `strings`/`grep -a "sk-"` 验证
-dex 里没有 `sk-` → 恢复 `local.properties`。**旧的含 Key APK 要删除。**
+**两次事故，同一个根因。**
+
+第一次：打出来的 APK 里，`classes3.dex` 明文含有 `sk-0a1fde5d…`。
+第二次（2026-10-22，v1.0.0 已发布到 GitHub Release 之后才发现）：同样是
+`buildConfigField` 把 `local.properties` 的 Key 编进了 `BuildConfig`，
+反编译 APK 就能直接 `grep` 到 `sk-0a1fd…`（长度 35）。
+带毒的包在 Release 页面挂了一段时间，只能按「已经泄露到公网」处理。
+
+**为什么老流程不管用**：原铁律写的是「发版前手动清空 local.properties」。
+这依赖人记得住 —— 而人会忘、会被打断、会以为上次清过了。**流程必须交给机器。**
+
+#### 现在的做法（三道防线，缺一不可）
+
+1. **构建层强制**（`app/build.gradle.kts`）
+   `defaultConfig` 里照常注入（方便 debug），但 `buildTypes.release` 里
+   再覆盖一次：
+   ```kotlin
+   buildConfigField("String", "DEEPSEEK_API_KEY", "\"\"")
+   ```
+   这样无论 `local.properties` 里有没有 Key，release 包的
+   `BuildConfig.DEEPSEEK_API_KEY` **永远是空串**。不再需要任何人「记得清空」。
+
+2. **逻辑层纠偏**（`MainActivity.kt` 的 `runAgentLoop`）
+   Key 必须读 `ApiConfig.apiKey`（用户填的、存加密存储的），
+   **不能读 `BuildConfig.DEEPSEEK_API_KEY`**。
+   之前读 BuildConfig，导致「用户在设置里填了 Key 却不生效」——
+   release 包那个值是空的，只有 debug 包被本机兜底 Key 掩盖了。
+   这个 bug 是查 Key 泄露时顺带发现的。
+
+3. **发布前必扫**（不能省）
+   ```bash
+   ./gradlew assembleRelease
+   # 解压 APK，对每个 classes*.dex 搜 sk-
+   ```
+   **判据：0 命中。** 不是「应该没有」，是必须亲眼看到 0。
+   顺带扫 `AIza…`（Google）、`ghp_…`（GitHub）、`BEGIN … PRIVATE KEY`。
+
+#### 其它已确认的安全基线
+
+- `local.properties` **从未进过 git**（`git ls-files` 查不到），
+  `.gitignore` 里有 `/local.properties` 和 `local.properties` 两条。
+- 签名密钥库 `.keystore/`、`*.jks`、`*.keystore` 同样被忽略。
+- `git log --all -S "sk-"` 检查过，**提交历史里没有 Key 字符串**。
+  也就是说泄露只发生在 APK 二进制里，源码仓库是干净的。
+- 已泄露的那把 Key **必须去 DeepSeek 后台作废**（改代码解决不了）。
+- 建议在 GitHub 仓库开启 **Secret Scanning**（Settings → Code security）。
+
+> 教训一句话：**凡是「发版前记得做 X」的规则，迟早会失效。**
+> 能写成构建脚本的就写成构建脚本；写不成的，必须有一个「跑一次、看输出」的检查命令。
 
 ---
 

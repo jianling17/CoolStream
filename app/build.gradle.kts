@@ -84,7 +84,19 @@ android {
         versionName = "0.$versionStamp"
         versionCode = versionCodeHour
 
-        // 把 local.properties 里的 Key 生成成 BuildConfig.DEEPSEEK_API_KEY
+        // ★★★ 发布包绝不能含 API Key ★★★
+        //
+        // 历史事故（HANDOVER §6.1 ⑤）：buildConfigField 会把 local.properties 里的
+        // Key 编进 BuildConfig，然后被打进 classes.dex。反编译就能直接 grep 到
+        // "sk-..."。那次发出去的 APK 里确实带着明文 Key。
+        //
+        // 现在的规则：
+        //   · debug   —— 照常注入，本机开发时不用每次填 Key
+        //   · release —— 永远注入空串，Key 只能由用户在 App 里自己填
+        //                （存在 EncryptedSharedPreferences 里，跟 APK 无关）
+        //
+        // 这个默认值在这里是空串，release 的 buildType 里会再覆盖一次空串
+        // （见 buildTypes.release 里的 buildConfigField），双保险。
         buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekApiKey\"")
 
         // 把版本号也生成进 BuildConfig，UI 里直接读，不用再解析 PackageInfo
@@ -144,6 +156,20 @@ android {
             // 配合下面的 -renamesourcefileattribute 隐藏真实文件名。
             // 体积代价很小（约 1%），排查价值极大。
             isDebuggable = false
+
+            // ★★★ 发布包里 Key 强制为空 ★★★
+            //
+            // 这是第二道保险：defaultConfig 里注入的是 local.properties 的值，
+            // 这里在 release 上覆盖成空串，保证打出来的 APK 里
+            // BuildConfig.DEEPSEEK_API_KEY == ""。
+            //
+            // 用户在 App 里填的 Key 存在 EncryptedSharedPreferences，
+            // 跟 APK 无关，所以清空它不影响正常使用。
+            //
+            // 验证方法（发版前必做）：
+            //   ./gradlew assembleRelease
+            //   解压 APK，在 classes*.dex 里 grep "sk-" —— 必须搜不到。
+            buildConfigField("String", "DEEPSEEK_API_KEY", "\"\"")
         }
     }
 

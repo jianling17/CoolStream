@@ -3395,7 +3395,18 @@ fun runAgentLoop(
     return scope.launch(Dispatchers.IO) {
         try {
             // ---------- 1. 检查 API Key ----------
-            val apiKey = BuildConfig.DEEPSEEK_API_KEY
+            //
+            // ★ 这里必须读 ApiConfig.apiKey，不能读 BuildConfig.DEEPSEEK_API_KEY。
+            //
+            //   历史 bug：原来读的是 BuildConfig，而 release 包里那个值是空串，
+            //   于是「用户明明在设置里填了 Key，一发送还是报没配置」——
+            //   因为真正发请求的这条路径压根没看用户填的值。
+            //   （只有 debug 包能跑，因为本机 local.properties 里有兜底 Key，
+            //    把这个问题掩盖了很久。）
+            //
+            //   ApiConfig.apiKey 在启动时由 loadApiConfig() 填好：
+            //   优先用用户存的，其次才是编译期兜底（release 上兜底恒为空）。
+            val apiKey = ApiConfig.apiKey
             if (apiKey.isBlank()) {
                 withContext(Dispatchers.Main) {
                     onError(ErrorText(R.string.err_no_api_key))
