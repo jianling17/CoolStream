@@ -24,6 +24,7 @@ import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivityResultRegistryOwner
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.compose.setContent
@@ -1151,11 +1152,88 @@ private val TOOL_DEFINITIONS = """
  * Kotlin 的 private 是「文件内可见」，测试类在别的文件里，够不着。
  */
 /**
+ * 一条「还没渲染成文字」的错误。
+ *
+ * ★ 为什么不用 String：
+ *   错误文案现在要跟着语言走，而拼文案需要 Context.getString(resId, args)。
+ *   但 httpErrorMessage / networkErrorMessage 是在 IO 协程里被调用的，
+ *   那里既不是 Composable、也不该把 Context 拖进纯函数。
+ *
+ *   所以这里只记「资源 id + 参数」，等到要上屏的那一刻（主线程、手里有
+ *   localizedContext）再调 resolve() 变成字符串。
+ *
+ *   好处：
+ *     · 纯数据，可以安全跨线程传递
+ *     · 单元测试里可以直接断言 resId，不用碰 Android 资源
+ *     · 语言切换后旧错误气泡不会「半中半英」
+ */
+data class ErrorText(val resId: Int, val args: List<Any> = emptyList())
+
+/**
+ * 把 ErrorText 渲染成当前语言的文案。
+ *
+ * 注意：传进来的 context 必须已经过 withAppLocale 处理，
+ * 否则 App 内切换语言后，错误气泡会跟界面语言不一致。
+ */
+fun ErrorText.resolve(context: Context): String {
+    val arr: Array<out Any> = args.toTypedArray()
+    return context.getString(resId, *arr)
+}
+
+/**
  * 把 HTTP 状态码翻译成用户能照着做的话。
  *
  * ★ 为什么要单独做这件事：
  *   原来界面上只显示「HTTP 401」，用户看到这四个字符完全不知道该干嘛。
  *   401 和 429 是最常见的两种，必须给出下一步动作。
+ *
+ * ★ 返回 ErrorText 而不是 String：见 ErrorText 的注释。
+ */
+fun httpErrorText(code: Int, body: String): ErrorText {
+    return when (code) {
+        401 -> ErrorText(R.string.err_401)
+        402 -> ErrorText(R.string.err_402)
+        403 -> ErrorText(R.string.err_403)
+        404 -> ErrorText(R.string.err_404)
+        429 -> ErrorText(R.string.err_429)
+        in 500..599 -> ErrorText(R.string.err_5xx, listOf(code))
+        else -> {
+            val hint = body.take(200).trim()
+            if (hint.isEmpty()) {
+                ErrorText(R.string.err_http, listOf(code))
+            } else {
+                ErrorText(R.string.err_http_body, listOf(code, hint))
+            }
+        }
+    }
+}
+
+/**
+ * 把网络异常翻译成人话。
+ *
+ * 这些异常用户一天能遇到好几次（地铁里、电梯里、切飞行模式），
+ * 每一种都要能自己判断「是我网不好，还是 App 挂了」。
+ */
+fun networkErrorText(e: Throwable): ErrorText {
+    return when (e) {
+        is UnknownHostException -> ErrorText(R.string.err_no_network)
+        is SocketTimeoutException -> ErrorText(R.string.err_timeout)
+        is SSLException -> ErrorText(R.string.err_ssl)
+        is java.io.IOException ->
+            ErrorText(R.string.err_io, listOf(e.message ?: e.javaClass.simpleName))
+        else -> ErrorText(
+            R.string.err_unknown,
+            listOf(e.javaClass.simpleName, e.message ?: e.javaClass.simpleName)
+        )
+    }
+}
+
+/**
+ * ⚠️ 下面这两个是【退化路径 sendToDeepSeek】专用的旧实现，故意保留。
+ *
+ * 铁律 3：sendToDeepSeek 一个字不改。它现在没有任何调用点，
+ * 但仍保留作参照。它的 onError 收的是 String，所以这里继续返回中文。
+ * 真正在跑的 runAgentLoop 已经改用上面的 httpErrorText / networkErrorText。
  */
 private fun httpErrorMessage(code: Int, body: String): String {
     return when (code) {
@@ -1172,12 +1250,6 @@ private fun httpErrorMessage(code: Int, body: String): String {
     }
 }
 
-/**
- * 把网络异常翻译成人话。
- *
- * 这些异常用户一天能遇到好几次（地铁里、电梯里、切飞行模式），
- * 每一种都要能自己判断「是我网不好，还是 App 挂了」。
- */
 private fun networkErrorMessage(e: Throwable): String {
     return when (e) {
         is UnknownHostException ->
@@ -1192,6 +1264,7 @@ private fun networkErrorMessage(e: Throwable): String {
             "出错了：${e.javaClass.simpleName}: ${e.message ?: "未知原因"}"
     }
 }
+
 
 internal data class ToolExecResult(val ok: Boolean, val output: String)
 
@@ -3257,7 +3330,15 @@ fun runAgentLoop(
     onFlush: (String) -> Unit,
     onUsage: (UsageStats) -> Unit,
     onDone: (totalChars: Int) -> Unit,
-    onError: (String) -> Unit
+    /**
+     * 出错回调。
+     *
+     * ★ 注意参数是 ErrorText 而不是 String：
+     *   这个函数跑在 IO 协程里，拿不到 stringResource，也不该把 Context 拖进来。
+     *   所以只把「资源 id + 参数」交出去，由调用方（主线程、手里有 localizedContext）
+     *   调 resolve(context) 变成当前语言的文字。
+     */
+    onError: (ErrorText) -> Unit
 ): Job {
     return scope.launch(Dispatchers.IO) {
         try {
@@ -3265,7 +3346,7 @@ fun runAgentLoop(
             val apiKey = BuildConfig.DEEPSEEK_API_KEY
             if (apiKey.isBlank()) {
                 withContext(Dispatchers.Main) {
-                    onError("还没有配置 API Key。\n请到「设置 → 模型与 API」里填入，或者点这里重新走一遍引导。")
+                    onError(ErrorText(R.string.err_no_api_key))
                 }
                 return@launch
             }
@@ -3338,13 +3419,13 @@ fun runAgentLoop(
                 if (!response.isSuccessful) {
                     val errBody = response.body?.string() ?: ""
                     Log.e(TAG, "HTTP ${response.code}: ${errBody.take(300)}")
-                    withContext(Dispatchers.Main) { onError(httpErrorMessage(response.code, errBody)) }
+                    withContext(Dispatchers.Main) { onError(httpErrorText(response.code, errBody)) }
                     return@launch
                 }
 
                 val bodyStream = response.body
                 if (bodyStream == null) {
-                    withContext(Dispatchers.Main) { onError("服务器返回了空内容") }
+                    withContext(Dispatchers.Main) { onError(ErrorText(R.string.err_empty_response)) }
                     return@launch
                 }
 
@@ -3505,14 +3586,14 @@ fun runAgentLoop(
             }
 
             withContext(Dispatchers.Main) {
-                onError("工具调用超过 $MAX_TOOL_ROUNDS 轮，已中止")
+                onError(ErrorText(R.string.err_too_many_rounds, listOf(MAX_TOOL_ROUNDS)))
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "agent loop failed", e)
             withContext(Dispatchers.Main) {
-                onError(networkErrorMessage(e))
+                onError(networkErrorText(e))
             }
         }
     }
@@ -3560,8 +3641,23 @@ class MainActivity : ComponentActivity() {
                 baseContext.withAppLocale(AppSettings.language)
             }
 
+            // ★ 必须显式补回 ActivityResultRegistryOwner。
+            //
+            //   坑：withAppLocale 用的是 createConfigurationContext()，
+            //   它返回的是一个【全新的 Context】，不是原来 Activity 的 ContextWrapper，
+            //   于是「顺着 Context 链往上找 Activity」这条路就断了。
+            //   而 rememberLauncherForActivityResult 正是靠 LocalActivityResultRegistryOwner
+            //   （默认从 LocalContext 里找）来拿注册表的 —— 断了就抛
+            //   IllegalStateException: No ActivityResultRegistryOwner was provided。
+            //
+            //   表现：语言设为「跟随系统」时一切正常（withAppLocale 直接 return this，不包装）；
+            //        一旦切到强制中文/英文，App 一启动就崩在通知权限请求那里。
+            //   所以这里把 owner 直接指向 Activity 自己（ComponentActivity 本来就实现了它）。
+            val activityResultOwner = this@MainActivity
+
             CompositionLocalProvider(
                 LocalContext provides localizedContext,
+                LocalActivityResultRegistryOwner provides activityResultOwner,
                 LocalIsDark provides dark,
                 LocalDensity provides Density(baseDensity.density, AppSettings.fontScale)
             ) {
@@ -3765,19 +3861,24 @@ fun ChatScreen() {
     fun newSession(): String {
         val id = UUID.randomUUID().toString()
         val createdAt = System.currentTimeMillis()
+        // ★ 默认标题故意【不】做多语言，保持中文：
+        //   标题是写进数据库的持久化数据、用户还能自己改。
+        //   如果按当前语言生成，同一个侧边栏里会出现「新对话 / New chat」混排，
+        //   历史会话的标题还会随着切语言变来变去。宁可它一直是同一个词。
+        val defaultTitle = "新对话"
         // 放到列表最上面：越新的会话越靠前，这是主流客户端的习惯
         sessions.add(
             0,
             ChatSession(
                 id = id,
-                title = "新对话",
+                title = defaultTitle,
                 messages = emptyList(),
                 createdAt = createdAt
             )
         )
         currentSessionId = id
         streamScope.launch(Dispatchers.IO) {
-            dao.insertSession(SessionEntity(id = id, title = "新对话", createdAt = createdAt))
+            dao.insertSession(SessionEntity(id = id, title = defaultTitle, createdAt = createdAt))
         }
         return id
     }
@@ -4447,7 +4548,11 @@ fun ChatScreen() {
                                 },
 
                                 onError = { err ->
-                                    Log.e(TAG, "stream error: $err")
+                                    // ★ 这里才把 ErrorText 渲染成文字：
+                                    //   context 是 ChatScreen 里拿到的 localizedContext，
+                                    //   已经按 App 内语言设置包装过，所以切英文后错误气泡也是英文。
+                                    val errMsg = err.resolve(context)
+                                    Log.e(TAG, "stream error: $errMsg")
                                     // 把错误显示在气泡里，不然界面上什么都看不到。
                                     // 标上 isError = true，这样下次发消息时它不会被
                                     // 当成 AI 的真实回复发给模型。
@@ -4457,7 +4562,7 @@ fun ChatScreen() {
                                             s.copy(
                                                 messages = msgs.dropLast(1) +
                                                     msgs.last().copy(
-                                                        content = "错误: $err",
+                                                        content = errMsg,
                                                         isError = true
                                                     )
                                             )
@@ -4528,12 +4633,10 @@ fun ChatScreen() {
             containerColor = MaterialTheme.colorScheme.surface,
             titleContentColor = MaterialTheme.colorScheme.onSurface,
             textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-            title = { Text("需要文件访问权限") },
+            title = { Text(stringResource(R.string.storage_tip_title)) },
             text = {
                 Text(
-                    "Agent 的 read_file 工具需要「所有文件访问权限」才能读取本地文件。\n\n" +
-                        "不开也能正常聊天，只是模型调用 read_file 时会失败。\n" +
-                        "开启后请回到 App 再试一次。",
+                    stringResource(R.string.storage_tip_body),
                     style = MaterialTheme.typography.bodySmall
                 )
             },
@@ -4541,10 +4644,12 @@ fun ChatScreen() {
                 TextButton(onClick = {
                     openAllFilesAccessSettings(context)
                     showStorageTip = false
-                }) { Text("去开启") }
+                }) { Text(stringResource(R.string.storage_tip_open)) }
             },
             dismissButton = {
-                TextButton(onClick = { showStorageTip = false }) { Text("稍后") }
+                TextButton(onClick = { showStorageTip = false }) {
+                    Text(stringResource(R.string.storage_tip_later))
+                }
             }
         )
     }
@@ -4678,12 +4783,12 @@ fun Sidebar(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                DRAWER_GROUPS.forEachIndexed { groupIndex, label ->
+                DRAWER_GROUPS.forEachIndexed { groupIndex, labelRes ->
                     val groupItems = filtered.filter { dayBucket(it.createdAt) == groupIndex }
                     if (groupItems.isNotEmpty()) {
                         item(key = "header-$groupIndex") {
                             Text(
-                                text = label,
+                                text = stringResource(labelRes),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = cs.onSurfaceVariant,
                                 modifier = Modifier.padding(start = 8.dp, top = 10.dp, bottom = 4.dp)
@@ -4703,7 +4808,7 @@ fun Sidebar(
                 if (filtered.isEmpty()) {
                     item(key = "empty") {
                         Text(
-                            text = "没有匹配的会话",
+                            text = stringResource(R.string.no_matching_chats),
                             style = MaterialTheme.typography.bodySmall,
                             color = cs.onSurfaceVariant,
                             modifier = Modifier.padding(start = 8.dp, top = 16.dp)
@@ -4723,7 +4828,7 @@ fun Sidebar(
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(Modifier.width(8.dp))
-                Text("设置", fontFamily = FontFamily.Monospace)
+                Text(stringResource(R.string.sidebar_settings), fontFamily = FontFamily.Monospace)
             }
         }
 
@@ -4841,7 +4946,7 @@ fun Sidebar(
             containerColor = glassDrawer(),
             titleContentColor = cs.onSurface,
             textContentColor = cs.onSurfaceVariant,
-            title = { Text("重命名会话") },
+            title = { Text(stringResource(R.string.rename_session_title)) },
             text = {
                 Surface(
                     color = glassFill(),
@@ -4869,18 +4974,26 @@ fun Sidebar(
                     val t = renameText.trim()
                     if (t.isNotEmpty()) onRename(target.id, t)
                     renameTarget = null
-                }) { Text("保存") }
+                }) { Text(stringResource(R.string.action_save)) }
             },
             dismissButton = {
-                TextButton(onClick = { renameTarget = null }) { Text("取消") }
+                TextButton(onClick = { renameTarget = null }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
             }
         )
     }
 }
 
 
-// 侧边栏分组标题
-private val DRAWER_GROUPS = listOf("今天", "昨天", "更早")
+// 侧边栏分组标题。
+// ★ 存的是资源 id 而不是中文字面量：这个 val 在顶层、不是 Composable，
+//   拿不到 stringResource，所以只能在渲染处再解析成文案。
+private val DRAWER_GROUPS = listOf(
+    R.string.group_today,
+    R.string.group_yesterday,
+    R.string.group_earlier
+)
 
 /** 0=今天 / 1=昨天 / 2=更早。纯内存计算，不查数据库。 */
 private fun dayBucket(ts: Long): Int {
@@ -5038,7 +5151,11 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     trailing = {
                         TextButton(onClick = { showKey = !showKey }) {
                             Text(
-                                text = if (showKey) "隐藏" else "显示",
+                                text = if (showKey) {
+                                stringResource(R.string.action_hide)
+                            } else {
+                                stringResource(R.string.action_show)
+                            },
                                 fontFamily = FontFamily.Monospace,
                                 style = MaterialTheme.typography.labelSmall
                             )
@@ -5487,7 +5604,13 @@ private fun ModelTab() {
     var draftBase by remember { mutableStateOf(ApiConfig.baseUrl) }
     var draftModel by remember { mutableStateOf(ApiConfig.model) }
     var showKey by remember { mutableStateOf(false) }
-    var hint by remember { mutableStateOf("") }
+    // 保存结果的提示：只存 key，真正的文案在渲染时用 stringResource 拼。
+    // ★ 以前是直接存中文、再用 hint.startsWith("已保存") 判断颜色 ——
+    //   一旦做多语言，这个判断立刻失效（英文文案不是「已保存」开头）。
+    //   所以拆成「状态 + 文案 key」两部分，颜色只看状态。
+    var hintRes by remember { mutableStateOf<Int?>(null) }
+    var hintArgs by remember { mutableStateOf<Array<out Any>>(emptyArray()) }
+    var hintIsOk by remember { mutableStateOf(false) }
 
     val keyOk = draftKey.isNotBlank()
     val dirty = draftKey != ApiConfig.apiKey ||
@@ -5498,15 +5621,15 @@ private fun ModelTab() {
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
     ) {
-        item { SectionHeader("模型与 API") }
+        item { SectionHeader(stringResource(R.string.section_model_api)) }
 
         item {
             ConfigField(
                 label = stringResource(R.string.field_api_base),
                 value = draftBase,
                 placeholder = DEFAULT_API_BASE,
-                helper = "只填 https://api.deepseek.com 也行，会自动补 /chat/completions",
-                onValueChange = { draftBase = it; hint = "" }
+                helper = stringResource(R.string.api_base_helper),
+                onValueChange = { draftBase = it; hintRes = null; hintIsOk = false }
             )
         }
 
@@ -5516,21 +5639,25 @@ private fun ModelTab() {
                 value = draftKey,
                 placeholder = "sk-...",
                 helper = if (keyOk) {
-                    "已填写 ${draftKey.length} 位；保存在加密存储里，不写日志、不进备份"
+                    stringResource(R.string.api_key_saved, draftKey.length)
                 } else {
-                    "去 platform.deepseek.com 申请"
+                    stringResource(R.string.api_key_empty)
                 },
                 masked = !showKey,
                 trailing = {
                     TextButton(onClick = { showKey = !showKey }) {
                         Text(
-                            text = if (showKey) "隐藏" else "显示",
+                            text = if (showKey) {
+                                stringResource(R.string.action_hide)
+                            } else {
+                                stringResource(R.string.action_show)
+                            },
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.labelSmall
                         )
                     }
                 },
-                onValueChange = { draftKey = it; hint = "" }
+                onValueChange = { draftKey = it; hintRes = null; hintIsOk = false }
             )
         }
 
@@ -5539,8 +5666,8 @@ private fun ModelTab() {
                 label = stringResource(R.string.field_model),
                 value = draftModel,
                 placeholder = DEFAULT_MODEL,
-                helper = "例：deepseek-flash / deepseek-v4-pro",
-                onValueChange = { draftModel = it; hint = "" }
+                helper = stringResource(R.string.model_helper),
+                onValueChange = { draftModel = it; hintRes = null; hintIsOk = false }
             )
         }
 
@@ -5554,7 +5681,9 @@ private fun ModelTab() {
                 Button(
                     onClick = {
                         saveApiConfig(context, draftKey, draftBase, draftModel)
-                        hint = "已保存，下一轮对话生效"
+                        hintRes = R.string.save_ok
+                        hintArgs = emptyArray()
+                        hintIsOk = true
                     },
                     enabled = keyOk && dirty,
                     colors = ButtonDefaults.buttonColors(
@@ -5562,27 +5691,34 @@ private fun ModelTab() {
                         contentColor = cs.onPrimary
                     )
                 ) {
-                    Text("保存", fontFamily = FontFamily.Monospace)
+                    Text(
+                        text = stringResource(R.string.action_save),
+                        fontFamily = FontFamily.Monospace
+                    )
                 }
                 Spacer(Modifier.width(12.dp))
                 Text(
-                    text = hint.ifBlank {
+                    // 没点过保存时，按当前状态给一句实时提示
+                    text = if (hintRes != null) {
+                        stringResource(hintRes!!, *hintArgs)
+                    } else {
                         when {
-                            !keyOk -> "Key 不能为空"
-                            !dirty -> "当前配置已是最新"
-                            else -> "有未保存的修改"
+                            !keyOk -> stringResource(R.string.save_key_required)
+                            !dirty -> stringResource(R.string.save_no_change)
+                            else -> stringResource(R.string.save_dirty)
                         }
                     },
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelSmall,
-                    color = if (hint.startsWith("已保存")) Color(0xFF3FB950) else cs.onSurfaceVariant
+                    // ★ 颜色只看状态，不再靠中文前缀判断
+                    color = if (hintIsOk) Color(0xFF3FB950) else cs.onSurfaceVariant
                 )
             }
         }
 
         item {
             Text(
-                text = "完整请求地址：${chatCompletionsUrl()}",
+                text = stringResource(R.string.full_url, chatCompletionsUrl()),
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.labelSmall,
                 color = cs.onSurfaceVariant,
@@ -5591,7 +5727,7 @@ private fun ModelTab() {
         }
 
         item { SectionHeader(stringResource(R.string.section_runtime)) }
-        item { InfoRow("批处理", "${FLUSH_INTERVAL_MS}ms") }
+        item { InfoRow(stringResource(R.string.label_batching), "${FLUSH_INTERVAL_MS}ms") }
         item {
             // 1_000_000 显示成「1M」比「1000K」好读
             val ctxLabel = if (CONTEXT_WINDOW_TOKENS >= 1_000_000) {
@@ -5599,17 +5735,25 @@ private fun ModelTab() {
             } else {
                 "${CONTEXT_WINDOW_TOKENS / 1000}K tokens"
             }
-            InfoRow("上下文", ctxLabel)
+            InfoRow(stringResource(R.string.label_context), ctxLabel)
         }
-        item { InfoRow("历史", "最近 $MAX_HISTORY_MESSAGES 条") }
-        item { InfoRow("轮次上限", "$MAX_TOOL_ROUNDS 轮") }
+        item {
+            InfoRow(
+                stringResource(R.string.label_history),
+                stringResource(R.string.history_value, MAX_HISTORY_MESSAGES)
+            )
+        }
+        item {
+            InfoRow(
+                stringResource(R.string.label_max_rounds),
+                stringResource(R.string.rounds_value, MAX_TOOL_ROUNDS)
+            )
+        }
 
-        item { SectionHeader("计费口径") }
+        item { SectionHeader(stringResource(R.string.section_billing)) }
         item {
             Text(
-                text = "费用按 DeepSeek 官方峰谷单价估算，不是账单。\n" +
-                    "高峰时段：北京时间周一至周五 09:00–12:00、14:00–18:00（法定节假日除外）。\n" +
-                    "节假日无法在客户端判断，那几天会按高峰价算，偏高。",
+                text = stringResource(R.string.billing_body),
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.bodySmall,
                 color = cs.onSurfaceVariant,
@@ -5697,8 +5841,7 @@ private fun PluginsTab() {
     ) {
         item {
             Text(
-                text = "关掉的工具不会出现在请求里，也不会写进系统提示词。\n" +
-                    "改动在下一轮对话生效，不需要重启。",
+                text = stringResource(R.string.plugins_hint_off),
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.bodySmall,
                 color = cs.onSurfaceVariant,
@@ -5713,13 +5856,8 @@ private fun PluginsTab() {
             item {
                 Text(
                     text = when (AppSettings.preset) {
-                        AgentPreset.PTC ->
-                            "当前是 PTC 模式：请求里只发 run_code，" +
-                                "下面这些开关控制的是「代码里能不能调到它们」，\n" +
-                                "关掉的那几个在沙箱里会返回 ok=false。"
-                        AgentPreset.MINIMAL ->
-                            "当前是极简模式：一个工具都不发，下面的开关暂时不起作用。\n" +
-                                "想用工具请回「通用」页把预设切回标准或 PTC。"
+                        AgentPreset.PTC -> stringResource(R.string.plugins_hint_ptc)
+                        AgentPreset.MINIMAL -> stringResource(R.string.plugins_hint_minimal)
                         AgentPreset.STANDARD -> ""
                     },
                     fontFamily = FontFamily.Monospace,
@@ -5743,10 +5881,13 @@ private fun PluginsTab() {
         item {
             Spacer(Modifier.height(6.dp))
             Text(
-                text = "已开启 ${AppSettings.enabledTools.size} / ${ALL_TOOL_NAMES.size}" +
-                    if (AppSettings.enabledTools.isEmpty()) {
-                        "　—— 全部关闭时模型不会收到任何工具，只能纯聊天"
-                    } else "",
+                text = stringResource(
+                    R.string.plugins_enabled_count,
+                    AppSettings.enabledTools.size,
+                    ALL_TOOL_NAMES.size
+                ) + if (AppSettings.enabledTools.isEmpty()) {
+                    stringResource(R.string.plugins_all_off)
+                } else "",
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.labelSmall,
                 color = cs.onSurfaceVariant,
@@ -5771,7 +5912,7 @@ private fun AboutTab() {
             //   由 build.gradle.kts 在【编译时】按「0.yyMMddHHmm」生成。
             //   每次构建都会变，不需要手动改。
             Text(
-                text = "当前版本：${BuildConfig.BUILD_VERSION_NAME}",
+                text = stringResource(R.string.about_version, BuildConfig.BUILD_VERSION_NAME),
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.bodyMedium,
                 color = cs.onSurface,
@@ -5780,18 +5921,41 @@ private fun AboutTab() {
         }
 
         item { SectionHeader(stringResource(R.string.section_stack)) }
-        item { InfoRow("界面", "Jetpack Compose + Material 3") }
-        item { InfoRow("网络", "OkHttp 4.12（手写 SSE 解析）") }
-        item { InfoRow("数据", "Room v3 本地数据库") }
-        item { InfoRow("提权", "Shizuku 13（AIDL UserService）") }
-        item { InfoRow("工具", "${ALL_TOOL_NAMES.size} 个本地工具，见「插件」页") }
+        item {
+            InfoRow(
+                stringResource(R.string.about_stack_ui),
+                stringResource(R.string.about_stack_ui_value)
+            )
+        }
+        item {
+            InfoRow(
+                stringResource(R.string.about_stack_net),
+                stringResource(R.string.about_stack_net_value)
+            )
+        }
+        item {
+            InfoRow(
+                stringResource(R.string.about_stack_db),
+                stringResource(R.string.about_stack_db_value)
+            )
+        }
+        item {
+            InfoRow(
+                stringResource(R.string.about_stack_shell),
+                stringResource(R.string.about_stack_shell_value)
+            )
+        }
+        item {
+            InfoRow(
+                stringResource(R.string.about_stack_tools),
+                stringResource(R.string.about_stack_tools_value, ALL_TOOL_NAMES.size)
+            )
+        }
 
         item { SectionHeader(stringResource(R.string.section_notes)) }
         item {
             Text(
-                text = "CoolStream 是个人项目，不是产品。\n" +
-                    "API Key 存在本机的 local.properties 里，没有服务端代理，\n" +
-                    "所以这个 APK 只适合自己用，不要分发给别人。",
+                text = stringResource(R.string.about_notes),
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.bodySmall,
                 color = cs.onSurfaceVariant,
@@ -6784,7 +6948,11 @@ private fun ToolCallCard(
                     } else {
                         Icons.Default.KeyboardArrowDown
                     },
-                    contentDescription = if (expanded) "收起参数" else "展开参数",
+                    contentDescription = if (expanded) {
+                        stringResource(R.string.tool_card_collapse)
+                    } else {
+                        stringResource(R.string.tool_card_expand)
+                    },
                     tint = cs.onSurfaceVariant,
                     modifier = Modifier.size(18.dp)
                 )
@@ -6795,7 +6963,7 @@ private fun ToolCallCard(
                 Spacer(Modifier.height(10.dp))
 
                 Text(
-                    text = "参数",
+                    text = stringResource(R.string.tool_card_args),
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelSmall,
                     color = cs.onSurfaceVariant
@@ -6809,7 +6977,7 @@ private fun ToolCallCard(
                     Spacer(Modifier.height(10.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = "差异",
+                            text = stringResource(R.string.tool_card_diff),
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.labelSmall,
                             color = cs.onSurfaceVariant
@@ -6838,7 +7006,11 @@ private fun ToolCallCard(
                 if (view.output.isNotEmpty()) {
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        text = if (view.ok == true) "结果" else "错误",
+                        text = if (view.ok == true) {
+                            stringResource(R.string.tool_card_result)
+                        } else {
+                            stringResource(R.string.tool_card_error)
+                        },
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.labelSmall,
                         color = cs.onSurfaceVariant
@@ -6972,16 +7144,18 @@ fun InfoBar(usage: UsageStats, isStreaming: Boolean) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(
-            text = "本轮 ≈ ${formatCny(cost)}",
+            text = stringResource(R.string.info_cost, formatCny(cost)),
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.labelSmall,
             color = cs.onSurfaceVariant
         )
         Spacer(Modifier.width(12.dp))
         Text(
-            text = "上下文 ${formatTokens(usage.promptTokens)} / " +
-                "${formatTokens(CONTEXT_WINDOW_TOKENS)}  " +
-                String.format(Locale.US, "%.1f%%", ctxPercent),
+            text = stringResource(
+                R.string.info_context,
+                formatTokens(usage.promptTokens),
+                formatTokens(CONTEXT_WINDOW_TOKENS)
+            ) + "  " + String.format(Locale.US, "%.1f%%", ctxPercent),
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.labelSmall,
             color = cs.onSurfaceVariant,
@@ -6989,7 +7163,7 @@ fun InfoBar(usage: UsageStats, isStreaming: Boolean) {
         )
         if (isStreaming) {
             Text(
-                text = "生成中…",
+                text = stringResource(R.string.info_generating),
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.labelSmall,
                 color = cs.primary

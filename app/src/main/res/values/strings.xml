@@ -81,6 +81,8 @@
     <string name="shizuku_tap_grant">点此授权</string>
 
     <string name="section_model_api">模型与 API</string>
+    <string name="section_billing">计费口径</string>
+    <string name="billing_body">费用按 DeepSeek 官方峰谷单价估算，不是账单。\n高峰时段：北京时间周一至周五 09:00–12:00、14:00–18:00（法定节假日除外）。\n节假日无法在客户端判断，那几天会按高峰价算，偏高。</string>
     <string name="api_base_helper">只填 https://api.deepseek.com 也行，会自动补 /chat/completions</string>
     <string name="api_key_empty">去 platform.deepseek.com 申请</string>
     <string name="api_key_saved">已填写 %1$d 位；保存在加密存储里，不写日志、不进备份</string>
@@ -131,4 +133,68 @@
     <string name="sheet_title">添加附件</string>
     <string name="sheet_image">上传图片</string>
     <string name="sheet_file">上传文件</string>
+
+    <!-- ============ 侧边栏 / 存储提示 ============ -->
+    <string name="storage_tip_title">需要文件访问权限</string>
+    <string name="storage_tip_body">Agent 的 read_file 工具需要「所有文件访问权限」才能读取手机文件。\n\n不开也能正常聊天，只是模型调用 read_file 时会失败。\n开启后请回到 App 再试一次。</string>
+    <string name="storage_tip_open">去开启</string>
+    <string name="storage_tip_later">稍后</string>
+    <string name="sidebar_settings">设置</string>
+    <string name="no_matching_chats">没有匹配的会话</string>
+    <string name="group_today">今天</string>
+    <string name="group_yesterday">昨天</string>
+    <string name="group_earlier">更早</string>
+    <string name="rename_session_title">重命名会话</string>
+    <string name="action_ok">确定</string>
+
+    <!-- ============ 插件页说明 ============ -->
+    <string name="plugins_hint_off">关掉的工具不会出现在请求里，也不会写进系统提示词。\n改动在下一轮对话生效，不需要重启。</string>
+    <string name="plugins_hint_ptc">当前是 PTC 模式：请求里只发 run_code，下面这些开关控制的是「代码里能不能调到它们」，\n关掉的那几个在沙箱里会返回 ok=false。</string>
+    <string name="plugins_hint_minimal">当前是极简模式：一个工具都不发，下面的开关暂时不起作用。\n想用工具请回「通用」页把预设切回标准或 PTC。</string>
+    <string name="plugins_enabled_count">已开启 %1$d / %2$d</string>
+    <string name="plugins_all_off">　—— 全部关闭时模型不会收到任何工具，只能纯聊天</string>
+
+    <!-- ============ 关于页 ============ -->
+    <string name="about_version">当前版本：%1$s</string>
+    <string name="about_stack_ui">界面</string>
+    <string name="about_stack_net">网络</string>
+    <string name="about_stack_db">数据</string>
+    <string name="about_stack_shell">提权</string>
+    <string name="about_stack_tools">工具</string>
+    <string name="about_stack_ui_value">Jetpack Compose + Material 3</string>
+    <string name="about_stack_net_value">OkHttp 4.12（手写 SSE 解析）</string>
+    <string name="about_stack_db_value">Room v3 本地数据库</string>
+    <string name="about_stack_shell_value">Shizuku 13（AIDL UserService）</string>
+    <string name="about_stack_tools_value">%1$d 个本地工具，见「插件」页</string>
+    <string name="about_notes">CoolStream 是个人项目，不是产品。\nAPI Key 存在本机的 local.properties 里，没有服务端代理，\n所以这个 APK 只适合自己用，不要分发给别人。</string>
+
+    <!-- ============ 工具卡片 / InfoBar ============ -->
+    <string name="tool_card_expand">展开参数</string>
+    <string name="tool_card_collapse">收起参数</string>
+    <string name="tool_card_args">参数</string>
+    <string name="tool_card_diff">差异</string>
+    <string name="tool_card_result">结果</string>
+    <string name="tool_card_error">错误</string>
+    <string name="info_cost">本轮 ≈ %1$s</string>
+    <string name="info_context">上下文 %1$s / %2$s</string>
+    <string name="info_generating">生成中…</string>
+
+    <!-- ============ 错误文案 ============ -->
+    <string name="err_401">API Key 无效或已欠费（401）。\n请到「设置 → 模型与 API」检查 Key 是否填错、账户是否还有余额。</string>
+    <string name="err_402">账户余额不足（402）。\n请到 DeepSeek 开放平台充值后再试。</string>
+    <string name="err_403">没有访问权限（403）。\n这个 Key 可能被限制访问该模型。</string>
+    <string name="err_404">接口地址不对（404）。\n检查「设置 → 模型与 API」里的 API 地址。</string>
+    <string name="err_429">请求太频繁，请休息一下（429）。\n等几十秒再发，或者换到低峰时段。</string>
+    <string name="err_5xx">服务器出问题了（%1$d）。\n不是你的操作问题，过一会儿再试。</string>
+    <string name="err_http">HTTP %1$d</string>
+    <string name="err_http_body">HTTP %1$d\n%2$s</string>
+    <string name="err_no_network">连不上网络。\n检查 Wi-Fi 或移动数据是否正常；如果开了代理/VPN，先关掉再试。</string>
+    <string name="err_timeout">请求超时。\n网络太慢或服务器没响应，换个网络或稍后重试。</string>
+    <string name="err_ssl">安全连接失败（SSL）。\n多半是代理或证书在中间拦截，关掉代理再试。</string>
+    <string name="err_io">网络异常：%1$s</string>
+    <string name="err_unknown">出错了：%1$s: %2$s</string>
+    <string name="err_unknown_reason">未知原因</string>
+    <string name="err_no_api_key">还没有配置 API Key。\n请到「设置 → 模型与 API」里填入，或者点这里重新走一遍引导。</string>
+    <string name="err_too_many_rounds">工具调用超过 %1$d 轮，已停止</string>
+    <string name="err_empty_response">服务器返回了空内容</string>
 </resources>
