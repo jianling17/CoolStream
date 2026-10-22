@@ -907,6 +907,8 @@ The proxy is up, but its upstream for **one specific host** (`github.com`) is br
 - [x] Red/green diff view inside successful `replace_in_file` cards (LCS, computed in the UI layer)
 - [x] Auto-scroll that follows new messages and streaming output, without hijacking a user who scrolled up
 - [x] Four-tab settings (通用 / 模型 / 插件 / 关于): theme, font scale, card default state, per-tool switches
+- [x] Long-press copy menu (full text / code block only), glass popup anchored to the bubble
+- [x] `restore.md` + `local.properties.example` — how to bring the project back on another machine
 
 ### Summary
 
@@ -1939,6 +1941,8 @@ fatal: unable to access 'https://github.com/...': CONNECT tunnel failed, respons
 - [x] `replace_in_file` 成功的卡片里显示红绿 diff（LCS，纯 UI 层计算）
 - [x] 自动滚动：跟随新消息与流式输出，但不会抢走用户往上翻的滚动
 - [x] 四 Tab 设置页（通用 / 模型 / 插件 / 关于）：主题、字号、卡片默认状态、逐工具开关
+- [x] 长按复制菜单（复制全文 / 只复制代码），毛玻璃弹窗贴着气泡出现
+- [x] `restore.md` + `local.properties.example` —— 换电脑怎么把项目跑起来
 
 ### 总结
 

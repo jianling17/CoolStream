@@ -1,0 +1,15 @@
+# 复制本文件为 local.properties，然后填上你自己的值。
+#   cp local.properties.example local.properties
+#
+# ⚠️ local.properties 已被 .gitignore 排除，不会进仓库，也不该发给别人。
+
+# Android SDK 路径。
+# Windows 的反斜杠要写成双反斜杠：
+#   sdk.dir=C\:\\Users\\你的用户名\\AppData\\Local\\Android\\Sdk
+# macOS：
+#   sdk.dir=/Users/你的用户名/Library/Android/sdk
+sdk.dir=
+
+# DeepSeek API Key，在 https://platform.deepseek.com 申请。
+# 留空的话 App 能编译能启动，但发消息时会提示「API Key 是空的」。
+DEEPSEEK_API_KEY=

@@ -3,6 +3,8 @@ package com.example.mychat
 import android.Manifest
 import android.app.Application
 import android.content.ComponentName
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
@@ -94,7 +96,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -4518,6 +4524,7 @@ private fun PermissionRow(
 // ============================================================
 // 6. 消息气泡
 // ============================================================
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MessageBubble(
     message: ChatMessage,
@@ -4533,6 +4540,7 @@ fun MessageBubble(
 
     val cs = MaterialTheme.colorScheme
     val isUser = message.isUser
+    val context = LocalContext.current
 
     // 用户气泡：实心蓝 + 白字
     // AI 气泡：深/浅灰底 + 1dp 描边 + 正文色
@@ -4546,41 +4554,167 @@ fun MessageBubble(
     //   用户自己打的内容不解释成 Markdown —— 免得他打了 # 或 ** 被吃掉。
     val useMarkdown = markdown && !isUser && !message.isError && message.content.isNotBlank()
 
+    // ---------- 长按复制 ----------
+    var menuOpen by remember { mutableStateOf(false) }
+    // 气泡高度：菜单要贴着气泡下沿弹出，所以得先量一下
+    var bubbleHeight by remember { mutableStateOf(0) }
+    // 代码块只在正文变化时重新抽一次，重组时不重复扫描
+    val codeBlocks = remember(message.content) { extractCodeBlocks(message.content) }
+
     // 外层 Box 负责"靠左还是靠右"
     Box(
         modifier = modifier.fillMaxWidth(),
         contentAlignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
     ) {
-        // 内层 Surface 负责"长什么样"
-        Surface(
-            color = bubbleColor,
-            // 大圆角 24dp：胶囊感
-            shape = RoundedCornerShape(24.dp),
-            // 无阴影：阴影高度和色调高度都归零
-            shadowElevation = 0.dp,
-            tonalElevation = 0.dp,
-            // 两种气泡都加一条极微弱的半透明高光边框（毛玻璃质感）
-            border = BorderStroke(1.dp, glassEdge()),
-            modifier = Modifier.widthIn(max = 300.dp)
-        ) {
-            if (useMarkdown) {
-                MarkdownText(
-                    content = message.content,
-                    textColor = textColor,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-                )
-            } else {
-                Text(
-                    text = if (placeholder) "正在思考…" else message.content,
-                    color = textColor,
-                    // 等宽字体：极客风的关键
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-                )
+        // ★ 再套一层 Box：Popup 的 alignment 是相对「直接父布局」算的。
+        //   不套这一层，菜单会贴着整行（= 屏幕边缘）出现，而不是贴着气泡。
+        Box {
+            // 内层 Surface 负责"长什么样"
+            Surface(
+                color = bubbleColor,
+                // 大圆角 24dp：胶囊感
+                shape = RoundedCornerShape(24.dp),
+                // 无阴影：阴影高度和色调高度都归零
+                shadowElevation = 0.dp,
+                tonalElevation = 0.dp,
+                // 两种气泡都加一条极微弱的半透明高光边框（毛玻璃质感）
+                border = BorderStroke(1.dp, glassEdge()),
+                modifier = Modifier
+                    .widthIn(max = 300.dp)
+                    .onGloballyPositioned { bubbleHeight = it.size.height }
+                    .combinedClickable(
+                        onClick = { /* 单击暂时不做任何事，留给以后编辑/重发 */ },
+                        onLongClick = {
+                            Log.d(
+                                TAG,
+                                "长按气泡: userId=${message.id}, 正文 ${message.content.length} 字, " +
+                                    "抽到代码块 ${codeBlocks.size} 段, 含围栏=${message.content.contains("```")}"
+                            )
+                            if (message.content.isNotBlank()) menuOpen = true
+                        }
+                    )
+            ) {
+                if (useMarkdown) {
+                    MarkdownText(
+                        content = message.content,
+                        textColor = textColor,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        onCodeLongPress = {
+                            Log.d(TAG, "长按代码块，抽到 ${codeBlocks.size} 段")
+                            menuOpen = true
+                        }
+                    )
+                } else {
+                    Text(
+                        text = if (placeholder) "正在思考…" else message.content,
+                        color = textColor,
+                        // 等宽字体：极客风的关键
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                    )
+                }
+            }
+
+            // ---------- 毛玻璃悬浮菜单 ----------
+            if (menuOpen) {
+                Popup(
+                    // 气泡在右边就从右侧展开，在左边就贴着左边
+                    alignment = if (isUser) Alignment.TopEnd else Alignment.TopStart,
+                    offset = IntOffset(0, bubbleHeight + 8),
+                    onDismissRequest = { menuOpen = false },
+                    properties = PopupProperties(focusable = true)
+                ) {
+                    CopyMenu(
+                        fullText = message.content,
+                        codeBlocks = codeBlocks,
+                        onCopy = { text ->
+                            copyToClipboard(context, text)
+                            menuOpen = false
+                        }
+                    )
+                }
             }
         }
     }
+}
+
+/** 匹配 ``` 围栏代码块；语言标记那一行可有可无 */
+private val CODE_FENCE_RE = Regex("```[^\\n]*\\n([\\s\\S]*?)```")
+
+/** 从 Markdown 正文里抽出所有代码块（不含围栏本身） */
+private fun extractCodeBlocks(text: String): List<String> {
+    if (!text.contains("```")) return emptyList()
+    return CODE_FENCE_RE.findAll(text)
+        .map { it.groupValues[1].trimEnd('\n', '\r') }
+        .filter { it.isNotBlank() }
+        .toList()
+}
+
+/**
+ * 写系统剪贴板。
+ *
+ * 用平台的 ClipboardManager 而不是 Compose 的 LocalClipboardManager ——
+ * 后者在 Compose 版本之间换过 API（ClipboardManager → Clipboard），
+ * 平台 API 反而更稳，而且 Android 13+ 复制后系统自己会弹「已复制」提示。
+ */
+private fun copyToClipboard(context: Context, text: String) {
+    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+    if (cm == null) {
+        Log.e(TAG, "取不到剪贴板服务，复制失败")
+        return
+    }
+    cm.setPrimaryClip(ClipData.newPlainText("CoolStream", text))
+    Log.d(TAG, "已复制 ${text.length} 字符到剪贴板")
+}
+
+/**
+ * 长按气泡后弹出的毛玻璃菜单。
+ *
+ * 只放「复制」这一类动作：复制不改变任何状态，做错了也没有代价，
+ * 所以不需要二次确认，弹出来点了就走。
+ */
+@Composable
+private fun CopyMenu(
+    fullText: String,
+    codeBlocks: List<String>,
+    onCopy: (String) -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = glassFill(),
+        border = BorderStroke(1.dp, glassEdge()),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp
+    ) {
+        Column(Modifier.padding(6.dp)) {
+            GlassMenuItem("复制全文") { onCopy(fullText) }
+
+            if (codeBlocks.isNotEmpty()) {
+                val label = if (codeBlocks.size > 1) {
+                    "复制代码（${codeBlocks.size} 段）"
+                } else {
+                    "复制代码"
+                }
+                GlassMenuItem(label) { onCopy(codeBlocks.joinToString("\n\n")) }
+            }
+        }
+    }
+}
+
+/** 菜单里的一行 */
+@Composable
+private fun GlassMenuItem(text: String, onClick: () -> Unit) {
+    Text(
+        text = text,
+        fontFamily = FontFamily.Monospace,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurface,
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 10.dp)
+    )
 }
 
 
@@ -4749,7 +4883,9 @@ private fun inlineFormat(text: String): AnnotatedString {
 private fun MarkdownText(
     content: String,
     textColor: Color,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    // 长按代码块时回调（气泡层用它弹菜单）
+    onCodeLongPress: (() -> Unit)? = null
 ) {
     val blocks = remember(content) { parseMarkdown(content) }
 
@@ -4776,7 +4912,7 @@ private fun MarkdownText(
                     style = MaterialTheme.typography.bodyMedium
                 )
 
-                is MdBlock.Code -> CodeBlock(block.code)
+                is MdBlock.Code -> CodeBlock(block.code, onLongPress = onCodeLongPress)
             }
         }
     }
@@ -4789,7 +4925,8 @@ private fun MarkdownText(
  * 亮色主题下是"白气泡里的一块黑"，暗色主题下靠 #30363D 描边区分。
  */
 @Composable
-private fun CodeBlock(code: String) {
+@OptIn(ExperimentalFoundationApi::class)
+private fun CodeBlock(code: String, onLongPress: (() -> Unit)? = null) {
     Surface(
         color = CodeBlockBackground,
         shape = RoundedCornerShape(6.dp),
@@ -4807,6 +4944,13 @@ private fun CodeBlock(code: String) {
             modifier = Modifier
                 .padding(10.dp)
                 .horizontalScroll(rememberScrollState())
+                // ★ combinedClickable 必须放在 horizontalScroll **之后**（也就是内层）。
+                //   放外层的话手势会先被滚动容器吃掉 —— 这就是「长按代码块没反应」的原因：
+                //   气泡自己那层 combinedClickable 根本收不到事件。
+                .combinedClickable(
+                    onClick = { /* 单击不做事 */ },
+                    onLongClick = { onLongPress?.invoke() }
+                )
         )
     }
 }
