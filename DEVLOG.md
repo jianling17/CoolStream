@@ -499,9 +499,39 @@ Not under "App permissions". It is at:
 The most reliable way to reach it is the intent:
 `Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`
 
+### ⚠️ `git push` blocked: proxy returns 502 for `github.com` only
+
+Symptom:
+
+```
+fatal: unable to access 'https://github.com/...': CONNECT tunnel failed, response 502
+```
+
+This is **not** a git problem, and **not** the credential-manager hang that `GIT_TERMINAL_PROMPT=0` fixes — those are two entirely different failures that happen to break the same command.
+
+Diagnosis:
+
+```
+env  http_proxy / https_proxy = http://127.0.0.1:1713   (injected by the host tool)
+
+proxy   → https://github.com      → 502  (CONNECT tunnel failed)
+proxy   → https://api.github.com  → 200  ← the proxy itself is alive
+direct  → github.com:443          → timeout
+```
+
+The proxy is up, but its upstream for **one specific host** (`github.com`) is broken. `api.github.com` still works — which is why API-based tooling keeps functioning while `git push` does not.
+
+**What does not help:** retrying (3 attempts, all 502), `GIT_TERMINAL_PROMPT=0`, restarting the adb or git credential helper.
+
+**What would help (untested here):** switching to a working proxy node, or SSH over `ssh.github.com:443` if the proxy allows that host.
+
+**Mitigation:** commit locally anyway. `git log` keeps the work, `git status -sb` shows `ahead N`, and the push is retried when the network recovers. **Never leave work uncommitted just because push is broken.**
+
 ---
 
 ## 5. Current Status
+
+### Day 1 — core engine
 
 - [x] Environment setup + on-device run
 - [x] Minimal chat UI
@@ -516,6 +546,21 @@ The most reliable way to reach it is the intent:
 - [x] Tools: `list_dir` / `search_files` / `read_file`
 - [x] Shizuku escalation + `run_shell` (AIDL + UserService)
 - [x] Shell command blacklist
+
+### Day 2 — versioning, settings, workspace
+
+- [x] Automatic timestamp versioning (`0.yyMMddHHmm`) injected into `BuildConfig.BUILD_VERSION_NAME`
+- [x] Full-screen Settings page replacing the old `AlertDialog` (运行 / 工作区 / 权限 / 关于)
+- [x] Inline code rendering — backticks no longer shown literally
+- [x] Workspace: system folder picker (`OpenDocumentTree`), tree Uri → absolute path, SharedPreferences persistence
+- [x] Workspace enforcement inside `read_file` / `list_dir` / `search_files`, plus a workspace clause injected into the system prompt
+- [x] Verified end-to-end on an Android 17 emulator (Pixel 9 Pro): picker works, path survives a restart, out-of-workspace reads are blocked
+
+### Summary
+
+Two days turned "my phone gets hot" into a native Compose client that can call tools, escalate to a shell, and stay inside a folder you chose.
+
+The point is not the feature count. It is that **every claim in this repository has a log line behind it** — the redraw count, the tool-call round, the blocked path. Where the evidence was missing (a real temperature delta), the claim is simply not made, and that decision is written down too.
 
 **All core functionality is in place. Moving into day-to-day polish.**
 
@@ -1049,9 +1094,40 @@ adb shell dumpsys package com.example.mychat | grep lastUpdateTime
 
 最稳的到达方式是代码直跳 `Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION`。
 
+### ⚠️ `git push` 被代理挡住：只对 `github.com` 返回 502
+
+症状：
+
+```
+fatal: unable to access 'https://github.com/...': CONNECT tunnel failed, response 502
+```
+
+这**不是 git 的问题**，也**不是** `GIT_TERMINAL_PROMPT=0` 能解决的那个「凭据管理器静默等待」——**两个完全不同的故障，只是都会让同一条命令挂掉**。
+
+诊断：
+
+```
+环境变量 http_proxy / https_proxy = http://127.0.0.1:1713   （宿主工具注入）
+
+代理   → https://github.com      → 502（CONNECT 隧道失败）
+代理   → https://api.github.com  → 200  ← 代理本身是活的
+直连   → github.com:443          → 超时
+```
+
+代理没死，是它到**某一个特定域名**（`github.com`）的上游坏了。`api.github.com` 还通——所以基于 API 的工具还能用，偏偏 `git push` 不行。
+
+**没用的办法**：重试（试了 3 次，全是 502）、`GIT_TERMINAL_PROMPT=0`、重启 adb / git 凭据助手。
+
+**可能有用的办法（本次未验证）**：换一个正常的代理节点；或者走 `ssh.github.com:443`（前提是代理放行这个域名）。
+
+**兜底策略**：**照常本地提交**。`git log` 留着工作，`git status -sb` 会显示 `ahead N`，等网络恢复再推。
+**绝不要因为推不上去就不提交**——代码留在暂存区/工作区，一次误操作就没了。
+
 ---
 
 ## 5. 当前进度
+
+### 第一天 —— 核心引擎
 
 - [x] 环境搭建与真机运行
 - [x] 最小聊天界面
@@ -1066,6 +1142,21 @@ adb shell dumpsys package com.example.mychat | grep lastUpdateTime
 - [x] 工具链：`list_dir` / `search_files` / `read_file`
 - [x] Shizuku 提权 + `run_shell`（AIDL + UserService）
 - [x] 命令黑名单安全防护
+
+### 第二天 —— 版本号、设置页、工作区
+
+- [x] 自动时间戳版本号（`0.yyMMddHHmm`），注入 `BuildConfig.BUILD_VERSION_NAME`
+- [x] 全屏设置页，替换原来的 `AlertDialog`（运行 / 工作区 / 权限 / 关于）
+- [x] 行内代码渲染——反引号不再原样裸露
+- [x] 工作区：系统目录选择器（`OpenDocumentTree`）、tree Uri → 绝对路径、SharedPreferences 持久化
+- [x] `read_file` / `list_dir` / `search_files` 三层越界拦截，外加注入系统提示词的工作区约束
+- [x] 在 Android 17 模拟器（Pixel 9 Pro）上全链路验证：选择器可用、路径重启不丢、越界读取被拦
+
+### 总结
+
+两天时间，把「我手机发烫」这句话，做成了一能调用工具、能提权到 shell、还被圈在你指定目录里的原生 Compose 客户端。
+
+重点不是功能数量。**而是这个仓库里的每一条结论背后都有一行日志**——重绘次数、工具调用轮次、被拦下的路径。拿不出证据的地方（比如真实的温差），干脆不下结论，而且这个「不下结论」的决定本身也写进了文档。
 
 **已实现全部核心功能，进入日常体验打磨阶段。**
 
