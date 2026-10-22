@@ -208,6 +208,7 @@ val SYSTEM_PROMPT = """
 - search_files(keyword, path)：在某个目录下递归搜索文件名包含 keyword 的文件，返回绝对路径（最多 20 条）。
 - read_file(path)：读取文本文件的纯文本内容。
 - write_file(path, content)：把文本内容写入文件（不存在就新建，已存在就整份覆盖）。父目录会自动创建。
+- replace_in_file(path, search, replace)：把文件里的 search 这段原文换成 replace，其余内容不动。改代码用这个。
 - run_shell(command)：通过 Shizuku 以 shell 权限执行命令，返回输出。需要用户先在 App 里授权 Shizuku。
 
 严格遵守以下规则：
@@ -233,12 +234,21 @@ val SYSTEM_PROMPT = """
    改系统设置等会被直接拦截。一旦收到「安全拦截」，不要换一种写法重试，
    直接告诉用户这个操作被系统禁止了。
 10. write_file 会把 content 原样写入（UTF-8），已存在的文件会被整份覆盖，不是追加：
-   - 用户说「新建 / 写一份 / 生成 / 保存成文件 / 改一下」时才用；
+   - 用户说「新建 / 写一份 / 生成 / 保存成文件」时才用；
    - 覆盖一个已存在的文件之前，先用 read_file 看清原内容，避免把用户的东西冲掉；
      如果原文件很重要而你不确定，就先问用户一句再写；
    - 只能写纯文本。生成 pptx / docx / xlsx / 图片 / 压缩包等二进制文件不是它能做的事，
      遇到这种要求要如实说明，不要假装写成功了；
    - 写完把最终路径和字节数如实报告，不要说"应该已经写好了"这种含糊话。
+11. 改已有文件里的某一段，优先用 replace_in_file，不要用 write_file 整篇重写
+   —— 整篇重写会把用户其它没提到的内容一起覆盖掉，是事故高发区：
+   - search 必须从 read_file 的结果里【逐字复制】，包括缩进、换行、括号、全角半角标点。
+     你凭印象手打的 search 基本一定匹配不上；
+   - search 前后各带一两行上下文，让它在文件里唯一。只写 "return" 这种太短的一定会撞；
+   - 工具回「找不到这段原文」时，不要猜着改，重新 read_file 看一眼再试；
+   - 工具回「出现了 N 次」时，把 search 加长到能区分这几处，不要图省事开 replace_all
+     一次改一片 —— 除非用户明确说"全部替换"；
+   - 改完可以再 read_file 看一眼确认结果，然后把改了哪几行如实告诉用户。
 """.trim()
 
 /**
@@ -250,11 +260,11 @@ val SYSTEM_PROMPT = """
 private fun systemPromptWithWorkspace(): String {
     val ws = currentWorkspace
     return if (ws.isBlank()) {
-        SYSTEM_PROMPT + "\n\n11. 用户还没有设置工作区，暂时不限制路径范围。"
+        SYSTEM_PROMPT + "\n\n12. 用户还没有设置工作区，暂时不限制路径范围。"
     } else {
         SYSTEM_PROMPT +
-            "\n\n11. 你的工作区是：$ws" +
-            "\n    所有工具操作（读文件、写文件、列目录、搜索、shell）都必须严格限制在这个目录下，严禁越界。" +
+            "\n\n12. 你的工作区是：$ws" +
+            "\n    所有工具操作（读文件、写文件、改文件、列目录、搜索、shell）都必须严格限制在这个目录下，严禁越界。" +
             "\n    越界的操作会被代码层直接拦截并返回「工作区越界」，不要换路径反复重试。"
     }
 }
@@ -1000,6 +1010,35 @@ private val TOOL_DEFINITIONS = """
   {
     "type": "function",
     "function": {
+      "name": "replace_in_file",
+      "description": "在文件里做局部替换：把 search 这段原文换成 replace，文件其余部分原样保留。改代码、改配置用这个，不要用 write_file 整篇覆盖。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "要修改的文件绝对路径，例如 /sdcard/Documents/notes.md"
+          },
+          "search": {
+            "type": "string",
+            "description": "要被替换掉的原文，必须和文件里的内容一字不差（包括缩进、换行、标点）。建议前后各带一两行上下文，保证这段文本在文件里是唯一的。"
+          },
+          "replace": {
+            "type": "string",
+            "description": "替换成的新文本。如果只是想删掉 search 这段，传空字符串即可。"
+          },
+          "replace_all": {
+            "type": "boolean",
+            "description": "search 在文件里出现多次时：true = 全部替换；false 或不传 = 出现多次就报错、不做任何修改。默认为 false。"
+          }
+        },
+        "required": ["path", "search", "replace"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "run_shell",
       "description": "通过 Shizuku 以 shell 权限执行一条命令，返回标准输出和错误输出。权限很高，只在用户明确要求执行命令时使用。",
       "parameters": {
@@ -1017,15 +1056,27 @@ private val TOOL_DEFINITIONS = """
 ]
 """
 
-/** 一次工具执行的结果 */
-private data class ToolExecResult(val ok: Boolean, val output: String)
+/**
+ * 一次工具执行的结果。
+ *
+ * 用 internal 而不是 private：单元测试（app/src/test）要断言它。
+ * Kotlin 的 private 是「文件内可见」，测试类在别的文件里，够不着。
+ */
+internal data class ToolExecResult(val ok: Boolean, val output: String)
 
 /**
  * 最多几轮工具调用（防止模型无限调用把自己转晕）。
  *
- * 「搜索 → 读取 → 回答」至少就要 3 轮，所以上限抬到 5，给更长的链路留余量。
+ * ★ 这个数字是「请求次数」不是「工具次数」：
+ *   每一轮 = 带着全部上下文发一次请求。模型在某轮里发起工具调用，我们执行完、
+ *   把结果回填，然后再发下一轮。
+ *
+ *   典型链路要烧掉几次：
+ *     search_files → read_file → replace_in_file → 最终回答  = 4 轮
+ *   如果模型还要 read_file 复查一遍结果，就是 5 轮 —— 正好顶到原来的上限，
+ *   一点余量都没有，稍微多一步就被掐断。所以抬到 8。
  */
-private const val MAX_TOOL_ROUNDS = 5
+private const val MAX_TOOL_ROUNDS = 8
 
 /**
  * 单个文件最大读取字节数：5 MB。
@@ -1093,6 +1144,21 @@ private fun argOf(argsJson: String, key: String): String {
 }
 
 /**
+ * 从参数 JSON 里安全取一个布尔值。
+ *
+ * 模型有时会把 true 写成字符串 "true"，这里只认真正的 Boolean，
+ * 其余一律当 false —— 对 replace_all 这种"放权"型参数，宁可保守。
+ */
+private fun argBoolOf(argsJson: String, key: String): Boolean {
+    return try {
+        (JSONObject(argsJson).opt(key) as? Boolean) ?: false
+    } catch (e: Exception) {
+        Log.e(TOOL_LOG_TAG, "参数解析失败（key=$key）: ${e.message}", e)
+        false
+    }
+}
+
+/**
  * 把模型给的路径清洗干净。
  *
  * 实测：用户输入里常带中文双引号 “ ”，模型会把它一起塞进 path。
@@ -1120,7 +1186,7 @@ private const val KEY_WORKSPACE = "workspace_path"
 
 /** 当前工作区绝对路径。空串 = 未设置，不做限制。 */
 @Volatile
-private var currentWorkspace: String = ""
+internal var currentWorkspace: String = ""
 
 private fun loadWorkspace(context: Context): String {
     return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1171,7 +1237,7 @@ private fun treeUriToPath(uri: Uri): String? {
  *
  * canonicalPath 会真正解析掉 ".." 和符号链接 —— 这是判断"是否在工作区内"的前提。
  */
-private fun safeCanonicalPath(file: File): String {
+internal fun safeCanonicalPath(file: File): String {
     return try {
         file.canonicalPath
     } catch (e: Exception) {
@@ -1184,7 +1250,7 @@ private fun safeCanonicalPath(file: File): String {
  * 检查某个路径是否在工作区内。
  * @return null = 放行；非 null = 越界说明（直接作为工具结果回传给模型）
  */
-private fun workspaceViolation(path: String): String? {
+internal fun workspaceViolation(path: String): String? {
     val ws = currentWorkspace
     if (ws.isBlank()) return null          // 没设工作区 → 不限制
 
@@ -1196,12 +1262,19 @@ private fun workspaceViolation(path: String): String? {
     //      （write_file 上线后这条从"理论风险"变成了"能删掉系统文件"，
     //        所以必须用 canonical 而不是 absolute。）
     val target = safeCanonicalPath(File(path))
-    val root = safeCanonicalPath(File(ws)).trimEnd('/')
+    val root = safeCanonicalPath(File(ws)).trimEnd('/', '\\')
 
     // ⚠️ 也不能直接写 target.startsWith(root)：
     //    "/storage/emulated/0/DocumentsX" 也以 "/storage/emulated/0/Documents" 开头，
     //    这是路径前缀判断的经典误判。必须比「root + 分隔符」。
-    val inside = target == root || target.startsWith("$root/")
+    //
+    // ⚠️⚠️ 分隔符还必须跟平台走，不能写死 "/"。
+    //    Android 上 canonicalPath 用 '/'，没问题；但同一份代码在电脑 JVM 上跑单元测试时，
+    //    Windows 的 canonicalPath 返回 "C:\...\ws\a.txt"，拼上 "/" 变成 "C:\...\ws/"，
+    //    startsWith 永远不成立 —— 工作区内的文件会被整片误判成越界。
+    //    这个坑就是单元测试抓出来的，别改回写死的 "/"。
+    val sep = File.separatorChar
+    val inside = target == root || target.startsWith("$root$sep")
 
     return if (inside) {
         null
@@ -1294,7 +1367,7 @@ private fun readTextFile(path: String): ToolExecResult {
  *   模型拿到"执行失败"这四个字只会重复调用，拿到"父目录不存在且创建失败"
  *   才知道该换路径。错误信息就是 Agent 的观测值，写得越具体，它越不容易钻牛角尖。
  */
-private fun writeTextFile(path: String, content: String): ToolExecResult {
+internal fun writeTextFile(path: String, content: String): ToolExecResult {
     // ① 工作区越界检查（必须在碰任何文件之前）
     workspaceViolation(path)?.let { return ToolExecResult(false, it) }
 
@@ -1355,18 +1428,7 @@ private fun writeTextFile(path: String, content: String): ToolExecResult {
     // ⑥ 覆盖前备份：只在原文件不太大时做，避免磁盘占用翻倍
     val existedBefore = file.exists() && file.isFile
     val oldSize = if (existedBefore) file.length() else 0L
-    var backupNote = ""
-    if (existedBefore && oldSize in 1..MAX_BACKUP_BYTES && !path.endsWith(".bak")) {
-        try {
-            val bak = File("$path.bak")
-            file.copyTo(bak, overwrite = true)
-            backupNote = "，原文件已备份到 ${bak.name}"
-        } catch (e: Exception) {
-            // 备份失败不阻断写入，但要让模型和用户都知道这次没有后悔药
-            Log.e(TOOL_LOG_TAG, "备份失败（继续写入）: ${e.message}", e)
-            backupNote = "，原文件备份失败（${e.javaClass.simpleName}）"
-        }
-    }
+    val backupNote = if (existedBefore) backupBeforeOverwrite(file) else ""
 
     // ⑦ 真正写入
     return try {
@@ -1400,14 +1462,241 @@ private fun writeTextFile(path: String, content: String): ToolExecResult {
         )
     } catch (e: IOException) {
         // 把内核 errno 翻译成人话，否则模型只会看到一串 "EACCES (Permission denied)"
-        val raw = (e.message ?: "").lowercase()
-        val friendly = when {
-            "enospc" in raw || "no space" in raw -> "存储空间不足，写入失败"
-            "eacces" in raw || "permission denied" in raw ->
-                "没有写入权限（这个目录可能属于其它应用）"
-            "erofs" in raw -> "目标位置是只读的，无法写入"
-            else -> "写入失败"
+        val friendly = friendlyIoReason(e)
+        Log.e(TOOL_LOG_TAG, "$friendly: $path（${e.message}）", e)
+        ToolExecResult(false, "$friendly：$path（${e.javaClass.simpleName}: ${e.message}）")
+    }
+}
+
+// ============================================================
+// 3.26 文件改写：备份、定位、局部替换
+// ============================================================
+
+/** 判断"空白差异"用的正则（缩进、空格、CRLF 全归一到单个空格） */
+private val WHITESPACE_RE = Regex("\\s+")
+
+/** 把 IOException 翻译成人话前缀。write_file 和 replace_in_file 共用 */
+private fun friendlyIoReason(e: IOException): String {
+    val raw = (e.message ?: "").lowercase()
+    return when {
+        "enospc" in raw || "no space" in raw -> "存储空间不足，写入失败"
+        "eacces" in raw || "permission denied" in raw -> "没有写入权限（这个目录可能属于其它应用）"
+        "erofs" in raw -> "目标位置是只读的，无法写入"
+        else -> "写入失败"
+    }
+}
+
+/**
+ * 覆盖已有文件前留一份 .bak。
+ *
+ * 只备份 1MB 以内的文件：大文件再复制一份会让磁盘占用翻倍，
+ * 而对"改代码"这个场景来说，需要留后路的基本都是小文件。
+ *
+ * @return 拼在成功消息后面的说明；没备份就是空串
+ */
+internal fun backupBeforeOverwrite(file: File): String {
+    val size = file.length()
+    // 空文件不用备份；太大不备份；本身是 .bak 也不再套娃
+    if (size <= 0L || size > MAX_BACKUP_BYTES || file.path.endsWith(".bak")) return ""
+    return try {
+        val bak = File("${file.path}.bak")
+        file.copyTo(bak, overwrite = true)
+        "，原文件已备份到 ${bak.name}"
+    } catch (e: Exception) {
+        // 备份失败不阻断写入，但要让模型和用户都知道这次没有后悔药
+        Log.e(TOOL_LOG_TAG, "备份失败（继续写入）: ${e.message}", e)
+        "，原文件备份失败（${e.javaClass.simpleName}）"
+    }
+}
+
+/** 统计 needle 在 haystack 里出现几次（不重叠） */
+internal fun countOccurrences(haystack: String, needle: String): Int {
+    if (needle.isEmpty()) return 0
+    var count = 0
+    var i = haystack.indexOf(needle)
+    while (i >= 0) {
+        count++
+        i = haystack.indexOf(needle, i + needle.length)
+    }
+    return count
+}
+
+/** 列出 needle 的所有起点，最多 limit 个（限制数量是为了避免病态输入吃内存） */
+internal fun findAllOccurrences(haystack: String, needle: String, limit: Int): List<Int> {
+    if (needle.isEmpty()) return emptyList()
+    val out = ArrayList<Int>()
+    var i = haystack.indexOf(needle)
+    while (i >= 0 && out.size < limit) {
+        out.add(i)
+        i = haystack.indexOf(needle, i + needle.length)
+    }
+    return out
+}
+
+/** 某个字符下标在第几行（从 1 开始） */
+internal fun lineNumberAt(text: String, index: Int): Int {
+    var line = 1
+    val end = minOf(index, text.length)
+    for (k in 0 until end) if (text[k] == '\n') line++
+    return line
+}
+
+/** 取包含该下标的整行内容，让模型看到"改成了什么" */
+internal fun lineTextAt(text: String, index: Int, maxLen: Int = 140): String {
+    if (text.isEmpty()) return ""
+    val safeIndex = index.coerceIn(0, text.length - 1)
+    val nl = text.lastIndexOf('\n', (safeIndex - 1).coerceAtLeast(0))
+    val start = if (nl < 0) 0 else nl + 1
+    val end = text.indexOf('\n', safeIndex).let { if (it < 0) text.length else it }
+    val line = text.substring(start.coerceAtMost(end), end).trim()
+    return if (line.length > maxLen) line.take(maxLen) + "…" else line
+}
+
+/**
+ * replace_in_file：把文件里的 search 换成 replace，其余内容原样保留。
+ *
+ * 这是"能改代码"和"只能整篇覆盖"的分界线。
+ * 整篇覆盖（write_file）的风险是：模型只记得住文件的一部分，
+ * 重写时会把没提到的内容一起冲掉。局部替换天然规避这个问题。
+ *
+ * 三条硬规则：
+ *   ① search 必须逐字匹配（空白也算），不做模糊匹配 —— 模糊匹配在代码里会改错地方
+ *   ② 匹配到多处时默认拒绝，不猜"大概是想改第一处"
+ *   ③ 改之前先备份
+ */
+internal fun replaceInFile(
+    path: String,
+    search: String,
+    replace: String,
+    replaceAll: Boolean
+): ToolExecResult {
+    // ① 工作区越界检查（在碰文件之前）
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+
+    if (search.isEmpty()) {
+        return ToolExecResult(false, "参数错误：search 是空的。要把哪段原文换掉，就把它原样填进来。")
+    }
+    if (search == replace) {
+        return ToolExecResult(false, "search 和 replace 一模一样，改了等于没改，本次未做任何修改。")
+    }
+
+    val file = File(path)
+    Log.d(
+        TOOL_LOG_TAG,
+        "replace_in_file path=$path, searchLen=${search.length}, replaceLen=${replace.length}, " +
+            "replaceAll=$replaceAll, exists=${file.exists()}, canWrite=${file.canWrite()}"
+    )
+
+    // ② 文件本身的状态
+    when {
+        !file.exists() ->
+            return ToolExecResult(false, "文件不存在：$path。可以先用 search_files 按文件名找一下。")
+
+        !file.isFile ->
+            return ToolExecResult(false, "这不是一个文件：$path。想列目录请用 list_dir。")
+
+        !file.canRead() ->
+            return ToolExecResult(false, "没有读取权限：$path。请确认已开启「所有文件访问权限」。")
+
+        !file.canWrite() ->
+            return ToolExecResult(false, "没有写入权限：$path。这个文件可能是只读的，或者所在目录不允许写入。")
+
+        file.length() > MAX_FILE_BYTES ->
+            return ToolExecResult(
+                false,
+                "文件太大（${file.length()} 字节），超过 ${MAX_FILE_BYTES / 1024 / 1024}MB 上限，" +
+                    "没法一次性读进来改写。"
+            )
+    }
+
+    // ③ 读 + 二进制探测（二进制文件做字符串替换只会把它改坏）
+    val bytes = try {
+        file.readBytes()
+    } catch (e: Exception) {
+        Log.e(TOOL_LOG_TAG, "读取失败: ${e.message}", e)
+        return ToolExecResult(false, "读取失败：$path（${e.javaClass.simpleName}: ${e.message}）")
+    }
+
+    val probe = minOf(bytes.size, 8192)
+    for (i in 0 until probe) {
+        if (bytes[i] == 0.toByte()) {
+            return ToolExecResult(
+                false,
+                "这是二进制文件（pptx / docx / zip / 图片等），不能用文本替换的方式修改。" +
+                    "请如实告诉用户改不了，不要假装改成功了。"
+            )
         }
+    }
+
+    val text = String(bytes, Charsets.UTF_8)
+
+    // ④ 定位
+    val total = countOccurrences(text, search)
+    Log.d(TOOL_LOG_TAG, "replace_in_file 匹配到 $total 处")
+
+    if (total == 0) {
+        // 诊断一下：如果忽略空白差异能匹配上，说明模型是"手打"的 search，缩进/换行不对
+        val normalizedHit = text.replace(WHITESPACE_RE, " ").contains(
+            search.replace(WHITESPACE_RE, " ")
+        )
+        val hint = if (normalizedHit) {
+            "\n提示：忽略空白差异后其实能匹配到 —— 说明你给的 search 里，缩进或换行符" +
+                "（CRLF/LF）和文件里的不一致。请直接从 read_file 的输出里整段复制，不要手打。"
+        } else {
+            "\n请先 read_file 看一下这个文件，确认原文长什么样，再逐字复制要改的那段。"
+        }
+        return ToolExecResult(false, "在 $path 里找不到这段原文，本次未做任何修改。$hint")
+    }
+
+    if (total > 1 && !replaceAll) {
+        val lines = findAllOccurrences(text, search, 10).map { lineNumberAt(text, it) }
+        return ToolExecResult(
+            false,
+            "search 在 $path 里出现了 $total 次（第 ${lines.joinToString("、")} 行附近），" +
+                "无法确定你想改哪一处，本次未做任何修改。\n" +
+                "两个办法：① 把 search 前后各带一两行上下文，让它只匹配一处；" +
+                "② 如果确实要全部替换，把 replace_all 传 true。"
+        )
+    }
+
+    // ⑤ 组装新内容
+    val firstHit = text.indexOf(search)
+    val newText = if (replaceAll) {
+        text.replace(search, replace)
+    } else {
+        text.replaceRange(firstHit, firstHit + search.length, replace)
+    }
+    if (newText == text) {
+        return ToolExecResult(false, "替换前后内容完全一样，本次未做任何修改。")
+    }
+
+    // ⑥ 备份 + 写入
+    val oldSize = file.length()
+    val backupNote = backupBeforeOverwrite(file)
+
+    return try {
+        file.writeBytes(newText.toByteArray(Charsets.UTF_8))
+        val newSize = file.length()
+
+        val line = lineNumberAt(text, firstHit)
+        val scope = if (replaceAll) "共替换 $total 处" else "替换 1 处"
+        val preview = lineTextAt(newText, firstHit)
+        val msg = buildString {
+            append("已修改：").append(path)
+            append("（第 ").append(line).append(" 行，").append(scope).append("）")
+            append("，原 ").append(oldSize).append(" 字节 → 现 ").append(newSize).append(" 字节")
+            append(backupNote)
+            if (preview.isNotEmpty()) {
+                append("\n改后该处所在行：").append(preview)
+            }
+        }
+        Log.d(TOOL_LOG_TAG, "替换成功: $path，$scope，$newSize 字节")
+        ToolExecResult(true, msg)
+    } catch (e: SecurityException) {
+        Log.e(TOOL_LOG_TAG, "没有写入权限: $path", e)
+        ToolExecResult(false, "没有写入权限：$path。请到系统设置里确认本应用已获得「所有文件访问权限」。")
+    } catch (e: IOException) {
+        val friendly = friendlyIoReason(e)
         Log.e(TOOL_LOG_TAG, "$friendly: $path（${e.message}）", e)
         ToolExecResult(false, "$friendly：$path（${e.javaClass.simpleName}: ${e.message}）")
     }
@@ -1771,6 +2060,31 @@ private fun executeTool(name: String, argsJson: String): ToolExecResult {
                     )
 
                     else -> writeTextFile(path, content)
+                }
+            }
+
+            "replace_in_file" -> {
+                val path = cleanPath(argOf(argsJson, "path"))
+
+                // ★ search / replace 同样不能过 cleanPath：
+                //   cleanPath 会削掉首尾引号和标点，一段以 " 或 } 结尾的代码会被削坏，
+                //   削过的 search 永远匹配不上原文。
+                val search = argOf(argsJson, "search")
+                val replace = argOf(argsJson, "replace")
+                val replaceAll = argBoolOf(argsJson, "replace_all")
+
+                when {
+                    path.isBlank() -> ToolExecResult(
+                        false,
+                        "参数错误：缺少 path。请给出要修改的文件绝对路径，例如 /sdcard/Documents/a.kt"
+                    )
+
+                    search.isEmpty() -> ToolExecResult(
+                        false,
+                        "参数错误：缺少 search。请把要被替换掉的那段原文原样填进来。"
+                    )
+
+                    else -> replaceInFile(path, search, replace, replaceAll)
                 }
             }
 

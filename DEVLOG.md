@@ -639,6 +639,50 @@ The last row matters: a `..` that lands **back inside** the workspace is still a
 
 ---
 
+### 3.12 `replace_in_file` — surgical edits, and the test that caught a separator bug
+
+`write_file` alone is not enough to *modify* code. A model only ever holds part of a file in its attention window; asking it to "rewrite the file with this one line changed" means it reconstructs the rest from memory — and quietly drops whatever it didn't remember. `replace_in_file(path, search, replace)` removes that failure mode: only the matched span changes, everything else is byte-identical.
+
+**Three rules, none negotiable:**
+
+1. **Exact match only.** No fuzzy, no case-insensitive, no regex. A fuzzy matcher in source code edits the wrong place and reports success.
+2. **Ambiguity is refused, not guessed.** If `search` occurs N>1 times, nothing is written. The reply lists the line numbers and offers two concrete ways forward (add context, or pass `replace_all`).
+3. **Back up before writing.** Same `.bak` policy as `write_file` (≤ 1 MB originals).
+
+**The error message is part of the interface.** A model that gets "failed" retries the same call. A model that gets *why* it failed changes tactics:
+
+| Situation | What it's told |
+|---|---|
+| 0 matches | "找不到这段原文" + if whitespace-normalised text *does* match: "忽略空白差异后其实能匹配到 —— 缩进或换行符不一致，请从 read_file 的输出里整段复制" |
+| N > 1 matches | "出现了 N 次（第 5、12 行附近）" + two options |
+| Target is binary | "二进制文件，不能用文本替换的方式修改" |
+
+**What the unit tests found.** `app/src/test/java/.../FileToolsTest.kt`, 16 cases, `./gradlew testDebugUnitTest`, 0.57 s, no device needed. First run: 10 failures. Not in the new code — in the workspace check that had shipped two commits earlier:
+
+```kotlin
+val inside = target == root || target.startsWith("$root/")   // ← hardcoded "/"
+```
+
+On Android `canonicalPath` always returns `/`, so production was fine. On the Windows JVM it returns `C:\...\ws\a.txt`, and `startsWith("C:\...\ws/")` is never true — **every file inside the workspace was judged out of workspace**. Fixed with `File.separatorChar`. The bug never affected the phone, but the test made an implicit assumption explicit, which is the point of having it.
+
+Two more cases are now locked in as regressions: `dot_dot_traversal_is_blocked` (the `canonicalPath` fix from 3.11) and `overwriting_leaves_a_bak_copy_of_the_original`.
+
+**Round budget: 5 → 8.** `MAX_TOOL_ROUNDS` counts **requests**, not tool calls. One chain —
+`search_files` → `read_file` → `replace_in_file` → `read_file` (verify) → answer — is 5 requests, which landed exactly on the old ceiling with no margin. Raised to 8.
+
+**End-to-end proof on the emulator.** One instruction, no follow-ups:
+
+```
+search_files(keyword="greet.kt")
+read_file(greet.kt)
+replace_in_file(greet.kt, search="fun greet(name: String) {\n    println(\"Hello, $name\")\n}", replace="...Hi...")
+read_file(greet.kt)          ← verifying its own edit
+```
+
+Result: `greet` → `Hi`, `greetAgain` untouched, `greet.kt.bak` holding the original. The model included the whole function signature as context on its own — the prompt rule "search 前后各带一两行上下文" did its job.
+
+---
+
 ## 4. Environment & Build (the most time-consuming section)
 
 ### ⚠️ Auto timestamp versioning: two traps
@@ -791,6 +835,9 @@ The proxy is up, but its upstream for **one specific host** (`github.com`) is br
 - [x] Sidebar long-press → rename / delete (cascade), with a safe fallback when the active session is deleted
 - [x] Tool calls persisted to Room with layered timestamps — cards re-render after a restart
 - [x] `write_file`: workspace-checked, auto-`mkdirs`, 2 MB cap, `.bak` before overwrite — plus the `absolutePath` → `canonicalPath` fix it exposed
+- [x] `replace_in_file`: exact-match surgical edits, ambiguity refused, `replace_all` opt-in
+- [x] First unit-test suite (16 JVM cases) — caught a hardcoded `/` in the workspace check
+- [x] `MAX_TOOL_ROUNDS` 5 → 8 so 4-step chains (search → read → edit → verify) fit with margin
 - [x] Per-tool icons on the tool card (wrench / green pencil / list / magnifier / play)
 
 ### Summary
@@ -1503,6 +1550,68 @@ private fun safeCanonicalPath(file: File): String = try {
 
 ---
 
+### 3.12 `replace_in_file` —— 局部精准修改，以及被单元测试抓出来的分隔符 bug
+
+光有 `write_file` 还不足以「改代码」。模型对文件只有一部分在注意力里，
+让它「把这一行改掉、顺便把整个文件重写一遍」，它就得靠记忆补全其余部分 ——
+补不上的地方会被悄悄丢掉。`replace_in_file(path, search, replace)` 从根上避开这件事：
+只有被匹配到的那一段变，其余字节原样不动。
+
+**三条规矩，一条都不能松：**
+
+1. **只做逐字匹配。** 不模糊、不忽略大小写、不正则。
+   在源码上做模糊匹配，改错地方还报成功，是最坏的一种失败。
+2. **匹配到多处就拒绝，绝不猜。** `search` 出现 N>1 次时一个字节都不写。
+   回复里列出这几处的行号，并给两个具体出路（加长上下文 / 显式传 `replace_all`）。
+3. **写之前先备份。** 和 `write_file` 同一套 `.bak` 策略（原文件 ≤ 1MB 才备份）。
+
+**错误信息本身就是接口的一部分。** 模型看到「失败」只会原地重试；
+看到「为什么失败」才会换打法：
+
+| 情况 | 回给模型的话 |
+|---|---|
+| 0 处匹配 | 「找不到这段原文」；如果忽略空白后能匹配上，追加「缩进或换行符不一致，请从 read_file 的输出里整段复制」 |
+| N > 1 处 | 「出现了 N 次（第 5、12 行附近）」+ 两个出路 |
+| 目标是二进制 | 「二进制文件，不能用文本替换的方式修改」 |
+
+**单元测试抓到了什么。** `app/src/test/java/.../FileToolsTest.kt`，16 条用例，
+`./gradlew testDebugUnitTest` 跑 0.57 秒，不需要真机。第一次跑：**10 条失败**。
+失败的地方不是新写的代码，而是两个提交之前就已经上线的那个工作区判断：
+
+```kotlin
+val inside = target == root || target.startsWith("$root/")   // ← 分隔符写死了
+```
+
+Android 上 `canonicalPath` 永远返回 `/`，所以线上一直是对的。
+但同一份代码在电脑 JVM 上跑测试时，Windows 返回的是 `C:\...\ws\a.txt`，
+拼上 `/` 变成 `C:\...\ws/`，`startsWith` 永远不成立 ——
+**工作区里的文件被整片误判成「越界」**。改用 `File.separatorChar` 之后全过。
+
+这个 bug 从来没影响过手机，但测试把「这里假设了分隔符」这件事变成了显式约定 ——
+这就是写测试的意义。
+
+另外两条从此变成回归测试：`dot_dot_traversal_is_blocked`（3.11 那个 `canonicalPath` 修复）、
+`overwriting_leaves_a_bak_copy_of_the_original`。
+
+**轮次上限：5 → 8。** `MAX_TOOL_ROUNDS` 数的是**请求次数**，不是工具次数。
+一条链路 —— `search_files` → `read_file` → `replace_in_file` → `read_file`（复查）→ 回答 ——
+正好 5 次请求，一点余量都没有。抬到 8。
+
+**模拟器上的端到端证据。** 一条指令，没有任何追问：
+
+```
+search_files(keyword="greet.kt")
+read_file(greet.kt)
+replace_in_file(greet.kt, search="fun greet(name: String) {\n    println(\"Hello, $name\")\n}", replace="...Hi...")
+read_file(greet.kt)          ← 自己复查改完的结果
+```
+
+结果：`greet` 里的 Hello 变成 Hi，`greetAgain` 一个字没动，
+`greet.kt.bak` 留住了原文。而且模型是**自己**把整个函数签名带进 search 当上下文的 ——
+提示词里那条「search 前后各带一两行上下文」确实起作用了。
+
+---
+
 ## 4. 环境与构建（这一节的坑最耗时间）
 
 ### ⚠️ 模拟器 UI 自动化：键盘会把弹窗顶飞
@@ -1660,6 +1769,9 @@ fatal: unable to access 'https://github.com/...': CONNECT tunnel failed, respons
 - [x] 侧边栏长按 → 重命名 / 删除（级联），删掉当前会话时有安全兜底
 - [x] 工具调用落库 + 时间戳分层，重启后卡片仍渲染成卡片
 - [x] `write_file`：工作区校验 + 自动建父目录 + 2MB 上限 + 覆盖前留 `.bak`——以及它顺带挖出的 `absolutePath` → `canonicalPath` 修复
+- [x] `replace_in_file`：逐字匹配的局部修改，多处匹配直接拒绝，`replace_all` 需显式开启
+- [x] 第一套单元测试（16 条 JVM 用例）——抓出工作区判断里写死的 `/`
+- [x] `MAX_TOOL_ROUNDS` 5 → 8，让「搜索 → 读取 → 修改 → 复查」这类四步链有余量
 - [x] 工具卡片按工具类型换图标（扳手 / 绿色钢笔 / 列表 / 放大镜 / 播放键）
 
 ### 总结

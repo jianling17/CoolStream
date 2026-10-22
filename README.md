@@ -76,7 +76,7 @@ A single-activity, single-Kotlin-file app that now includes:
 - A pure-black, GitHub/Codex-inspired UI with glassmorphism (no `Modifier.blur()`)
 - Room persistence for sessions and messages
 - A zero-dependency Markdown renderer
-- A real tool-calling agent loop (`list_dir` / `search_files` / `read_file` / `write_file` / `run_shell`)
+- A real tool-calling agent loop (`list_dir` / `search_files` / `read_file` / `write_file` / `replace_in_file` / `run_shell`)
 - Shizuku escalation via AIDL `UserService`, with a regex command blacklist
 
 ---
@@ -147,7 +147,7 @@ The two runs produced **different reply lengths** (1034 vs 1458 chars), because 
 | **Rendering** | In-place replacement of the last bubble only; Markdown rendered **once**, after `onDone` |
 | **Persistence** | Room v3 — `sessions` + `messages` with `ON DELETE CASCADE`, enum `TypeConverter`, real `ALTER TABLE` migration |
 | **Agent** | `tools` schema → streamed `tool_calls` reassembly → local execution → `role:"tool"` feedback → second request |
-| **Tools** | `list_dir`, `search_files` (recursive, capped), `read_file` (5 MB cap + binary detection), `write_file` (2 MB cap, auto-`mkdirs`, `.bak` on overwrite), `run_shell` |
+| **Tools** | `list_dir`, `search_files` (recursive, capped), `read_file` (5 MB cap + binary detection), `write_file` (2 MB cap, auto-`mkdirs`, `.bak` on overwrite), `replace_in_file` (exact-match, refuses ambiguity), `run_shell` |
 | **Escalation** | Shizuku 13 via AIDL `UserService` (see below — `Shizuku.newProcess()` no longer exists) |
 | **Safety** | 16-rule regex command blacklist applied **before** execution; workspace checks use `canonicalPath`, not `absolutePath` |
 | **UI** | Pure black `#000000`, glassmorphism via translucent fills + 1 dp highlight strokes, monospace everywhere, 24 dp bubbles |
@@ -349,6 +349,7 @@ The author **cannot independently read or modify this codebase**. That has real 
 - [x] Tool calling agent loop
 - [x] Shizuku escalation + `run_shell` with blacklist
 - [x] `write_file` (workspace-checked, auto-`mkdirs`, `.bak` before overwrite)
+- [x] `replace_in_file` (surgical edits; refuses ambiguous matches; 16 JVM unit tests)
 - [ ] Long-press to delete a session
 - [ ] ViewModel (survive rotation)
 - [ ] Persist tool cards
@@ -432,7 +433,7 @@ WebView 本质上是一个完整的浏览器内核。为了渲染一个聊天界
 - 纯黑 + GitHub / Codex 风格的毛玻璃 UI（**不用 `Modifier.blur()`**）
 - Room 持久化（会话 + 消息）
 - 零依赖的 Markdown 渲染器
-- 真实的 Tool Calling 闭环（`list_dir` / `search_files` / `read_file` / `write_file` / `run_shell`）
+- 真实的 Tool Calling 闭环（`list_dir` / `search_files` / `read_file` / `write_file` / `replace_in_file` / `run_shell`）
 - Shizuku 提权（AIDL `UserService`）+ 正则命令黑名单
 
 ---
@@ -503,7 +504,7 @@ stream done: total=1458 chars (deltas=911, flushes=58, skipped=2)
 | **渲染** | 只原地替换最后一条气泡；Markdown **只在 `onDone` 之后渲染一次** |
 | **持久化** | Room v3——`sessions` + `messages`（`ON DELETE CASCADE`）、枚举 `TypeConverter`、正经 `ALTER TABLE` 迁移 |
 | **Agent** | `tools` 清单 → 流式 `tool_calls` 分片重组 → 本地执行 → `role:"tool"` 回填 → 二次请求 |
-| **工具** | `list_dir`、`search_files`（递归 + 三重上限）、`read_file`（5MB 上限 + 二进制探测）、`write_file`（2MB 上限、自动建父目录、覆盖前留 `.bak`）、`run_shell` |
+| **工具** | `list_dir`、`search_files`（递归 + 三重上限）、`read_file`（5MB 上限 + 二进制探测）、`write_file`（2MB 上限、自动建父目录、覆盖前留 `.bak`）、`replace_in_file`（逐字匹配、拒绝歧义）、`run_shell` |
 | **提权** | Shizuku 13，走 AIDL `UserService`（见下——`Shizuku.newProcess()` 已经不存在了） |
 | **安全** | 16 条正则黑名单，在**执行之前**拦截；工作区判断用 `canonicalPath` 而不是 `absolutePath` |
 | **UI** | 纯黑 `#000000`、半透明底 + 1dp 高光边框的毛玻璃、全篇等宽、24dp 气泡 |
@@ -706,6 +707,7 @@ export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 - [x] Tool Calling 闭环
 - [x] Shizuku 提权 + `run_shell`（含黑名单）
 - [x] `write_file`（工作区校验 + 自动建父目录 + 覆盖前留 `.bak`）
+- [x] `replace_in_file`（局部精准修改；匹配到多处直接拒绝；16 条 JVM 单元测试）
 - [ ] 会话长按删除
 - [ ] ViewModel（旋转不丢状态）
 - [ ] 工具卡片持久化

@@ -78,6 +78,14 @@ android {
             )
         }
     }
+
+    // 单元测试跑在电脑的 JVM 上，不碰真机。
+    // 我们的工具函数里有 Log.d / Environment.isExternalStorageManager() 这类
+    // Android 框架调用，JVM 上没有实现会直接抛 "not mocked"，
+    // 打开 returnDefaultValues 让它们返回 null / false 而不是崩掉。
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
