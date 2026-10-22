@@ -6,6 +6,7 @@ import android.content.ComponentName
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -91,11 +92,17 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import android.content.Context
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
@@ -180,6 +187,7 @@ import com.example.mychat.ui.theme.GlassTintLight
 // ---- 像素级 UI 重构新增的 import ----
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -189,6 +197,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -196,18 +205,17 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import java.util.Calendar
+import javax.net.ssl.SSLException
 import java.util.Locale
+import kotlinx.coroutines.delay
 
 
 // ============================================================
 // ★★★ 配置区 ★★★
 // ============================================================
 
-/** DeepSeek 接口地址。必须写全，包含 /chat/completions */
-private const val API_URL = "https://api.deepseek.com/chat/completions"
-
-/** 模型名。当前在售：deepseek-flash / deepseek-v4-pro */
-private const val MODEL_NAME = "deepseek-flash"
+// 接口地址和模型名不再是编译期常量 —— 用户在「设置 → 模型与 API」里填，
+// 存加密存储，见后面的 ApiConfig。这里只留一句提醒：改的是运行期值。
 
 /**
  * 系统提示词。
@@ -677,7 +685,7 @@ fun sendToDeepSeek(
 
             if (apiKey.isBlank()) {
                 withContext(Dispatchers.Main) {
-                    onError("API Key 是空的，请检查 local.properties 里的 DEEPSEEK_API_KEY")
+                    onError("还没有配置 API Key。\n请到「设置 → 模型与 API」里填入，或者点这里重新走一遍引导。")
                 }
                 return@launch
             }
@@ -717,7 +725,7 @@ fun sendToDeepSeek(
             Log.d(TAG, "history packed: ${messagesArray.length()} messages (skipped $skippedError error bubbles)")
 
             val bodyJson = JSONObject().apply {
-                put("model", MODEL_NAME)
+                put("model", ApiConfig.model)
                 put("stream", true)
                 put("messages", messagesArray)
 
@@ -731,7 +739,7 @@ fun sendToDeepSeek(
             }.toString()
 
             val request = Request.Builder()
-                .url(API_URL)
+                .url(chatCompletionsUrl())
                 .addHeader("Authorization", "Bearer $apiKey")
                 .addHeader("Content-Type", "application/json")
                 .addHeader("Accept", "text/event-stream")
@@ -745,7 +753,7 @@ fun sendToDeepSeek(
             if (!response.isSuccessful) {
                 val errBody = response.body?.string() ?: ""
                 Log.e(TAG, "HTTP error body: ${errBody.take(300)}")
-                withContext(Dispatchers.Main) { onError("HTTP ${response.code}") }
+                withContext(Dispatchers.Main) { onError(httpErrorMessage(response.code, errBody)) }
                 return@launch
             }
 
@@ -841,7 +849,7 @@ fun sendToDeepSeek(
 
         } catch (e: Exception) {
             Log.e(TAG, "stream exception: ${e.message}", e)
-            withContext(Dispatchers.Main) { onError(e.message ?: "unknown") }
+            withContext(Dispatchers.Main) { onError(networkErrorMessage(e)) }
         }
     }
 }
@@ -1095,6 +1103,49 @@ private val TOOL_DEFINITIONS = """
  * 用 internal 而不是 private：单元测试（app/src/test）要断言它。
  * Kotlin 的 private 是「文件内可见」，测试类在别的文件里，够不着。
  */
+/**
+ * 把 HTTP 状态码翻译成用户能照着做的话。
+ *
+ * ★ 为什么要单独做这件事：
+ *   原来界面上只显示「HTTP 401」，用户看到这四个字符完全不知道该干嘛。
+ *   401 和 429 是最常见的两种，必须给出下一步动作。
+ */
+private fun httpErrorMessage(code: Int, body: String): String {
+    return when (code) {
+        401 -> "API Key 无效或已欠费（401）。\n请到「设置 → 模型与 API」检查 Key 是否填错、账户是否还有余额。"
+        402 -> "账户余额不足（402）。\n请到 DeepSeek 开放平台充值后再试。"
+        403 -> "没有访问权限（403）。\n这个 Key 可能被限制访问该模型。"
+        404 -> "接口地址不对（404）。\n检查「设置 → 模型与 API」里的 API 地址。"
+        429 -> "请求太频繁，请休息一下（429）。\n等几十秒再发，或者换到低峰时段。"
+        in 500..599 -> "服务器出问题了（$code）。\n不是你的操作问题，过一会儿再试。"
+        else -> {
+            val hint = body.take(200).trim()
+            if (hint.isEmpty()) "HTTP $code" else "HTTP $code\n$hint"
+        }
+    }
+}
+
+/**
+ * 把网络异常翻译成人话。
+ *
+ * 这些异常用户一天能遇到好几次（地铁里、电梯里、切飞行模式），
+ * 每一种都要能自己判断「是我网不好，还是 App 挂了」。
+ */
+private fun networkErrorMessage(e: Throwable): String {
+    return when (e) {
+        is UnknownHostException ->
+            "连不上网络。\n检查 Wi-Fi 或移动数据是否正常；如果开了代理/VPN，先关掉再试。"
+        is SocketTimeoutException ->
+            "请求超时。\n网络太慢或服务器没响应，换个网络或稍后重试。"
+        is SSLException ->
+            "安全连接失败（SSL）。\n多半是代理或证书在中间拦截，关掉代理再试。"
+        is java.io.IOException ->
+            "网络异常：${e.message ?: e.javaClass.simpleName}"
+        else ->
+            "出错了：${e.javaClass.simpleName}: ${e.message ?: "未知原因"}"
+    }
+}
+
 internal data class ToolExecResult(val ok: Boolean, val output: String)
 
 /**
@@ -1358,6 +1409,181 @@ private fun buildToolsArray(): JSONArray {
         if (name.isNotEmpty() && name in enabled) out.put(item)
     }
     return out
+}
+
+// ============================================================
+// 3.24b API 配置 —— 加密存储
+//
+// 老做法是把 Key 写进 local.properties，编译期塞进 BuildConfig。
+// 那对开发者方便，但**分发出去的 APK 里就是明文**，反编译就能拿到。
+//
+// 现在改成：用户在设置页里填，存 EncryptedSharedPreferences。
+// 密钥材料放在 Android Keystore 里（不落盘、不能导出），
+// 就算把整个 SharedPreferences 文件拷走也解不开。
+//
+// BuildConfig 里的那把仍然保留，作为「开发者本机默认值」兜底：
+// 用户没配过时直接用，省得自己每次重装都要填一遍。
+// ============================================================
+
+private const val SECURE_PREFS_NAME = "coolstream_secure"
+private const val SEC_KEY_API_KEY = "api_key"
+private const val SEC_KEY_BASE_URL = "base_url"
+private const val SEC_KEY_MODEL = "model_name"
+
+/** 「引导已完成」标记。放普通 SharedPreferences 就行，它不是敏感信息 */
+private const val KEY_ONBOARD_DONE = "onboard_done"
+
+private const val DEFAULT_API_BASE = "https://api.deepseek.com"
+private const val DEFAULT_MODEL = "deepseek-flash"
+
+@Volatile
+private var securePrefsCache: SharedPreferences? = null
+
+/**
+ * 拿到加密的 SharedPreferences。
+ *
+ * ★ 失败要能兜住：某些机型/系统上 Keystore 会抽风（尤其是恢复备份、
+ *   或者用户清了凭据之后），这时候 create() 会抛异常。
+ *   真抛了就退回普通 SharedPreferences —— 安全性打折，但 App 不能因此起不来。
+ */
+private fun securePrefs(context: Context): SharedPreferences? {
+    securePrefsCache?.let { return it }
+    return try {
+        val masterKey = MasterKey.Builder(context.applicationContext)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        EncryptedSharedPreferences.create(
+            context.applicationContext,
+            SECURE_PREFS_NAME,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        ).also {
+            securePrefsCache = it
+            Log.d(TAG, "加密存储已就绪")
+        }
+    } catch (e: Exception) {
+        Log.e(TAG, "加密存储初始化失败，退回普通 SharedPreferences", e)
+        null
+    }
+}
+
+/** 运行期的 API 配置。用 mutableStateOf 托着，设置页一改界面立刻跟着变 */
+private object ApiConfig {
+    var apiKey by mutableStateOf("")
+    var baseUrl by mutableStateOf(DEFAULT_API_BASE)
+    var model by mutableStateOf(DEFAULT_MODEL)
+
+    /** 有没有可用的 Key —— 引导页的放行条件之一 */
+    val configured: Boolean get() = apiKey.isNotBlank()
+}
+
+internal fun loadApiConfig(context: Context) {
+    val p = securePrefs(context)
+    val savedKey = p?.getString(SEC_KEY_API_KEY, "").orEmpty()
+    // 用户没配过就用编译期那把（开发者本机），两者都没有就是空
+    ApiConfig.apiKey = savedKey.ifBlank { BuildConfig.DEEPSEEK_API_KEY }
+    ApiConfig.baseUrl = p?.getString(SEC_KEY_BASE_URL, DEFAULT_API_BASE)
+        ?.takeIf { it.isNotBlank() } ?: DEFAULT_API_BASE
+    ApiConfig.model = p?.getString(SEC_KEY_MODEL, DEFAULT_MODEL)
+        ?.takeIf { it.isNotBlank() } ?: DEFAULT_MODEL
+    Log.d(
+        TAG,
+        "API 配置已加载: baseUrl=${ApiConfig.baseUrl}, model=${ApiConfig.model}, " +
+            "key=${if (ApiConfig.apiKey.isBlank()) "空" else "已配置(${ApiConfig.apiKey.length} 字符)"}, " +
+            "加密存储=${p != null}"
+    )
+}
+
+internal fun saveApiConfig(context: Context, key: String, base: String, model: String) {
+    val k = key.trim()
+    val b = base.trim().ifBlank { DEFAULT_API_BASE }
+    val m = model.trim().ifBlank { DEFAULT_MODEL }
+
+    val p = securePrefs(context)
+    if (p == null) {
+        Log.e(TAG, "加密存储不可用，API 配置无法持久化")
+    } else {
+        p.edit()
+            .putString(SEC_KEY_API_KEY, k)
+            .putString(SEC_KEY_BASE_URL, b)
+            .putString(SEC_KEY_MODEL, m)
+            .apply()
+    }
+
+    ApiConfig.apiKey = k
+    ApiConfig.baseUrl = b
+    ApiConfig.model = m
+    Log.d(TAG, "API 配置已保存: baseUrl=$b, model=$m, key=${k.length} 字符")
+}
+
+/**
+ * 把用户填的地址补成完整的 chat/completions 端点。
+ *
+ * 用户很可能只填 `https://api.deepseek.com`（文档里就是这么写的），
+ * 也有人会填全 `.../chat/completions`，两种都得认。
+ */
+private fun chatCompletionsUrl(): String {
+    val base = ApiConfig.baseUrl.trim().trimEnd('/')
+    return if (base.endsWith("/chat/completions")) base else "$base/chat/completions"
+}
+
+// ============================================================
+// 3.24c 首次启动与默认工作区
+// ============================================================
+
+/** 默认工作区路径。新用户不选工作区也能直接发指令 */
+private const val DEFAULT_WORKSPACE = "/storage/emulated/0/Documents/CoolStream_Workspace"
+
+internal fun isOnboarded(context: Context): Boolean {
+    return prefsOf(context).getBoolean(KEY_ONBOARD_DONE, false)
+}
+
+internal fun setOnboarded(context: Context, done: Boolean) {
+    prefsOf(context).edit().putBoolean(KEY_ONBOARD_DONE, done).apply()
+}
+
+/**
+ * 要不要弹引导页。
+ *
+ * 判断的是**真实状态**而不是一个「首次启动」标记：
+ * Key 配好了、文件权限也给了，就直接进主界面 —— 老用户升级后
+ * 不会被莫名其妙拦一次。反过来，只要缺一个就拦。
+ *
+ * 「跳过」按钮会把 KEY_ONBOARD_DONE 置上，之后不再打扰。
+ */
+internal fun needsOnboarding(context: Context): Boolean {
+    if (isOnboarded(context)) return false
+    val keyOk = ApiConfig.apiKey.isNotBlank()
+    val storageOk = hasAllFilesAccess(context)
+    return !(keyOk && storageOk)
+}
+
+/**
+ * 确保有一个可用的工作区。
+ *
+ * 只在「用户从来没设过」的时候动手，绝不覆盖用户自己选的目录。
+ * 建目录需要「所有文件访问权限」，所以调用方要先确认权限已给。
+ */
+internal fun ensureDefaultWorkspace(context: Context): String? {
+    if (currentWorkspace.isNotBlank()) return currentWorkspace
+    if (!Environment.isExternalStorageManager()) {
+        Log.w(TAG, "没有存储权限，跳过默认工作区创建")
+        return null
+    }
+    return try {
+        val dir = File(DEFAULT_WORKSPACE)
+        if (!dir.exists() && !dir.mkdirs()) {
+            Log.e(TAG, "默认工作区创建失败: $DEFAULT_WORKSPACE")
+            return null
+        }
+        saveWorkspace(context, dir.absolutePath)
+        Log.d(TAG, "默认工作区已就绪: ${dir.absolutePath}")
+        dir.absolutePath
+    } catch (e: Exception) {
+        Log.e(TAG, "创建默认工作区出错", e)
+        null
+    }
 }
 
 /**
@@ -2408,7 +2634,7 @@ fun runAgentLoop(
             val apiKey = BuildConfig.DEEPSEEK_API_KEY
             if (apiKey.isBlank()) {
                 withContext(Dispatchers.Main) {
-                    onError("API Key 是空的，请检查 local.properties 里的 DEEPSEEK_API_KEY")
+                    onError("还没有配置 API Key。\n请到「设置 → 模型与 API」里填入，或者点这里重新走一遍引导。")
                 }
                 return@launch
             }
@@ -2447,7 +2673,7 @@ fun runAgentLoop(
                 Log.d(TAG, "agent round $round / messages=${messages.length()}")
 
                 val bodyJson = JSONObject().apply {
-                    put("model", MODEL_NAME)
+                    put("model", ApiConfig.model)
                     put("stream", true)
                     // ★ 关键：不加这个，流式响应里【根本不会返回 usage】
                     //   DeepSeek 默认只在非流式请求里给 usage
@@ -2467,7 +2693,7 @@ fun runAgentLoop(
                 )
 
                 val request = Request.Builder()
-                    .url(API_URL)
+                    .url(chatCompletionsUrl())
                     .addHeader("Authorization", "Bearer $apiKey")
                     .addHeader("Content-Type", "application/json")
                     .addHeader("Accept", "text/event-stream")
@@ -2480,7 +2706,7 @@ fun runAgentLoop(
                 if (!response.isSuccessful) {
                     val errBody = response.body?.string() ?: ""
                     Log.e(TAG, "HTTP ${response.code}: ${errBody.take(300)}")
-                    withContext(Dispatchers.Main) { onError("HTTP ${response.code}") }
+                    withContext(Dispatchers.Main) { onError(httpErrorMessage(response.code, errBody)) }
                     return@launch
                 }
 
@@ -2654,7 +2880,7 @@ fun runAgentLoop(
         } catch (e: Exception) {
             Log.e(TAG, "agent loop failed", e)
             withContext(Dispatchers.Main) {
-                onError("${e.javaClass.simpleName}: ${e.message}")
+                onError(networkErrorMessage(e))
             }
         }
     }
@@ -2675,6 +2901,10 @@ class MainActivity : ComponentActivity() {
 
         // 设置要在第一次重组之前读出来，否则会先按默认主题渲染一帧再跳变
         loadAppSettings(this)
+        // API 配置（加密存储）同理
+        loadApiConfig(this)
+        // 已经有权限的话，顺手把默认工作区补上（幂等）
+        ensureDefaultWorkspace(this)
 
         setContent {
             // 外观：跟随系统 / 强制浅色 / 强制深色
@@ -2688,12 +2918,20 @@ class MainActivity : ComponentActivity() {
             // 动 density 的话间距、圆角、图标会跟着一起缩放，布局会散架。
             val baseDensity = LocalDensity.current
 
+            // ★ 首次启动判断：Key 或文件权限缺一个，就先走引导。
+            //   已经引导过（或用户点过「跳过」）就不再拦。
+            var onboarded by remember { mutableStateOf(!needsOnboarding(this@MainActivity)) }
+
             CompositionLocalProvider(
                 LocalIsDark provides dark,
                 LocalDensity provides Density(baseDensity.density, AppSettings.fontScale)
             ) {
                 MyChatTheme(darkTheme = dark) {
-                    ChatScreen()
+                    if (onboarded) {
+                        ChatScreen()
+                    } else {
+                        OnboardingScreen(onFinish = { onboarded = true })
+                    }
                 }
             }
         }
@@ -3917,6 +4155,272 @@ private fun SessionRow(
 //   运行 / 权限 / 关于 三段。
 // 顶栏带返回箭头，系统返回键也接上了。
 // ============================================================
+// 5.5 首次启动引导（Onboarding）
+//
+// 目标很朴素：一个完全不了解这个 App 的人，下载 APK 之后
+// 不看任何文档，也能在自己手机上把它跑起来。
+//
+// 三步：
+//   ① API Key —— 没有这个发不出消息，硬性要求
+//   ② 文件权限 —— 没有这个所有工具都废掉，硬性要求
+//   ③ Shizuku   —— 只影响 run_shell，可选，只做状态提示
+//
+// ⚠️ 第 ③ 步刻意不做硬性拦截：Shizuku 需要另外装一个 App、还要电脑激活，
+//    拿它当门槛等于把 90% 的用户挡在门外。
+// ============================================================
+@Composable
+fun OnboardingScreen(onFinish: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    val context = LocalContext.current
+
+    var draftKey by remember { mutableStateOf(ApiConfig.apiKey) }
+    var draftBase by remember { mutableStateOf(ApiConfig.baseUrl) }
+    var draftModel by remember { mutableStateOf(ApiConfig.model) }
+    var showKey by remember { mutableStateOf(false) }
+
+    var storageOk by remember { mutableStateOf(hasAllFilesAccess(context)) }
+    var shizukuOk by remember { mutableStateOf(isShizukuGranted() && isShizukuRunning()) }
+
+    // 权限是跳到系统设置里给的，回来不会有回调，只能定时问一下
+    LaunchedEffect(Unit) {
+        while (true) {
+            storageOk = hasAllFilesAccess(context)
+            shizukuOk = isShizukuGranted() && isShizukuRunning()
+            delay(800)
+        }
+    }
+
+    val keyOk = draftKey.isNotBlank()
+    val canEnter = keyOk && storageOk
+
+    fun finish() {
+        saveApiConfig(context, draftKey, draftBase, draftModel)
+        // 工作区要在权限拿到之后再建，否则 mkdirs 必失败
+        ensureDefaultWorkspace(context)
+        setOnboarded(context, true)
+        onFinish()
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = cs.background,
+        contentColor = cs.onBackground
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 16.dp)
+        ) {
+            // ---------- 品牌 ----------
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier
+                        .size(10.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(cs.primary)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "CoolStream",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.titleLarge
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "三步就能用起来。全部在本机完成，不经过任何服务器。",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                color = cs.onSurfaceVariant
+            )
+            Spacer(Modifier.height(18.dp))
+
+            // ---------- ① API Key ----------
+            OnboardStep(index = 1, title = "填入 API Key", done = keyOk) {
+                ConfigField(
+                    label = "API 地址",
+                    value = draftBase,
+                    placeholder = DEFAULT_API_BASE,
+                    helper = "",
+                    onValueChange = { draftBase = it }
+                )
+                ConfigField(
+                    label = "API Key",
+                    value = draftKey,
+                    placeholder = "sk-...",
+                    helper = "在 platform.deepseek.com 申请，只存在本机的加密存储里",
+                    masked = !showKey,
+                    trailing = {
+                        TextButton(onClick = { showKey = !showKey }) {
+                            Text(
+                                text = if (showKey) "隐藏" else "显示",
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    },
+                    onValueChange = { draftKey = it }
+                )
+                ConfigField(
+                    label = "模型名称",
+                    value = draftModel,
+                    placeholder = DEFAULT_MODEL,
+                    helper = "不确定就保持默认",
+                    onValueChange = { draftModel = it }
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // ---------- ② 文件权限 ----------
+            OnboardStep(index = 2, title = "允许访问文件", done = storageOk) {
+                Text(
+                    text = "读文件、写文件、改代码、跑命令都依赖这个权限。" +
+                        "不开的话只能纯聊天，工具全部不可用。",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant
+                )
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = { openAllFilesAccessSettings(context) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (storageOk) cs.surfaceVariant else cs.primary,
+                        contentColor = if (storageOk) cs.onSurfaceVariant else cs.onPrimary
+                    )
+                ) {
+                    Text(
+                        text = if (storageOk) "已授权" else "去授权",
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // ---------- ③ Shizuku（可选） ----------
+            OnboardStep(index = 3, title = "Shizuku（可选）", done = shizukuOk) {
+                Text(
+                    text = "只有 run_shell 需要它。不装也不影响其它功能，以后想用再回来开。",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant
+                )
+                Spacer(Modifier.height(8.dp))
+                TextButton(
+                    onClick = {
+                        if (isShizukuGranted()) {
+                            bindShizukuUserService(context)
+                        } else {
+                            requestShizukuPermission()
+                        }
+                    }
+                ) {
+                    Text(
+                        text = if (isShizukuRunning()) "检查授权" else "Shizuku 服务未运行",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(22.dp))
+
+            // ---------- 进入 ----------
+            Button(
+                onClick = { finish() },
+                enabled = canEnter,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = cs.primary,
+                    contentColor = cs.onPrimary
+                )
+            ) {
+                Text(
+                    text = if (canEnter) "进入 CoolStream" else "请先完成上面两步",
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+
+            // 兜底出口：极少数机型给不了「所有文件访问权限」，
+            // 没有这个按钮用户就永远卡在引导页上了。
+            if (keyOk && !storageOk) {
+                TextButton(
+                    onClick = { finish() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "跳过（工具将不可用，只能聊天）",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = cs.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.height(20.dp))
+        }
+    }
+}
+
+/** 引导页里的一步：序号 + 标题 + 完成状态 + 内容 */
+@Composable
+private fun OnboardStep(
+    index: Int,
+    title: String,
+    done: Boolean,
+    content: @Composable () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val accent = Color(0xFF3FB950)
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = glassFill(),
+        border = BorderStroke(1.dp, glassEdge()),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(CircleShape)
+                        .background(if (done) accent else cs.primary.copy(alpha = 0.22f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (done) "✓" else "$index",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (done) Color(0xFF0D1117) else cs.primary
+                    )
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    text = title,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = cs.onSurface,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = if (done) "已完成" else "待完成",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (done) accent else cs.onSurfaceVariant
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+            content()
+        }
+    }
+}
+
 @Composable
 fun SettingsScreen(
     shizukuGranted: Boolean,
@@ -4135,24 +4639,117 @@ private fun GeneralTab(
     }
 }
 
-/** 模型：接口、运行时参数、计费口径 */
+/** 模型与 API：地址 / Key / 模型名都能直接改 */
 @Composable
 private fun ModelTab() {
     val cs = MaterialTheme.colorScheme
-    val keyConfigured = BuildConfig.DEEPSEEK_API_KEY.isNotBlank()
+    val context = LocalContext.current
+
+    // 草稿状态：改了还没点保存时，不影响正在使用的配置
+    var draftKey by remember { mutableStateOf(ApiConfig.apiKey) }
+    var draftBase by remember { mutableStateOf(ApiConfig.baseUrl) }
+    var draftModel by remember { mutableStateOf(ApiConfig.model) }
+    var showKey by remember { mutableStateOf(false) }
+    var hint by remember { mutableStateOf("") }
+
+    val keyOk = draftKey.isNotBlank()
+    val dirty = draftKey != ApiConfig.apiKey ||
+        draftBase != ApiConfig.baseUrl ||
+        draftModel != ApiConfig.model
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
     ) {
-        item { SectionHeader("接口") }
-        item { InfoRow("模型", MODEL_NAME) }
-        item { InfoRow("地址", API_URL) }
+        item { SectionHeader("模型与 API") }
+
         item {
-            InfoRow(
-                "Key",
-                // 不显示任何一位 Key —— 截图、录屏时不会意外泄露
-                if (keyConfigured) "已配置" else "未配置，检查 local.properties"
+            ConfigField(
+                label = "API 地址",
+                value = draftBase,
+                placeholder = DEFAULT_API_BASE,
+                helper = "只填 https://api.deepseek.com 也行，会自动补 /chat/completions",
+                onValueChange = { draftBase = it; hint = "" }
+            )
+        }
+
+        item {
+            ConfigField(
+                label = "API Key",
+                value = draftKey,
+                placeholder = "sk-...",
+                helper = if (keyOk) {
+                    "已填写 ${draftKey.length} 位；保存在加密存储里，不写日志、不进备份"
+                } else {
+                    "去 platform.deepseek.com 申请"
+                },
+                masked = !showKey,
+                trailing = {
+                    TextButton(onClick = { showKey = !showKey }) {
+                        Text(
+                            text = if (showKey) "隐藏" else "显示",
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                },
+                onValueChange = { draftKey = it; hint = "" }
+            )
+        }
+
+        item {
+            ConfigField(
+                label = "模型名称",
+                value = draftModel,
+                placeholder = DEFAULT_MODEL,
+                helper = "例：deepseek-flash / deepseek-v4-pro",
+                onValueChange = { draftModel = it; hint = "" }
+            )
+        }
+
+        item {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = {
+                        saveApiConfig(context, draftKey, draftBase, draftModel)
+                        hint = "已保存，下一轮对话生效"
+                    },
+                    enabled = keyOk && dirty,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = cs.primary,
+                        contentColor = cs.onPrimary
+                    )
+                ) {
+                    Text("保存", fontFamily = FontFamily.Monospace)
+                }
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    text = hint.ifBlank {
+                        when {
+                            !keyOk -> "Key 不能为空"
+                            !dirty -> "当前配置已是最新"
+                            else -> "有未保存的修改"
+                        }
+                    },
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (hint.startsWith("已保存")) Color(0xFF3FB950) else cs.onSurfaceVariant
+                )
+            }
+        }
+
+        item {
+            Text(
+                text = "完整请求地址：${chatCompletionsUrl()}",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp, start = 4.dp)
             )
         }
 
@@ -4180,6 +4777,71 @@ private fun ModelTab() {
                 style = MaterialTheme.typography.bodySmall,
                 color = cs.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+            )
+        }
+    }
+}
+
+/** 设置页里的一行输入框（带说明文字） */
+@Composable
+private fun ConfigField(
+    label: String,
+    value: String,
+    placeholder: String,
+    helper: String,
+    onValueChange: (String) -> Unit,
+    masked: Boolean = false,
+    trailing: (@Composable () -> Unit)? = null
+) {
+    val cs = MaterialTheme.colorScheme
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp)
+    ) {
+        Text(
+            text = label,
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.labelSmall,
+            color = cs.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp, bottom = 4.dp)
+        )
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.fillMaxWidth(),
+            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            placeholder = {
+                Text(
+                    text = placeholder,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant.copy(alpha = 0.6f)
+                )
+            },
+            visualTransformation = if (masked) {
+                PasswordVisualTransformation()
+            } else {
+                VisualTransformation.None
+            },
+            trailingIcon = trailing,
+            singleLine = true,
+            shape = RoundedCornerShape(10.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = cs.primary,
+                unfocusedBorderColor = glassEdge(),
+                focusedContainerColor = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent
+            )
+        )
+        if (helper.isNotEmpty()) {
+            Text(
+                text = helper,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp, top = 3.dp)
             )
         }
     }
@@ -4544,8 +5206,16 @@ fun MessageBubble(
 
     // 用户气泡：实心蓝 + 白字
     // AI 气泡：深/浅灰底 + 1dp 描边 + 正文色
-    val bubbleColor = if (isUser) cs.primary else cs.surface
-    val textColor = if (isUser) cs.onPrimary else cs.onSurface
+    // 错误气泡：暗红毛玻璃。和用户气泡、AI 气泡一眼能分开
+    val isErr = message.isError
+    val errorAccent = Color(0xFFF85149)
+
+    val bubbleColor = when {
+        isErr -> errorAccent.copy(alpha = 0.14f)
+        isUser -> cs.primary
+        else -> cs.surface
+    }
+    val textColor = if (isUser && !isErr) cs.onPrimary else cs.onSurface
 
     // 正文为空说明 AI 还在思考（占位行），或者上次流式中断了
     val placeholder = message.content.isBlank() && !isUser
@@ -4578,7 +5248,10 @@ fun MessageBubble(
                 shadowElevation = 0.dp,
                 tonalElevation = 0.dp,
                 // 两种气泡都加一条极微弱的半透明高光边框（毛玻璃质感）
-                border = BorderStroke(1.dp, glassEdge()),
+                border = BorderStroke(
+                    1.dp,
+                    if (isErr) errorAccent.copy(alpha = 0.45f) else glassEdge()
+                ),
                 modifier = Modifier
                     .widthIn(max = 300.dp)
                     .onGloballyPositioned { bubbleHeight = it.size.height }
@@ -4594,7 +5267,36 @@ fun MessageBubble(
                         }
                     )
             ) {
-                if (useMarkdown) {
+                if (isErr) {
+                    Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = errorAccent,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = "出错了",
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = errorAccent
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            // 老数据里存的是「错误: xxx」，渲染时把前缀去掉，
+                            // 标题已经在上面写着了，正文只留原因
+                            text = message.content
+                                .removePrefix("错误: ")
+                                .removePrefix("错误："),
+                            color = cs.onSurface,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                } else if (useMarkdown) {
                     MarkdownText(
                         content = message.content,
                         textColor = textColor,

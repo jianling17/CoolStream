@@ -106,6 +106,10 @@ dependencies {
     // OkHttp：流式请求 DeepSeek API
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // 加密存储：API Key 不能明文躺在 SharedPreferences 里。
+    // 底层是 Android Keystore 里的一把 AES256 主密钥，文件被拷走也解不开。
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // ===== Room：本地数据库 =====
     // room-runtime 是运行时库，room-ktx 提供协程支持（suspend / Flow），
     // room-compiler 是编译器，用 ksp(...) 而不是 implementation(...)，
