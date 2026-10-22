@@ -115,6 +115,9 @@ dependencies {
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    // ViewModel：让 sessions / currentSessionId 这类状态在旋转屏幕后存活，
+    // 同时用 viewModelScope 跑流式请求（rememberCoroutineScope 会在重建时被 cancel）
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.6.1")
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)

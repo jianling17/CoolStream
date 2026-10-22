@@ -1,6 +1,7 @@
 package com.example.mychat
 
 import android.Manifest
+import android.app.Application
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
@@ -62,6 +63,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.example.mychat.ui.theme.MyChatTheme
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -80,6 +82,9 @@ import android.content.Context
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.Dao
@@ -122,6 +127,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import rikka.shizuku.Shizuku
 
@@ -148,7 +154,9 @@ import com.example.mychat.ui.theme.GlassTintDark
 import com.example.mychat.ui.theme.GlassTintLight
 
 // ---- 像素级 UI 重构新增的 import ----
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
@@ -2047,25 +2055,69 @@ data class ChatSession(
 //     ├─ drawerContent → DrawerContent（新建对话 / 会话列表 / 设置）
 //     └─ 主内容 → Scaffold(TopAppBar) + 聊天区 + 输入框
 // ============================================================
+// ============================================================
+// 5.05 ChatViewModel —— 跨屏幕旋转存活的状态
+//
+// 为什么需要它：
+//   ① remember { mutableStateOf() } 在 Activity 重建（旋转屏幕）时全部丢失
+//   ② rememberCoroutineScope() 会随组合销毁被 cancel —— 旋转屏幕会把正在跑的
+//      流式请求直接掐断，用户看到的是"回复突然停住"
+//
+// 做法：状态搬进 ViewModel，但对外暴露的是 MutableState，
+//       界面侧用 `by vm.xxxState` 委托，现有代码几乎不用改。
+//       流式请求改跑在 viewModelScope 上，旋转就不再打断。
+//
+// ⚠️ 注意：ViewModel 只在「配置变更」时存活；进程被杀（真正退出）依然会丢，
+//    那种情况靠 Room 恢复。
+// ============================================================
+class ChatViewModel(app: Application) : AndroidViewModel(app) {
+
+    val dao: ChatDao = AppDatabase.get(app).chatDao()
+
+    // ---------- 状态（界面通过 by 委托读取/写入） ----------
+    val sessions = mutableStateListOf<ChatSession>()
+    val currentSessionIdState = mutableStateOf("")
+    val inputTextState = mutableStateOf("")
+    val isStreamingState = mutableStateOf(false)
+    val lastUsageState = mutableStateOf(UsageStats.EMPTY)
+    val workspaceState = mutableStateOf("")
+    val showSettingsState = mutableStateOf(false)
+
+    /** 首次从数据库加载只做一次。旋转回来不要重新读库，否则会打断正在进行的流。 */
+    var loadedOnce = false
+
+    /** 正在跑的流式任务，停止按钮要用 */
+    var streamJob: Job? = null
+
+    /** 本轮 AI 占位行在数据库里的 id（停止生成时落库用） */
+    val aiRowId = AtomicInteger(0)
+
+    /** 本轮属于哪个会话 */
+    var activeSessionId: String = ""
+}
+
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen() {
-    // ===== 全局状态 =====
+    // ===== 全局状态：全部放在 ViewModel 里，旋转屏幕不丢 =====
+    val vm: ChatViewModel = viewModel()
+
     // 所有会话。mutableStateListOf 是"能被 Compose 感知的列表"。
-    val sessions = remember { mutableStateListOf<ChatSession>() }
+    val sessions = vm.sessions
 
     // 当前选中的会话 id
-    var currentSessionId by remember { mutableStateOf("") }
+    var currentSessionId by vm.currentSessionIdState
 
     // 输入框文字 / 是否正在流式回复
-    var inputText by remember { mutableStateOf("") }
-    var isStreaming by remember { mutableStateOf(false) }
+    var inputText by vm.inputTextState
+    var isStreaming by vm.isStreamingState
 
-    // 抽屉开合状态
+    // 抽屉开合状态（rememberDrawerState 内部用的就是 rememberSaveable，本身就能扛旋转）
     val drawerState = rememberDrawerState(DrawerValue.Closed)
 
-    // 设置对话框
-    var showSettings by remember { mutableStateOf(false) }
+    // 设置页
+    var showSettings by vm.showSettingsState
 
     // 存储权限提示（Agent 的 read_file 工具需要「所有文件访问权限」）
     var showStorageTip by remember { mutableStateOf(false) }
@@ -2073,8 +2125,11 @@ fun ChatScreen() {
     // Shizuku 授权状态（run_shell 工具需要）
     var shizukuGranted by remember { mutableStateOf(false) }
 
-    // 和界面生命周期绑定的协程作用域
+    // UI 操作（开关抽屉之类）用这个作用域
     val scope = rememberCoroutineScope()
+    // ★ 流式请求用 viewModelScope：旋转屏幕时 rememberCoroutineScope 会被 cancel，
+    //   而 viewModelScope 要等 ViewModel 真正销毁才结束 —— 这样旋转不会打断生成。
+    val streamScope: CoroutineScope = vm.viewModelScope
 
     // ===== Room 数据库 =====
     // AppDatabase.get(...) 是单例，调多少次都只会创建一个数据库实例。
@@ -2082,7 +2137,7 @@ fun ChatScreen() {
     val dao = remember { AppDatabase.get(context).chatDao() }
 
     // ===== 工作区（Settings 页里选，存 SharedPreferences，重启不丢） =====
-    var workspace by remember { mutableStateOf("") }
+    var workspace by vm.workspaceState
     LaunchedEffect(Unit) {
         workspace = loadWorkspace(context)
         // ★ 同步给顶层的工具层：executeTool 是普通函数，读不到 Compose 状态，
@@ -2091,15 +2146,10 @@ fun ChatScreen() {
         Log.d(TAG, "已加载工作区: ${workspace.ifBlank { "(未设置)" }}")
     }
 
-    // ===== 流式任务 / 费用统计 / 停止生成 =====
-    // 当前正在跑的流式任务。点「停止」时靠它 cancel。
-    var streamJob by remember { mutableStateOf<Job?>(null) }
-    // 最近一轮的 token 用量，InfoBar 显示用
-    var lastUsage by remember { mutableStateOf(UsageStats.EMPTY) }
+    // ===== 流式任务 / 费用统计（状态都在 ViewModel 里） =====
+    var lastUsage by vm.lastUsageState
     // AI 占位行在数据库里的 id。停止时要靠它把已收到的文字写回去。
-    val aiRowId = remember { AtomicInteger(0) }
-    // 本轮属于哪个会话（停止时要用）
-    var activeSessionId by remember { mutableStateOf("") }
+    val aiRowId = vm.aiRowId
 
     // ===== 工具：按 id 更新某个会话 =====
     // ⚠️ 关键设计：流式回调里必须按"发送那一刻记下的 sessionId"更新，
@@ -2126,7 +2176,7 @@ fun ChatScreen() {
             )
         )
         currentSessionId = id
-        scope.launch(Dispatchers.IO) {
+        streamScope.launch(Dispatchers.IO) {
             dao.insertSession(SessionEntity(id = id, title = "新对话", createdAt = createdAt))
         }
         return id
@@ -2136,6 +2186,15 @@ fun ChatScreen() {
     // LaunchedEffect(Unit) 表示：这段代码在界面第一次显示时执行一次。
     // 数据库读写必须切到 IO 线程，否则会卡住界面。
     LaunchedEffect(Unit) {
+        // ★ 只加载一次。
+        //   ViewModel 在旋转屏幕时是存活的，state 还在；要是这里重新读库 + clear，
+        //   会把正在流式输出的那条气泡、以及还没落库的工具卡片全冲掉。
+        if (vm.loadedOnce) {
+            Log.d(TAG, "旋转回来，跳过重新加载（sessions=${sessions.size}）")
+            return@LaunchedEffect
+        }
+        vm.loadedOnce = true
+
         val loaded: List<ChatSession> = withContext(Dispatchers.IO) {
             dao.getAllSessions().map { se ->
                 ChatSession(
@@ -2256,11 +2315,37 @@ fun ChatScreen() {
                         .statusBarsPadding()
                         .navigationBarsPadding()
                 ) {
-                    Sidebar(
-                        state = sidebarState,
-                        onSelect = onSelectSession,
-                        onSettings = onOpenSettings
-                    )
+                Sidebar(
+                    state = sidebarState,
+                    onSelect = onSelectSession,
+                    // 重命名：内存 + Room 一起改
+                    onRename = { id, newTitle ->
+                        updateSession(id) { it.copy(title = newTitle) }
+                        streamScope.launch(Dispatchers.IO) {
+                            dao.updateSessionTitle(id, newTitle)
+                        }
+                        Log.d(TAG, "重命名会话: $id → $newTitle")
+                    },
+                    // 删除：Room 级联删消息；删的是当前会话时自动切走，绝不白屏
+                    onDelete = { id ->
+                        sessions.removeAll { it.id == id }
+                        streamScope.launch(Dispatchers.IO) {
+                            dao.deleteSession(id)   // messages 表有 ON DELETE CASCADE，会一起删
+                        }
+                        Log.d(TAG, "删除会话: $id，剩余 ${sessions.size} 个")
+
+                        if (currentSessionId == id) {
+                            val next = sessions.firstOrNull()?.id
+                            if (next != null) {
+                                currentSessionId = next
+                            } else {
+                                // 全删光了：建一个新的空会话，否则界面没有可显示的会话
+                                newSession()
+                            }
+                        }
+                    },
+                    onSettings = onOpenSettings
+                )
                 }
             }
         }
@@ -2412,7 +2497,10 @@ fun ChatScreen() {
                                 sessionId = sessionId,
                                 content = "",
                                 isUser = false,
-                                timestamp = now + 1,
+                                // ★ 必须比工具卡片（now + 1）大：
+                                //   重启后按 timestamp 排序，AI 回复要排在工具卡片之后。
+                                //   用户消息 = now，工具卡片 = now + 1，AI = now + 2。
+                                timestamp = now + 2,
                                 type = MessageType.AI_TEXT
                             )
 
@@ -2438,8 +2526,8 @@ fun ChatScreen() {
                             //   aiRowId 用 AtomicInteger 装：写库在 IO 线程，
                             //   读它发生在 onDone，普通 var 跨线程不安全。
                             // aiRowId 用的是 ChatScreen 级的那个（停止生成时要读它），这里不再重新声明
-                            activeSessionId = sessionId
-                            val dbJob = scope.launch(Dispatchers.IO) {
+                            vm.activeSessionId = sessionId
+                            val dbJob = streamScope.launch(Dispatchers.IO) {
                                 // 标题变了才更新（会话行本身在 newSession() 时已经插过）
                                 if (newTitle != null) {
                                     dao.updateSessionTitle(sessionId, newTitle)
@@ -2494,10 +2582,13 @@ fun ChatScreen() {
                             //      必须插在「AI 占位气泡」之前，
                             //      这样 messages.last() 永远还是占位气泡，onFlush 才不会写错地方。
                             val toolCardSlots = HashMap<String, Int>()
+                            // callId → 数据库行号。用 CompletableDeferred 保证：
+                            // 「执行完」要更新那一行时，insert 一定已经完成了（不然会更新到一个还不存在的 id）
+                            val toolCardRowIds = ConcurrentHashMap<String, CompletableDeferred<Int>>()
 
-                            streamJob = runAgentLoop(
+                            vm.streamJob = runAgentLoop(
                                 history = historyForApi,
-                                scope = scope,
+                                scope = streamScope,
 
                                 // 模型要调工具：先插一张「执行中」的卡片
                                 onToolCallStarted = { callId, toolName, argsJson ->
@@ -2526,7 +2617,9 @@ fun ChatScreen() {
                                         sessionId = sessionId,
                                         content = payload,
                                         isUser = false,
-                                        timestamp = System.currentTimeMillis(),
+                                        // ★ 必须是 now + 1：用户消息是 now、AI 占位是 now + 2。
+                                        //   这样重启后按 timestamp 排序，卡片才会落在用户和 AI 之间。
+                                        timestamp = now + 1,
                                         type = MessageType.TOOL_CALL
                                     )
 
@@ -2540,29 +2633,53 @@ fun ChatScreen() {
                                         s.copy(messages = list)
                                     }
                                     if (slot >= 0) toolCardSlots[callId] = slot
+
+                                    // ★ 落库：不落库的话，重启 App 这张卡片就直接消失了
+                                    val deferred = CompletableDeferred<Int>()
+                                    toolCardRowIds[callId] = deferred
+                                    streamScope.launch(Dispatchers.IO) {
+                                        val rid = dao.insert(card).toInt()
+                                        deferred.complete(rid)
+                                        Log.d(TAG, "工具卡片已落库: callId=$callId rowId=$rid")
+                                    }
                                 },
 
-                                // 工具执行完：把结果写回那张卡片
+                                // 工具执行完：把结果写回那张卡片（内存 + 数据库）
                                 onToolCallFinished = { callId, ok, output ->
                                     val slot = toolCardSlots[callId] ?: -1
+
+                                    // 先把新的 content 算出来，内存和数据库用同一份
+                                    val current = sessions.firstOrNull { it.id == sessionId }
+                                        ?.messages?.getOrNull(slot)?.content ?: ""
+                                    val updated = try {
+                                        JSONObject(current).apply {
+                                            put("ok", ok)
+                                            put("output", output)
+                                        }.toString()
+                                    } catch (e: Exception) {
+                                        current
+                                    }
+
                                     updateSession(sessionId) { s ->
                                         val msgs = s.messages
                                         if (slot in msgs.indices &&
                                             msgs[slot].type == MessageType.TOOL_CALL
                                         ) {
-                                            val updated = try {
-                                                JSONObject(msgs[slot].content).apply {
-                                                    put("ok", ok)
-                                                    put("output", output)
-                                                }.toString()
-                                            } catch (e: Exception) {
-                                                msgs[slot].content
-                                            }
                                             val list = msgs.toMutableList()
                                             list[slot] = msgs[slot].copy(content = updated)
                                             s.copy(messages = list)
                                         } else {
                                             s
+                                        }
+                                    }
+
+                                    toolCardRowIds[callId]?.let { deferred ->
+                                        streamScope.launch(Dispatchers.IO) {
+                                            val rid = deferred.await()
+                                            if (rid > 0) {
+                                                dao.updateContent(rid, updated, false)
+                                                Log.d(TAG, "工具卡片结果已入库: callId=$callId rowId=$rid")
+                                            }
                                         }
                                     }
                                 },
@@ -2590,7 +2707,7 @@ fun ChatScreen() {
                                 onDone = { total ->
                                     Log.d(TAG, "onDone: total=$total")
                                     isStreaming = false
-                                    streamJob = null
+                                    vm.streamJob = null
 
                                     // ★ 流结束，这才是唯一需要写"正文"的时刻。
                                     //   要是每个 50ms 都写库，900 个碎片就是几十次磁盘操作，
@@ -2599,7 +2716,7 @@ fun ChatScreen() {
                                         .firstOrNull { it.id == sessionId }
                                         ?.messages?.lastOrNull()?.content ?: ""
 
-                                    scope.launch(Dispatchers.IO) {
+                                    streamScope.launch(Dispatchers.IO) {
                                         dbJob.join()          // 等插入完成（正常早就完成了）
                                         val rowId = aiRowId.get()
                                         if (rowId > 0) {
@@ -2630,7 +2747,7 @@ fun ChatScreen() {
 
                                     // 出错也算一次流的结束，同样落库。
                                     // 不写的话这一行会一直是空串，下次启动就被过滤掉了。
-                                    scope.launch(Dispatchers.IO) {
+                                    streamScope.launch(Dispatchers.IO) {
                                         dbJob.join()
                                         val rowId = aiRowId.get()
                                         if (rowId > 0) {
@@ -2638,7 +2755,7 @@ fun ChatScreen() {
                                         }
                                     }
                                     isStreaming = false
-                                    streamJob = null
+                                    vm.streamJob = null
                                 }
                             )
                         }
@@ -2647,12 +2764,12 @@ fun ChatScreen() {
                     //   cancel() 之后 runAgentLoop 里的 CancellationException 会被重新抛出，
                     //   协程结束；但 onDone 不会触发，所以「落库」必须在这里自己补上。
                     onStop = {
-                        val job = streamJob
-                        streamJob = null
+                        val job = vm.streamJob
+                        vm.streamJob = null
                         job?.cancel()
                         isStreaming = false
 
-                        val sid = activeSessionId
+                        val sid = vm.activeSessionId
                         val partial = sessions.firstOrNull { it.id == sid }
                             ?.messages?.lastOrNull()?.content ?: ""
                         val rowId = aiRowId.get()
@@ -2660,7 +2777,7 @@ fun ChatScreen() {
                         Log.d(TAG, "用户停止生成: 已收到 ${partial.length} 字符, rowId=$rowId")
 
                         if (rowId > 0) {
-                            scope.launch(Dispatchers.IO) {
+                            streamScope.launch(Dispatchers.IO) {
                                 dao.updateContent(rowId, partial, false)
                             }
                         }
@@ -2723,12 +2840,20 @@ fun ChatScreen() {
 fun Sidebar(
     state: SidebarState,
     onSelect: (String) -> Unit,
+    onRename: (String, String) -> Unit,
+    onDelete: (String) -> Unit,
     onSettings: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
 
     // 搜索关键词。纯内存过滤，不碰数据库。
     var query by remember { mutableStateOf("") }
+
+    // 长按菜单的目标会话
+    var menuTarget by remember { mutableStateOf<SidebarSession?>(null) }
+    // 重命名弹窗的目标 + 输入内容
+    var renameTarget by remember { mutableStateOf<SidebarSession?>(null) }
+    var renameText by remember { mutableStateOf("") }
 
     // ★ 注意 remember 的 key 是 state.sessions（内容比较），
     //   不是整个 ChatSession。流式刷新不会让它重算。
@@ -2814,7 +2939,8 @@ fun Sidebar(
                             SessionRow(
                                 title = session.title,
                                 selected = session.id == state.currentSessionId,
-                                onClick = { onSelect(session.id) }
+                                onClick = { onSelect(session.id) },
+                                onLongClick = { menuTarget = session }
                             )
                         }
                     }
@@ -2856,6 +2982,84 @@ fun Sidebar(
                 .background(GlassHighlight)
         )
     }
+
+    // ---------- 长按菜单：重命名 / 删除 ----------
+    menuTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { menuTarget = null },
+            containerColor = glassDrawer(),
+            titleContentColor = cs.onSurface,
+            textContentColor = cs.onSurfaceVariant,
+            title = {
+                Text(
+                    text = target.title,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            },
+            text = {
+                Text("对这个会话做什么？", style = MaterialTheme.typography.bodySmall)
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    renameText = target.title
+                    renameTarget = target
+                    menuTarget = null
+                }) { Text("重命名") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    onDelete(target.id)
+                    menuTarget = null
+                }) {
+                    Text("删除", color = Color(0xFFF85149))
+                }
+            }
+        )
+    }
+
+    // ---------- 重命名弹窗 ----------
+    renameTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            containerColor = glassDrawer(),
+            titleContentColor = cs.onSurface,
+            textContentColor = cs.onSurfaceVariant,
+            title = { Text("重命名会话") },
+            text = {
+                Surface(
+                    color = glassFill(),
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, glassEdge()),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    BasicTextField(
+                        value = renameText,
+                        onValueChange = { renameText = it },
+                        singleLine = true,
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(
+                            fontFamily = FontFamily.Monospace,
+                            color = cs.onSurface
+                        ),
+                        cursorBrush = SolidColor(cs.primary),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val t = renameText.trim()
+                    if (t.isNotEmpty()) onRename(target.id, t)
+                    renameTarget = null
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTarget = null }) { Text("取消") }
+            }
+        )
+    }
 }
 
 
@@ -2880,11 +3084,13 @@ private fun dayBucket(ts: Long): Int {
 }
 
 /** 侧边栏的一行会话：选中时是半透明胶囊高亮 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SessionRow(
     title: String,
     selected: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
     Surface(
@@ -2894,7 +3100,8 @@ private fun SessionRow(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(20.dp))
-            .clickable(onClick = onClick)
+            // 长按 = 重命名 / 删除
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
     ) {
         Text(
             text = title,
