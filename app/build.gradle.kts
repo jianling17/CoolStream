@@ -1,3 +1,6 @@
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.Properties
 
 plugins {
@@ -32,11 +35,36 @@ android {
         applicationId = "com.example.mychat"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+
+        // ============================================================
+        // ★ 自动版本号：0.yyMMddHHmm
+        //
+        //   2026-10-22 12:00 → versionName = "0.2610221200"
+        //
+        //   ⚠️ 这里必须显式指定 Locale.US。
+        //      SimpleDateFormat 默认跟随系统语言，某些语言环境下
+        //      "yyMMddHH" 会输出非 ASCII 数字，下面的 toInt() 会直接抛
+        //      NumberFormatException，整个构建在 configure 阶段就挂掉。
+        //
+        //   ⚠️ versionCode 只精确到【小时】，不是分钟。
+        //      versionCode 必须是 32 位正整数（上限约 21 亿）。
+        //      yyMMddHHmm 是 10 位数字（2610221200 ≈ 26 亿），会溢出成负数，
+        //      Android 会直接拒绝安装。截到小时是 8 位（最大 99123123），安全。
+        //      代价：同一小时内多次构建，versionCode 不变 ——
+        //           调试覆盖安装没问题，正式发版时一小时只能出一个包。
+        // ============================================================
+        val nowDate = Date()
+        val versionStamp = SimpleDateFormat("yyMMddHHmm", Locale.US).format(nowDate)
+        val versionCodeHour = SimpleDateFormat("yyMMddHH", Locale.US).format(nowDate).toInt()
+
+        versionName = "0.$versionStamp"
+        versionCode = versionCodeHour
 
         // 把 local.properties 里的 Key 生成成 BuildConfig.DEEPSEEK_API_KEY
         buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekApiKey\"")
+
+        // 把版本号也生成进 BuildConfig，UI 里直接读，不用再解析 PackageInfo
+        buildConfigField("String", "BUILD_VERSION_NAME", "\"$versionName\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

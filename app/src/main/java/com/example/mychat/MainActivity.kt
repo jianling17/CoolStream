@@ -14,6 +14,7 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -130,6 +131,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
+import com.example.mychat.ui.theme.CodeInlineBackground
 import com.example.mychat.ui.theme.CodeBlockBackground
 import com.example.mychat.ui.theme.CodeBlockBorder
 import com.example.mychat.ui.theme.CodeBlockText
@@ -154,6 +156,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.ui.draw.clip
@@ -2383,67 +2386,11 @@ fun ChatScreen() {
         }
     }
 
-    // ---------- 设置对话框 ----------
+    // ---------- 设置页（全屏，覆盖在聊天界面之上） ----------
     if (showSettings) {
-        AlertDialog(
-            onDismissRequest = { showSettings = false },
-            containerColor = MaterialTheme.colorScheme.surface,
-            titleContentColor = MaterialTheme.colorScheme.onSurface,
-            textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-            title = { Text("设置") },
-            text = {
-                val storageOk = hasAllFilesAccess(context)
-                val shizukuRunning = isShizukuRunning()
-
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("模型　$MODEL_NAME", style = MaterialTheme.typography.bodySmall)
-                    Text("接口　$API_URL", style = MaterialTheme.typography.bodySmall)
-                    Text("批处理　${FLUSH_INTERVAL_MS}ms", style = MaterialTheme.typography.bodySmall)
-                    Text("上下文　最近 $MAX_HISTORY_MESSAGES 条", style = MaterialTheme.typography.bodySmall)
-                    Text(
-                        "工具　list_dir / search_files / read_file / run_shell",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-
-                    Spacer(Modifier.height(6.dp))
-
-                    // 可点击的权限行 —— 点一下直达授权页
-                    PermissionRow(
-                        label = "文件权限",
-                        status = if (storageOk) "已开启" else "未开启",
-                        ok = storageOk,
-                        onClick = { openAllFilesAccessSettings(context) }
-                    )
-                    PermissionRow(
-                        label = "Shizuku",
-                        status = when {
-                            !shizukuRunning -> "服务未运行"
-                            shizukuGranted -> "已授权"
-                            else -> "点此授权"
-                        },
-                        ok = shizukuGranted,
-                        onClick = {
-                            // 已授权 → 重新绑一次（可能是冷启动没连上）
-                            // 未授权 → 弹 Shizuku 的授权对话框
-                            if (isShizukuGranted()) {
-                                bindShizukuUserService(context)
-                            } else {
-                                requestShizukuPermission()
-                            }
-                        }
-                    )
-
-                    Spacer(Modifier.height(6.dp))
-
-                    Text(
-                        "会话已持久化保存至本地数据库。",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showSettings = false }) { Text("关闭") }
-            }
+        SettingsScreen(
+            shizukuGranted = shizukuGranted,
+            onBack = { showSettings = false }
         )
     }
 
@@ -2671,8 +2618,167 @@ private fun SessionRow(
     }
 }
 
+// ============================================================
+// 5.2 设置页（全屏）
+//
+// 原来是 AlertDialog，条目一多就挤成一团，改成整页列表：
+//   运行 / 权限 / 关于 三段。
+// 顶栏带返回箭头，系统返回键也接上了。
+// ============================================================
+@Composable
+fun SettingsScreen(
+    shizukuGranted: Boolean,
+    onBack: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    val context = LocalContext.current
+
+    // 系统返回键 = 关闭设置页
+    BackHandler(onBack = onBack)
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = cs.background,
+        contentColor = cs.onBackground
+    ) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                // ★ App 开了 enableEdgeToEdge()，不补这个内边距，
+                //   顶栏会钻到状态栏底下，和信号/电量图标叠在一起。
+                //   （聊天主界面由 Scaffold 自动处理，设置页是自己画的，得手动补）
+                .statusBarsPadding()
+                .navigationBarsPadding()
+        ) {
+            // ---------- 顶栏 ----------
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 6.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "返回"
+                    )
+                }
+                Text(
+                    text = "设置",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                // ---------- 运行 ----------
+                item { SectionHeader("运行") }
+                item { InfoRow("模型", MODEL_NAME) }
+                item { InfoRow("接口", API_URL) }
+                item { InfoRow("批处理", "${FLUSH_INTERVAL_MS}ms") }
+                item { InfoRow("上下文", "最近 $MAX_HISTORY_MESSAGES 条") }
+
+                // ---------- 权限 ----------
+                item { SectionHeader("权限") }
+                item {
+                    val storageOk = hasAllFilesAccess(context)
+                    PermissionRow(
+                        label = "文件权限",
+                        status = if (storageOk) "已开启" else "未开启",
+                        ok = storageOk,
+                        onClick = { openAllFilesAccessSettings(context) }
+                    )
+                }
+                item {
+                    val running = isShizukuRunning()
+                    PermissionRow(
+                        label = "Shizuku",
+                        status = when {
+                            !running -> "服务未运行"
+                            shizukuGranted -> "已授权"
+                            else -> "点此授权"
+                        },
+                        ok = shizukuGranted,
+                        onClick = {
+                            // 已授权 → 重新绑一次（可能是冷启动没连上）
+                            // 未授权 → 弹 Shizuku 的授权对话框
+                            if (isShizukuGranted()) {
+                                bindShizukuUserService(context)
+                            } else {
+                                requestShizukuPermission()
+                            }
+                        }
+                    )
+                }
+
+                // ---------- 关于 ----------
+                item { SectionHeader("关于") }
+                item {
+                    // ★ 版本号来自 BuildConfig.BUILD_VERSION_NAME，
+                    //   由 build.gradle.kts 在【编译时】按「0.yyMMddHHmm」生成。
+                    //   每次构建都会变，不需要手动改。
+                    Text(
+                        text = "当前版本：${BuildConfig.BUILD_VERSION_NAME}",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = cs.onSurface,
+                        modifier = Modifier.padding(vertical = 8.dp)
+                    )
+                }
+                item {
+                    InfoRow("工具", "list_dir / search_files / read_file / run_shell")
+                }
+                item {
+                    InfoRow("数据", "Room v3 本地数据库")
+                }
+            }
+        }
+    }
+}
+
+/** 设置页的分组标题 */
+@Composable
+private fun SectionHeader(title: String) {
+    Text(
+        text = title,
+        fontFamily = FontFamily.Monospace,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(start = 4.dp, top = 18.dp, bottom = 6.dp)
+    )
+}
+
+/** 设置页的「名字 — 值」一行（不可点） */
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(96.dp)
+        )
+        Text(
+            text = value,
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
 /**
- * 设置弹窗里的「权限」一行：左边名字，右边状态，整行可点。
+ * 设置页里的「权限」一行：左边名字，右边状态，整行可点。
  * 点一下直达对应的授权页（比让用户自己去系统设置里翻可靠得多）。
  */
 @Composable
@@ -2868,30 +2974,65 @@ private fun parseMarkdown(src: String): List<MdBlock> {
 }
 
 /**
- * 把一行里的 **粗体** 变成真正的粗体。
- * 只处理 ** 这一种标记，不处理 *斜体* / _下划线_ / `行内代码`，
- * 因为它们和中文标点混在一起时容易误判。
+ * 行内标记渲染：把 `**粗体**` 和 `` `行内代码` `` 变成真正的样式。
+ *
+ * 只处理这两种，不处理 *斜体* / _下划线_ —— 它们和中文标点混在一起时容易误判，
+ * 而模型回复里最常出现的就是加粗和工具名，先解决这两个。
+ *
+ * 做法：从左往右扫，每次找「离当前位置最近的标记」，处理完跳过，继续扫。
+ * 单个标记没有配对（常见于流式中断）时原样输出，不吞字符。
  */
-private fun boldText(text: String): AnnotatedString {
+private fun inlineFormat(text: String): AnnotatedString {
     val builder = AnnotatedString.Builder()
     var i = 0
+
     while (i < text.length) {
-        val start = text.indexOf("**", i)
-        if (start < 0) {
+        val boldAt = text.indexOf("**", i)
+        val codeAt = text.indexOf('`', i)
+
+        // 两种标记都没有了 → 剩下的原样追加，结束
+        if (boldAt < 0 && codeAt < 0) {
             builder.append(text.substring(i))
             break
         }
-        val end = text.indexOf("**", start + 2)
-        if (end < 0) {
-            // 只有开没有闭（常见于流式中断），原样输出
-            builder.append(text.substring(i))
-            break
+
+        // 谁的标记更靠前就先处理谁
+        val useBold = when {
+            boldAt < 0 -> false
+            codeAt < 0 -> true
+            else -> boldAt <= codeAt
         }
+        val start = if (useBold) boldAt else codeAt
+
         if (start > i) builder.append(text.substring(i, start))
-        builder.withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-            append(text.substring(start + 2, end))
+
+        if (useBold) {
+            val end = text.indexOf("**", start + 2)
+            if (end < 0) {
+                builder.append(text.substring(start))
+                break
+            }
+            builder.withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                append(text.substring(start + 2, end))
+            }
+            i = end + 2
+        } else {
+            val end = text.indexOf('`', start + 1)
+            if (end < 0) {
+                builder.append(text.substring(start))
+                break
+            }
+            // 行内代码：等宽 + 淡灰底，反引号本身不显示
+            builder.withStyle(
+                SpanStyle(
+                    fontFamily = FontFamily.Monospace,
+                    background = CodeInlineBackground
+                )
+            ) {
+                append(text.substring(start + 1, end))
+            }
+            i = end + 1
         }
-        i = end + 2
     }
     return builder.toAnnotatedString()
 }
@@ -2917,7 +3058,7 @@ private fun MarkdownText(
         for (block in blocks) {
             when (block) {
                 is MdBlock.Heading -> Text(
-                    text = boldText(block.text),
+                    text = inlineFormat(block.text),
                     color = textColor,
                     fontWeight = FontWeight.Bold,
                     style = when (block.level) {
@@ -2928,7 +3069,7 @@ private fun MarkdownText(
                 )
 
                 is MdBlock.Paragraph -> Text(
-                    text = boldText(block.text),
+                    text = inlineFormat(block.text),
                     color = textColor,
                     style = MaterialTheme.typography.bodyMedium
                 )

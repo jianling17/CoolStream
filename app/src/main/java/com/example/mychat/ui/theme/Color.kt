@@ -59,3 +59,8 @@ val GlassEdgeLight   = Color.Black.copy(alpha = 0.08f)         // 高光边框�
 val GlassHighlight   = Color.White.copy(alpha = 0.22f)         // 更强的高光线（侧边栏右缘）
 val GlassTintDark    = Color.White.copy(alpha = 0.06f)         // 选中项的半透明高亮
 val GlassTintLight   = Color.Black.copy(alpha = 0.05f)
+
+// ---------------- 行内代码 `xxx` 的底色 ----------------
+// 用中性灰 + 低透明度，白底上是浅灰、黑底上是深灰，一套值两边都能用。
+// （行内代码只出现在 AI 气泡里 —— 用户消息不渲染 Markdown）
+val CodeInlineBackground = Color(0xFF8B949E).copy(alpha = 0.25f)
