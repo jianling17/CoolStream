@@ -482,3 +482,31 @@ $ADB shell am start -n com.example.mychat/.MainActivity
 - `testDebugUnitTest` **307 条 0 失败**（269 基线 + 25 表格 + 13 文件卡片）
 - `assembleRelease` ✅ `app-release.apk` = 2,088,151 字节 ≈ **1.99 MB**（放宽后的 3MB 限制内，余量约 1MB）
 - `FLUSH_INTERVAL_MS = 50L` 未动（`MainActivity.kt:487`）
+
+---
+
+## v1.1.7 IDE 告警清理 + 首次真机发版
+
+### 清理的告警（6 处，全过编译与 307 条单测）
+- 删掉 `ParallaxDrawerState.isOpen`：早期手势实现留下的，settle 阈值内联后没人调用；
+- `if (locked == false) break` → `locked != true`：对 nullable Boolean，语义等价（null 都不 break）；
+- `FileCardRow` 删 `textColor` 参数：样式走 CodeBlock 配色，参数从未被用（调用点同步）；
+- `androidx.compose.foundation.layout.PaddingValues` → `PaddingValues`（补 import）；
+- 两处 `"..." + x` → 模板串（`readLongTextFile` 的报错、阅读器的报错）。
+
+### 核对后不修的告警（各一条理由）
+- `:2492 使用析构声明`：`val line = reader.readLine()` 没有任何可解构的东西，改了反而错；
+- `:6387 使用 setter 方法语法`：`cm.primaryClip = ...` 在该 SDK 下是只读属性，
+  上一轮已实测编译报错并回退（见 v1.1.1 章节）；
+- `:2849 BoxWithConstraints scope is not used`：误报 —— 内部 ：2880/:2882 用了 `maxWidth`，
+  scope 是通过接收者隐式使用的，IDE 只看有没有直接引用 scope 类型。
+
+### 首次真机发版（按装包约定）
+- `adb install -r` release 包 Success，versionName `1.1.0+build.2610232301`，覆盖安装保留数据；
+- 启动后进程存活，长文气泡（旧会话 5100 字）渲染正常，Room 历史完整 —— R8 混淆包运行时无崩溃；
+- 截图 `test-screenshots/phone-final.png`。
+
+### 验证结果
+- `compileDebugKotlin` 0 error；`testDebugUnitTest` **307 条 0 失败**；
+- `assembleRelease` ✅ `app-release.apk` = 2,088,155 字节 ≈ **1.99 MB**；
+- `FLUSH_INTERVAL_MS = 50L` 未动（`MainActivity.kt:487`）。

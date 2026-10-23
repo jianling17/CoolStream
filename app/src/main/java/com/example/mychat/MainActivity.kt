@@ -2823,7 +2823,6 @@ internal class ParallaxDrawerState(initialProgress: Float = 0f) {
     var scrimActive by mutableStateOf(initialProgress > 0.001f)
         private set
 
-    val isOpen: Boolean get() = progress > 0.5f
 
     private fun apply(value: Float) {
         val clamped = value.coerceIn(0f, 1f)
@@ -2919,7 +2918,7 @@ internal fun ParallaxNavigationDrawer(
                                 if (abs(accX) > slop || abs(accY) > slop) {
                                     locked = abs(accX) >= abs(accY)
                                     // 判定为纵向：立刻撒手，让聊天列表正常滚动
-                                    if (locked == false) break
+                                    if (locked != true) break
                                 }
                             }
                             if (locked == true) {
@@ -7842,7 +7841,6 @@ internal fun fileCardsOf(raw: String): List<FileCard> {
 @Composable
 private fun FileCardRow(
     card: FileCard,
-    textColor: Color,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -7894,7 +7892,7 @@ private fun FileCardList(cards: List<FileCard>, textColor: Color, modifier: Modi
     var readerPath by remember { mutableStateOf<String?>(null) }
     Column(modifier) {
         cards.forEach { card ->
-            FileCardRow(card = card, textColor = textColor, onClick = { readerPath = card.path })
+            FileCardRow(card = card, onClick = { readerPath = card.path })
             Spacer(Modifier.height(6.dp))
         }
     }
@@ -7916,7 +7914,7 @@ internal const val LONG_TEXT_READ_LIMIT = 2_000_000
  */
 internal fun readLongTextFile(path: String): String {
     val f = File(path)
-    if (!f.isFile) throw IllegalStateException("文件不存在或不是普通文件：" + path)
+    if (!f.isFile) throw IllegalStateException("文件不存在或不是普通文件：$path")
     val total = f.length()
     if (total <= LONG_TEXT_READ_LIMIT) return f.readText()
     val buf = ByteArray(LONG_TEXT_READ_LIMIT)
@@ -8008,7 +8006,7 @@ private fun LongTextReaderDialog(path: String, onClose: () -> Unit) {
                 val text = content
                 when {
                     err != null -> Text(
-                        text = "打不开这个文件：" + err,
+                        text = "打不开这个文件：$err",
                         color = cs.onBackground,
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.bodySmall,
@@ -8028,7 +8026,7 @@ private fun LongTextReaderDialog(path: String, onClose: () -> Unit) {
                         val lines = remember(text) { text.split('\n') }
                         LazyColumn(
                             modifier = Modifier.fillMaxSize(),
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            contentPadding = PaddingValues(
                                 start = 16.dp, end = 16.dp, top = 12.dp, bottom = 32.dp
                             )
                         ) {
