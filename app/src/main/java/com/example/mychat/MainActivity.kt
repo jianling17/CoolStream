@@ -3782,6 +3782,130 @@ private fun formatTokens(n: Int): String = when {
     else -> n.toString()
 }
 
+// ============================================================
+// 4.x Token 用量的跨轮累计与持久化（v1.1 阶段三任务二）
+//
+//   单轮的 usage 在 ChatScreen 里已经有 lastUsage 显示了，
+//   但 App 一重启就归零。这里再加一层「账本」：
+//     · 每轮对话结束（onUsage 回调）累加一次
+//     · 按「今天」和「历史总计」两个口径分别累计
+//     · 写 SharedPreferences（coolstream_prefs），读写全在 Dispatchers.IO
+//
+//   ★ 为什么费用存总额、不存单价再重算：isPeakHour() 随时钟变化，
+//     重算会把昨天的谷价轮次按今天的峰价改写，账就错了。
+//     所以每轮只把「当轮实付金额」累加进 ledger，之后永不重算。
+//
+//   ★ 为什么放单例而不是 ViewModel：账本是 App 级的，
+//     跨会话、跨 ViewModel 生命周期都该存在；ViewModel 只是「今天」
+//     这部分的一个观察窗口。
+// ============================================================
+
+/** 账本快照：今天 + 累计 两个口径 */
+data class UsageLedgerSnapshot(
+    val todayPromptTokens: Int = 0,
+    val todayCacheHitTokens: Int = 0,
+    val todayCompletionTokens: Int = 0,
+    val todayCny: Double = 0.0,
+    val totalPromptTokens: Int = 0,
+    val totalCacheHitTokens: Int = 0,
+    val totalCompletionTokens: Int = 0,
+    val totalCny: Double = 0.0
+) {
+    val todayTotalTokens: Int get() = todayPromptTokens + todayCompletionTokens
+    val totalTotalTokens: Int get() = totalPromptTokens + totalCompletionTokens
+}
+
+/** 账本日期键：yyyy-MM-dd。SimpleDateFormat 非线程安全，每次调用新建一个小对象（IO 协程里跑，无性能压力） */
+private fun usageDayFormat(): java.text.SimpleDateFormat =
+    java.text.SimpleDateFormat("yyyy-MM-dd", Locale.US)
+
+object UsageLedger {
+    private const val KEY_DAY = "usage_day"                  // 今天是几号（yyyy-MM-dd）
+    private const val KEY_DAY_PREFIX = "usage_day_"          // 前缀 + 字段名 = 今天的 key
+    private const val KEY_TOTAL_PREFIX = "usage_total_"      // 前缀 + 字段名 = 累计的 key
+
+    /** 跨轮累计的「今天」用量（主线程写、Compose 观察），落盘在 IO 协程里做 */
+    val today = mutableStateOf(UsageLedgerSnapshot())
+
+    /** 把一轮的 usage 累进账本并异步落盘。onUsage 在主线程回调，绝不阻塞流式渲染。 */
+    fun record(context: Context, u: UsageStats) {
+        val spend = costCny(u)
+        // 主线程只改内存状态（一次快照 copy，微秒级），IO 全部丢给协程
+        val cur = today.value
+        today.value = cur.copy(
+            todayPromptTokens = cur.todayPromptTokens + u.promptTokens,
+            todayCacheHitTokens = cur.todayCacheHitTokens + u.cacheHitTokens,
+            todayCompletionTokens = cur.todayCompletionTokens + u.completionTokens,
+            todayCny = cur.todayCny + spend,
+            totalPromptTokens = cur.totalPromptTokens + u.promptTokens,
+            totalCacheHitTokens = cur.totalCacheHitTokens + u.cacheHitTokens,
+            totalCompletionTokens = cur.totalCompletionTokens + u.completionTokens,
+            totalCny = cur.totalCny + spend
+        )
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val day = usageDayFormat().format(Date())   // yyyy-MM-dd
+                // 跨天了：旧的一天数据不删（总量已含），只把「今天」口径清零重开
+                val sameDay = prefs.getString(KEY_DAY, null) == day
+                prefs.edit {
+                    putString(KEY_DAY, day)
+                    fun bumpInt(key: String, delta: Int) {
+                        val v = if (sameDay) prefs.getInt(key, 0) else 0
+                        putInt(key, v + delta)
+                    }
+                    bumpInt(KEY_DAY_PREFIX + "prompt", u.promptTokens)
+                    bumpInt(KEY_DAY_PREFIX + "hit", u.cacheHitTokens)
+                    bumpInt(KEY_DAY_PREFIX + "completion", u.completionTokens)
+                    val daySpend = if (sameDay) java.lang.Double.longBitsToDouble(
+                        prefs.getLong(KEY_DAY_PREFIX + "cny", 0L)) else 0.0
+                    putLong(KEY_DAY_PREFIX + "cny",
+                        java.lang.Double.doubleToRawLongBits(daySpend + spend))
+                    fun bumpTotal(key: String, delta: Int) =
+                        putInt(key, prefs.getInt(key, 0) + delta)
+                    bumpTotal(KEY_TOTAL_PREFIX + "prompt", u.promptTokens)
+                    bumpTotal(KEY_TOTAL_PREFIX + "hit", u.cacheHitTokens)
+                    bumpTotal(KEY_TOTAL_PREFIX + "completion", u.completionTokens)
+                    val totalSpend = java.lang.Double.longBitsToDouble(
+                        prefs.getLong(KEY_TOTAL_PREFIX + "cny", 0L))
+                    putLong(KEY_TOTAL_PREFIX + "cny",
+                        java.lang.Double.doubleToRawLongBits(totalSpend + spend))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "usage 落盘失败", e)
+            }
+        }
+    }
+
+    /** App 启动 / ViewModel 初始化时读一次账本（IO 协程） */
+    fun load(context: Context) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val day = usageDayFormat().format(Date())
+                val sameDay = prefs.getString(KEY_DAY, null) == day
+                fun dayInt(key: String) = if (sameDay) prefs.getInt(KEY_DAY_PREFIX + key, 0) else 0
+                fun dayCny() = if (sameDay) java.lang.Double.longBitsToDouble(
+                    prefs.getLong(KEY_DAY_PREFIX + "cny", 0L)) else 0.0
+                val snap = UsageLedgerSnapshot(
+                    todayPromptTokens = dayInt("prompt"),
+                    todayCacheHitTokens = dayInt("hit"),
+                    todayCompletionTokens = dayInt("completion"),
+                    todayCny = dayCny(),
+                    totalPromptTokens = prefs.getInt(KEY_TOTAL_PREFIX + "prompt", 0),
+                    totalCacheHitTokens = prefs.getInt(KEY_TOTAL_PREFIX + "hit", 0),
+                    totalCompletionTokens = prefs.getInt(KEY_TOTAL_PREFIX + "completion", 0),
+                    totalCny = java.lang.Double.longBitsToDouble(
+                        prefs.getLong(KEY_TOTAL_PREFIX + "cny", 0L))
+                )
+                withContext(Dispatchers.Main) { today.value = snap }
+            } catch (e: Exception) {
+                Log.e(TAG, "usage 账本读取失败", e)
+            }
+        }
+    }
+}
+
 /** 从任意一条 SSE 数据里尝试抠出 usage（DeepSeek 通常放在最后一条，且那一条 choices 为空） */
 private fun parseUsage(json: String): UsageStats? {
     return try {
@@ -4325,6 +4449,11 @@ data class ChatSession(
 private val ASK_USER_CANCELLED = String(charArrayOf('@'))
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
+
+    init {
+        // Token 账本：启动时把今天 + 累计的用量从 SharedPreferences 读回来（IO 协程）
+        UsageLedger.load(app)
+    }
 
     // ★ 这里刻意不放 dao：
     //   ChatScreen 里已经有 val dao = remember { AppDatabase.get(context).chatDao() }，
@@ -5351,8 +5480,13 @@ fun ChatScreen() {
                                     }
                                 },
 
-                                // token 用量回来了：更新 InfoBar
-                                onUsage = { u -> lastUsage = u },
+                                // token 用量回来了：更新 InfoBar + 累进跨轮账本
+                                //（record 主线程只做一次快照 copy，落盘全在 Dispatchers.IO，
+                                //  绝不碰 50ms 流式批处理路径）
+                                onUsage = { u ->
+                                    lastUsage = u
+                                    UsageLedger.record(context, u)
+                                },
 
                                 // ask_user：把问题交给 ChatScreen 的桥接实现
                                 onAskUser = { q -> vm.askUserAndWait(q) },
@@ -5654,6 +5788,37 @@ fun Sidebar(
                         )
                     }
                 }
+            }
+
+            // ---------- Token / 花费面板（v1.1 阶段三任务二） ----------
+            //
+            //   极简两行等宽字：今天 + 累计。数据源是 UsageLedger.today
+            //   （mutableStateOf，record() 一改这里就重组，无需手动刷新）。
+            //   布局只是两个 Text，不参与流式渲染热路径，不碰 50ms 批处理。
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, end = 12.dp, bottom = 4.dp)
+            ) {
+                val ledger = UsageLedger.today.value
+                Text(
+                    text = "TODAY  " + formatTokens(ledger.todayTotalTokens) +
+                        " / " + formatCny(ledger.todayCny),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "TOTAL " + formatTokens(ledger.totalTotalTokens) +
+                        " / " + formatCny(ledger.totalCny),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             // ---------- 左下角：设置（透明底 + 齿轮 + 文字） ----------
