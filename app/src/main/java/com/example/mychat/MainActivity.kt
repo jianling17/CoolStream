@@ -37,6 +37,19 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import kotlin.math.abs
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -163,16 +176,13 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.material3.rememberDrawerState
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextAlign
@@ -2740,7 +2750,226 @@ private fun glassSheet(): Color = if (LocalIsDark.current) GlassSheetDark else G
 private fun glassEdge(): Color = if (LocalIsDark.current) GlassEdgeDark else GlassEdgeLight
 
 @Composable
-private fun glassTint(): Color = if (LocalIsDark.current) GlassTintDark else GlassTintLight
+private fun glassTint(): Color = if (LocalIsDark.current) GlassTintDark else GlassTintLight// ============================================================
+// 5.01 视差叠搭侧边栏（Parallax Stacked Drawer）
+//
+// 为什么自己写、不用 ModalNavigationDrawer：
+//   ① 它的遮罩颜色、抽屉宽度、主界面变换全都不暴露，做不出「主界面右移 + 等比缩放 +
+//      圆角 + 阴影」的叠搭观感；
+//   ② 滑动动画是 Material 内部实现，无法指定 spring(dampingRatio, stiffness)。
+//
+// 性能铁律（保护 50ms 流式批处理）：
+//   所有随开合比例变化的量（translationX / scale / 圆角 / 阴影 / 遮罩透明度）
+//   都只在 graphicsLayer 的绘制阶段读取 progress。
+//   graphicsLayer 的 lambda 属于「绘制阶段读状态」，读 progress 不会触发重组，
+//   所以拖动时每帧只有重绘、没有一次 recomposition，聊天区的 50ms 批处理不受影响。
+//
+// 视差从哪来：
+//   抽屉宽度 = 屏宽 * 78%；主内容右移距离 = 抽屉宽度（正好让出左侧，边缘对齐）；
+//   抽屉自身的行程再乘 1.35 —— 同样的时间里走更远的路，看起来就比主内容快。
+//   多走的那一段在屏幕外，观众看不见，只在起手瞬间体现出速度差。
+// ============================================================
+
+private const val DRAWER_WIDTH_FRACTION = 0.78f      // 侧边栏宽度 = 屏宽 * 78%
+private const val DRAWER_SLIDE_EXTRA = 1.35f         // 抽屉行程放大系数（制造视差）
+private const val DRAWER_CONTENT_MIN_SCALE = 0.92f   // 主内容最小缩放
+private const val DRAWER_SCRIM_MAX_ALPHA = 0.30f     // 遮罩最大不透明度
+private const val DRAWER_EDGE_FRACTION = 0.16f       // 关闭态下可从左边缘起手的宽度占比
+
+private val DRAWER_CORNER = 22.dp                    // 主内容最大圆角
+private val DRAWER_SHADOW = 24.dp                    // 主内容最大阴影
+
+internal class ParallaxDrawerState(initialProgress: Float = 0f) {
+
+    var progress by mutableFloatStateOf(initialProgress)
+        private set
+
+    // 只在有/无边界翻转的布尔量：composition 读它决定是否插入遮罩层。
+    // 拖动过程中它不变，所以一个手势最多只引起两次重组（起手插入、收尾移除）。
+    var scrimActive by mutableStateOf(initialProgress > 0.001f)
+        private set
+
+    val isOpen: Boolean get() = progress > 0.5f
+
+    private fun apply(value: Float) {
+        val clamped = value.coerceIn(0f, 1f)
+        progress = clamped
+        val active = clamped > 0.001f
+        if (active != scrimActive) scrimActive = active
+    }
+
+    private suspend fun animateTo(target: Float) {
+        animate(
+            initialValue = progress,
+            targetValue = target,
+            animationSpec = spring(dampingRatio = 0.8f, stiffness = 400f),
+        ) { value, _ -> apply(value) }
+    }
+
+    suspend fun open() = animateTo(1f)
+
+    suspend fun close() = animateTo(0f)
+
+    fun dragTo(value: Float) = apply(value)
+
+    // 松手：快甩直接判给终点，慢拖按 50% 就近吸附。
+    suspend fun settle(velocityPxPerSec: Float) {
+        val target = when {
+            velocityPxPerSec > 900f -> 1f
+            velocityPxPerSec < -900f -> 0f
+            progress > 0.5f -> 1f
+            else -> 0f
+        }
+        animateTo(target)
+    }
+}
+
+@Composable
+internal fun rememberParallaxDrawerState(): ParallaxDrawerState = remember { ParallaxDrawerState() }
+
+@Composable
+internal fun ParallaxNavigationDrawer(
+    drawerState: ParallaxDrawerState,
+    drawerWidthFraction: Float = DRAWER_WIDTH_FRACTION,
+    drawerContent: @Composable () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+
+    // 容器必须先铺一层主题底色：主内容缩放后会露出上下两条边，
+    // 没有底色就会透出窗口的白色 windowBackground（深色主题下非常刺眼）。
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        val drawerWidth = maxWidth * drawerWidthFraction
+        val drawerWidthPx = with(LocalDensity.current) { drawerWidth.toPx() }
+        val edgePx = with(LocalDensity.current) { (maxWidth * DRAWER_EDGE_FRACTION).toPx() }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                // Initial pass：在手势到达任何子组件之前先看一遍。
+                // 只有判定为横向拖动时才 consume，纵向滚动照旧交给聊天列表。
+                .pointerInput(drawerWidthPx, edgePx) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(
+                            requireUnconsumed = false,
+                            pass = PointerEventPass.Initial,
+                        )
+                        val startProgress = drawerState.progress
+                        val fromEdge = down.position.x <= edgePx
+                        // 关着的时候只有从左边缘起手才算拉抽屉，
+                        // 否则聊天区里的横向滑动会被误判成手势。
+                        if (startProgress <= 0.001f && !fromEdge) return@awaitEachGesture
+
+                        val tracker = VelocityTracker()
+                        tracker.addPosition(down.uptimeMillis, down.position)
+                        var last = down.position
+                        var accX = 0f
+                        var accY = 0f
+                        var locked: Boolean? = null
+                        val slop = viewConfiguration.touchSlop
+
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) break
+                            accX += change.position.x - last.x
+                            accY += change.position.y - last.y
+                            last = change.position
+                            tracker.addPosition(change.uptimeMillis, change.position)
+
+                            if (locked == null) {
+                                if (abs(accX) > slop || abs(accY) > slop) {
+                                    locked = abs(accX) >= abs(accY)
+                                    // 判定为纵向：立刻撒手，让聊天列表正常滚动
+                                    if (locked == false) break
+                                }
+                            }
+                            if (locked == true) {
+                                change.consume()
+                                drawerState.dragTo(startProgress + accX / drawerWidthPx)
+                            }
+                        }
+
+                        if (locked == true) {
+                            // AwaitPointerEventScope 是 @RestrictsSuspension 的，
+                            // 里面只能 await，不能直接调任意 suspend 函数，所以借外部 scope。
+                            val velocity = tracker.calculateVelocity().x
+                            scope.launch { drawerState.settle(velocity) }
+                        }
+                    }
+                }
+        ) {
+            // ① 主内容（最底层）：右移 + 等比缩放 + 圆角 + 阴影
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        val p = drawerState.progress
+                        translationX = drawerWidthPx * p
+                        val scale = 1f - (1f - DRAWER_CONTENT_MIN_SCALE) * p
+                        scaleX = scale
+                        scaleY = scale
+                        // 以左边缘中点为缩放锚点：卡片右缘继续往右走，像被整体推走
+                        transformOrigin = TransformOrigin(0f, 0.5f)
+                        shape = RoundedCornerShape(DRAWER_CORNER * p)
+                        clip = true
+                        shadowElevation = DRAWER_SHADOW.toPx() * p
+                    }
+            ) {
+                content()
+            }
+
+            // ② 遮罩：单独抽成 composable，让 scrimActive 的读取只重组它自己，
+            //    不会连带重组 content()（聊天区）。
+            ParallaxScrim(drawerState = drawerState) {
+                drawerState.close()
+            }
+
+            // ③ 侧边栏（最上层）：从屏幕外滑入，行程比主内容长 1.35 倍
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .width(drawerWidth)
+                    .graphicsLayer {
+                        translationX = -(1f - drawerState.progress) * drawerWidthPx * DRAWER_SLIDE_EXTRA
+                    }
+            ) {
+                drawerContent()
+            }
+        }
+    }
+}
+
+@Composable
+private fun ParallaxScrim(
+    drawerState: ParallaxDrawerState,
+    onClose: suspend () -> Unit,
+) {
+    // 关闭态直接不插入：否则这层会吃掉聊天区的所有点击。
+    if (!drawerState.scrimActive) return
+    val scope = rememberCoroutineScope()
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            // ⚠️ 不要写成 background(Color.Black) 再挂 graphicsLayer { alpha }：
+            //    modifier 链从左到右、外层先画，background 排在 graphicsLayer 左边
+            //    就等于画在图层外面，alpha 根本不生效 —— 遮罩会变成纯黑不透明，
+            //    把右移后的主内容整块盖死（踩过这个坑）。
+            //    drawBehind 在绘制阶段读 progress，同样不触发重组。
+            .drawBehind {
+                drawRect(Color.Black, alpha = DRAWER_SCRIM_MAX_ALPHA * drawerState.progress)
+            }
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { scope.launch { onClose() } }
+    )
+}
+
 
 
 // ============================================================
@@ -2786,7 +3015,7 @@ data class ChatSession(
 // 5. 聊天主界面（侧边抽屉 + 主内容）
 //
 // 结构：
-//   ModalNavigationDrawer
+//   ParallaxNavigationDrawer（自绘，见 5.01）
 //     ├─ drawerContent → DrawerContent（新建对话 / 会话列表 / 设置）
 //     └─ 主内容 → Scaffold(TopAppBar) + 聊天区 + 输入框
 // ============================================================
@@ -2918,8 +3147,9 @@ fun ChatScreen() {
     var inputText by vm.inputTextState
     var isStreaming by vm.isStreamingState
 
-    // 抽屉开合状态（rememberDrawerState 内部用的就是 rememberSaveable，本身就能扛旋转）
-    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    // 抽屉开合状态：自绘视差抽屉，progress 是 0..1 的开合比例，
+    // 所有随动变换都在 graphicsLayer 里读它，因此拖动时不产生重组。
+    val drawerState = rememberParallaxDrawerState()
 
     // 设置页
     var showSettings by vm.showSettingsState
@@ -3102,11 +3332,8 @@ fun ChatScreen() {
         }
     }
 
-    ModalNavigationDrawer(
+    ParallaxNavigationDrawer(
         drawerState = drawerState,
-        // 遮罩加深：默认 0.32 太浅，侧边栏右侧会透出聊天区的蓝色用户气泡，
-        // 在屏幕右边缘看起来就是一条"蓝色竖条"
-        scrimColor = Color.Black.copy(alpha = 0.6f),
         drawerContent = {
             // ★ 不用 ModalDrawerSheet：
             //   它内部把阴影硬编码成 16dp（DrawerDefaults.ModalDrawerElevation），
@@ -3115,7 +3342,8 @@ fun ChatScreen() {
             Surface(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .width(320.dp),
+                    // 宽度由 ParallaxNavigationDrawer 的 drawerWidthFraction 决定（屏宽 * 78%）
+                    .fillMaxWidth(),
                 color = glassDrawer(),
                 shape = RoundedCornerShape(0.dp),
                 shadowElevation = 0.dp,

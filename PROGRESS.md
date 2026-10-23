@@ -240,3 +240,63 @@ $ADB shell am start -n com.example.mychat/.MainActivity
 - `compileDebugKotlin` ✅ / `assembleRelease` ✅ / `testDebugUnitTest` **269 条 0 失败**
 - ⚠️ **手机（a2c1bf9c）在装包前从 USB 掉线**，`adb devices` 为空，
   所以这一版**尚未在真机上截图确认视觉效果**。手机接回后按「装包约定」直接 `adb install -r` 即可。
+---
+
+## v1.1.2 视差叠搭侧边栏（用户 m01539 下达）
+
+### 为什么自己写，不用 ModalNavigationDrawer
+1. 它的遮罩颜色、抽屉宽度、主界面变换全都不暴露，做不出「主界面右移 + 等比缩放 + 圆角 + 阴影」的叠搭观感；
+2. 滑动动画是 Material 内部实现，无法指定 spring(dampingRatio, stiffness)。
+
+### 落点（全部在 `MainActivity.kt`）
+- `ParallaxDrawerState`：`progress: Float`（0..1，mutableFloatStateOf）、`scrimActive: Boolean`、
+  `suspend open()/close()`（`animate(spring(dampingRatio = 0.8f, stiffness = 400f))`）、`dragTo()`、`suspend settle(velocity)`
+- `rememberParallaxDrawerState()`
+- `ParallaxNavigationDrawer(drawerState, drawerWidthFraction, drawerContent, content)` —— 与 `ModalNavigationDrawer` 同形，
+  所以调用点只改了名字、删了 `scrimColor`
+- `ParallaxScrim(drawerState, onClose)`
+- 常量：`DRAWER_WIDTH_FRACTION = 0.78f`、`DRAWER_SLIDE_EXTRA = 1.35f`、`DRAWER_CONTENT_MIN_SCALE = 0.92f`、
+  `DRAWER_SCRIM_MAX_ALPHA = 0.30f`、`DRAWER_EDGE_FRACTION = 0.16f`、`DRAWER_CORNER = 22.dp`、`DRAWER_SHADOW = 24.dp`
+
+### 性能：为什么不会影响 50ms 流式批处理
+所有随开合比例变化的量（translationX / scale / 圆角 / 阴影 / 遮罩透明度）都只在
+`graphicsLayer { }` 或 `drawBehind { }` 里读 `progress` —— 这是绘制阶段读状态，
+只让图层失效、不触发重组。唯一会被 composition 读的是 `scrimActive`，而它只在 0/1 边界翻转，
+一个手势最多两次重组。`FLUSH_INTERVAL_MS = 50L` 全程未动。
+
+### 踩到的两个坑（都写进代码注释了）
+1. **遮罩必须用 drawBehind，不能 background + graphicsLayer{alpha}**
+   `Modifier.fillMaxSize().background(Color.Black).graphicsLayer { alpha = 0.3f * p }`
+   里 background 排在 graphicsLayer 左边 = 画在图层外面，alpha 根本不生效，遮罩变成纯黑不透明，
+   把右移后的主内容整块盖死（现象：抽屉打开后右侧全黑，只剩状态栏图标）。
+2. **容器必须先铺一层主题底色**
+   主内容缩到 0.92 后上下会露出两条边，没有底色就透出窗口的白色 windowBackground。
+   现在 `BoxWithConstraints` 上挂了 `.background(MaterialTheme.colorScheme.background)`。
+3. 附带：`AwaitPointerEventScope` 是 `@RestrictsSuspension` 的，手势循环里不能直接调
+   `drawerState.settle()`，要用外部 `rememberCoroutineScope().launch`。
+
+### 手势（实测通过，Pixel_9_Pro / API 37）
+| 动作 | 期望 | 结果 |
+| --- | --- | --- |
+| 点遮罩 | 关闭 | ✅ |
+| 从 x=120 左缘滑出 | 打开 | ✅ |
+| 右滑 | 关闭 | ✅ |
+| 屏幕中部横滑（关闭态） | 不误触 | ✅ |
+| 聊天区纵向滑动 | 正常滚动、抽屉不动 | ✅ |
+
+实现要点：外层 `Box` 挂 `pointerInput` + `awaitEachGesture` + `PointerEventPass.Initial`，
+位移超过 `viewConfiguration.touchSlop` 后做轴向锁（`abs(accX) >= abs(accY)` 才算横向），
+只有横向才 `consume()`，纵向直接撒手交还聊天列表；关闭态只有起手点落在左缘 16% 内才接管。
+松手用 `VelocityTracker` 取速度：> 900px/s 判开、< -900px/s 判关，否则按 50% 就近吸附。
+
+### 验证结果
+- `compileDebugKotlin` ✅ 0 warning / `testDebugUnitTest` **269 条 0 失败** / `assembleRelease` ✅
+- release APK **2,071,446 字节 ≈ 1.98 MB**（≤ 3MB）
+- `FLUSH_INTERVAL_MS = 50L`（`MainActivity.kt:453`）未动
+- 截图：`test-screenshots/p11-open.png`（打开态，视差叠搭）、`p01-main.png`（关闭态）
+- 注意：模拟器测试时把 `navigation_mode` 临时改成 0（三键）避开系统返回手势抢触摸，测完已改回 2
+
+### 一个已知取舍
+手势导航下，屏幕最左约 20dp 是系统返回手势区，起手点落在那里时抽屉抢不到触摸。
+这是 Android 的系统级约束（Material 官方抽屉同样如此），不是 bug；从边缘内约 60px 起手即可。
+
