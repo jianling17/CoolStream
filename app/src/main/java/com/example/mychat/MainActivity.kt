@@ -339,6 +339,23 @@ val SYSTEM_PROMPT = """
 """.trim()
 
 /**
+ * 长文落盘死命令（用户 m01829 任务三）。
+ *
+ * 为什么值得单列一条：模型的默认行为是把整篇文章直接吐在对话里，
+ * 三千字以上既烧 completion token，又让气泡变成一个没法读的巨型文本块。
+ * 写进文件 + 只回路径和摘要，对话里干净，正文还能用长文阅读器全屏看。
+ */
+private const val LONG_TEXT_OUTPUT_RULE =
+    "当输出的内容超过 3000 字时，严禁在对话中直接返回全文：必须把完整内容分步写入文件" +
+        "（使用 write_file，长文按章节分多次写，第一次新建、之后用 replace_in_file 或追加写下一段），" +
+        "最后在对话中仅返回文件的绝对路径与 100 字以内的摘要。"
+
+/** 实时信息必须走 web_search（用户 m01829 任务三），禁止用 run_code / run_shell 绕 */
+private const val REALTIME_SEARCH_RULE =
+    "获取实时信息（新闻、当前时间、天气、价格、版本发布等）必须用 web_search，" +
+        "严禁用 run_code 或 run_shell 抓网页来代替，也严禁凭训练记忆编造。"
+
+/**
  * 实际发给模型的系统提示词 = 预设基础提示词 + 当前运行时的约束。
  *
  * 工作区和工具开关都是**运行时**才确定的（用户在设置页里选的），
@@ -363,6 +380,8 @@ private fun systemPromptWithWorkspace(): String {
                     .append("。在代码里调用它们会直接返回 ok=false，不要写进代码，")
                     .append("确实需要就让用户去「设置 → 插件」里打开。")
             }
+            append("\n3. ").append(LONG_TEXT_OUTPUT_RULE)
+            append("\n4. ").append(REALTIME_SEARCH_RULE)
         }
 
         // ---------- 标准：原样保留，一个字符都不改 ----------
@@ -378,7 +397,16 @@ private fun systemPromptWithWorkspace(): String {
                     "不在这份清单里的工具已被用户在设置里关闭，不要调用，也不要假装调用过；" +
                     "如果当前任务确实需要某个被关掉的工具，如实告诉用户去「设置 → 插件」里打开它。"
             }
-            "$SYSTEM_PROMPT\n\n12. $toolLine\n13. $wsLine"
+            // ★ 14 / 15 是用户明确要求的硬约束，别当成建议：
+            //   长文必须落盘（否则几千字糊在气泡里既费 Token 又没法读），
+            //   实时信息必须走 web_search（run_shell 抓网页既慢又容易被拦）。
+            buildString {
+                append(SYSTEM_PROMPT)
+                append("\n\n12. ").append(toolLine)
+                append("\n13. ").append(wsLine)
+                append("\n14. ").append(LONG_TEXT_OUTPUT_RULE)
+                append("\n15. ").append(REALTIME_SEARCH_RULE)
+            }
         }
     }
 }
@@ -6294,6 +6322,17 @@ fun MessageBubble(
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
                     )
                 }
+                // ★ 长文阅读器入口：正文里出现本地文本文件路径就给一张可点卡片。
+                //   用 remember(message.content) 缓存解析结果 —— 流式输出时 content 每帧都变，
+                //   但这个卡片只在整条消息上算，且正则很便宜，不会影响 50ms 批处理。
+                val fileCards = remember(message.content) { fileCardsOf(message.content) }
+                if (fileCards.isNotEmpty()) {
+                    FileCardList(
+                        cards = fileCards,
+                        textColor = textColor,
+                        modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 8.dp)
+                    )
+                }
                 }
             }
 
@@ -7761,6 +7800,255 @@ private fun DocCardRow(card: DocCard, textColor: Color, modifier: Modifier = Mod
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f, fill = false)
         )
+    }
+}
+
+/**
+ * 正文里出现的本地文本文件路径。
+ *
+ * 只认「绝对路径 + 文本类扩展名」：.txt / .md / .log / .csv / .json。
+ * 为什么不认 .kt / .xml / .png：那些是工作区源码或图片，点开塞进阅读器没意义，
+ * 而且代码块里的路径满屏都是，卡片会糊一屏。
+ */
+internal data class FileCard(val path: String, val name: String)
+
+/**
+ * 从一条消息里抽出可以点开的本地文本文件。
+ *
+ * ★ 负向后行断言 `(?<![:/\w])` 是必须的：
+ *   没有它，URL `https://a.com/b.txt` 里的 `/b.txt` 会被当成绝对路径弹卡片。
+ * ★ 同一条消息里重复出现同一路径只留一张卡（模型常常正文一遍、结尾又重复一遍）。
+ */
+private val LOCAL_TEXT_PATH_RE = Regex("""(?<![:/\w])(/(?:[\w.\-]+/)*[\w.\-]+\.(?:txt|md|log|csv|json))""")
+
+internal fun fileCardsOf(raw: String): List<FileCard> {
+    if (raw.isEmpty() || !raw.contains('/')) return emptyList()
+    val seen = HashSet<String>()
+    return LOCAL_TEXT_PATH_RE.findAll(raw)
+        .mapNotNull { m ->
+            val p = m.groupValues[1]
+            // 太短的（/a.txt 这种）基本是噪音，不要
+            if (p.length < 6 || !seen.add(p)) null else FileCard(path = p, name = p.substringAfterLast('/'))
+        }
+        .toList()
+}
+
+/**
+ * 极客风的「📄 文档卡片」。
+ *
+ * 与 DocCardRow 的区别：那个是「已读进来的附件」（不可点），
+ * 这个是「模型写到盘上的产物」（可点开全屏读），所以带边框 + 可点。
+ */
+@Composable
+private fun FileCardRow(
+    card: FileCard,
+    textColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = CodeBlockBackground,
+        shape = RoundedCornerShape(6.dp),
+        border = BorderStroke(1.dp, CodeBlockBorder),
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(text = "📄", style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = card.name,
+                    color = CodeBlockText,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "点击全屏阅读",
+                    color = CodeBlockText.copy(alpha = 0.55f),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 卡片列表 + 阅读器状态。
+ *
+ * 把 readerPath 关在这里而不是提到 ChatBubble 顶层：
+ * 气泡重组很频繁（流式每 50ms 一次），多一个 state 就多一份快照开销；
+ * 只有真有文件卡片时才创建这个 state。
+ */
+@Composable
+private fun FileCardList(cards: List<FileCard>, textColor: Color, modifier: Modifier = Modifier) {
+    var readerPath by remember { mutableStateOf<String?>(null) }
+    Column(modifier) {
+        cards.forEach { card ->
+            FileCardRow(card = card, textColor = textColor, onClick = { readerPath = card.path })
+            Spacer(Modifier.height(6.dp))
+        }
+    }
+    val open = readerPath
+    if (open != null) {
+        LongTextReaderDialog(path = open, onClose = { readerPath = null })
+    }
+}
+
+/** 单次最多读这么多字节进阅读器；再大就不是「长文」而是「误点了一个日志文件」了 */
+internal const val LONG_TEXT_READ_LIMIT = 2_000_000
+
+/**
+ * 读一个本地文本文件给阅读器用。
+ *
+ * ★ 必须能抛异常：调用方在 IO 线程里 runCatching，把 message 直接展示给用户，
+ *   比返回空字符串好得多 —— 用户至少知道是「文件不存在」还是「没权限」。
+ * ★ 超限只读前 2MB：一个 200MB 的日志全读进 String 会直接 OOM。
+ */
+internal fun readLongTextFile(path: String): String {
+    val f = File(path)
+    if (!f.isFile) throw IllegalStateException("文件不存在或不是普通文件：" + path)
+    val total = f.length()
+    if (total <= LONG_TEXT_READ_LIMIT) return f.readText()
+    val buf = ByteArray(LONG_TEXT_READ_LIMIT)
+    var read = 0
+    f.inputStream().use { ins ->
+        while (read < buf.size) {
+            val n = ins.read(buf, read, buf.size - read)
+            if (n <= 0) break
+            read += n
+        }
+    }
+    return String(buf, 0, read, Charsets.UTF_8) +
+        "\n\n…（文件共 " + total + " 字节，这里只显示前 2MB）"
+}
+
+/**
+ * 全屏长文阅读器。
+ *
+ * ★ 用 Dialog + usePlatformDefaultWidth = false 做全屏，而不是 Navigation 或新 Activity：
+ *   阅读器是纯展示，没有任何需要进返回栈的东西，弹层最轻。
+ * ★ LazyColumn 而不是 Column + verticalScroll：三千字以上是几万行文本，
+ *   全量组合会直接卡死（一帧几百 ms），Lazy 只组合可见的十几行。
+ * ★ 读取在 Dispatchers.IO：主线程读 2MB 文件会 ANR。
+ */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun LongTextReaderDialog(path: String, onClose: () -> Unit) {
+    val context = LocalContext.current
+    val cs = MaterialTheme.colorScheme
+    var content by remember(path) { mutableStateOf<String?>(null) }
+    var error by remember(path) { mutableStateOf<String?>(null) }
+    LaunchedEffect(path) {
+        runCatching { withContext(Dispatchers.IO) { readLongTextFile(path) } }
+            .onSuccess { content = it }
+            .onFailure { error = it.message ?: "读取失败" }
+    }
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(modifier = Modifier.fillMaxSize(), color = cs.background) {
+            Column(Modifier.fillMaxSize()) {
+                // 顶部条：文件名 + 字数 + 复制全部 + 关闭
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 8.dp, top = 40.dp, bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = path.substringAfterLast('/'),
+                            color = cs.onBackground,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.titleSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = content?.let { "字数: " + it.length } ?: path,
+                            color = cs.onBackground.copy(alpha = 0.6f),
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    TextButton(onClick = { content?.let { copyToClipboard(context, it) } }) {
+                        Text(
+                            text = "复制全部",
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                    TextButton(onClick = onClose) {
+                        Text(
+                            text = "关闭",
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(1.dp)
+                        .background(CodeBlockBorder)
+                )
+                val err = error
+                val text = content
+                when {
+                    err != null -> Text(
+                        text = "打不开这个文件：" + err,
+                        color = cs.onBackground,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                    text == null -> Text(
+                        text = "读取中…",
+                        color = cs.onBackground.copy(alpha = 0.7f),
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                    else -> {
+                        // split 也算在 remember 里缓存，别每次重组都切一遍 2MB 字符串
+                        val lines = remember(text) { text.split('\n') }
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                start = 16.dp, end = 16.dp, top = 12.dp, bottom = 32.dp
+                            )
+                        ) {
+                            items(lines.size) { i ->
+                                Text(
+                                    // 空行给个空格，否则 Text("") 高度为 0，段落间距会丢
+                                    text = lines[i].ifEmpty { " " },
+                                    color = cs.onBackground,
+                                    fontFamily = FontFamily.Monospace,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.combinedClickable(
+                                        onClick = {},
+                                        onLongClick = { copyToClipboard(context, text) }
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

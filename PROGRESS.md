@@ -378,3 +378,57 @@ $ADB shell am start -n com.example.mychat/.MainActivity
 - `compileDebugKotlin` ✅ 0 error / 0 warning
 - `testDebugUnitTest` **294 条 0 失败**（269 旧 + 25 新）
 - `FLUSH_INTERVAL_MS = 50L` 未动
+
+---
+
+## v1.1.5 Prompt 长文落盘约束 + 长文阅读器
+
+用户任务：模型输出超长内容时不要糊在对话里，改为写文件 + 只回路径；
+对话里出现本地文本路径时渲染可点的「📄 文档卡片」，点开全屏读。
+
+### 1) System Prompt 两条死命令（`MainActivity.kt`）
+新增两个常量，STANDARD 与 PTC 两种预设都注入：
+- `LONG_TEXT_OUTPUT_RULE`：超过 3000 字必须用 `write_file` 分步写文件（首段新建、之后续写），
+  对话里**只**返回文件绝对路径 + 100 字以内摘要，严禁直接输出全文。
+- `REALTIME_SEARCH_RULE`：实时信息（新闻 / 时间 / 天气 / 价格 / 版本发布）必须走 `web_search`，
+  严禁用 `run_code` / `run_shell` 抓网页代替，也严禁凭记忆编造。
+
+落点：STANDARD 分支从 `"$SYSTEM_PROMPT\n\n12. ...\n13. ..."` 改成 `buildString`，
+追加 `14.` / `15.`；PTC 分支的 `补充约束` 追加 `3.` / `4.`。
+为什么两条都注入而不是只给 STANDARD：PTC 走沙箱，一样会把长文吐进对话、一样爱用 run_shell 抓网页。
+
+### 2) 文档卡片 + 全屏阅读器（`MainActivity.kt`）
+| 新增 | 作用 |
+| --- | --- |
+| `internal data class FileCard(path, name)` | 一张卡片的两个字段 |
+| `internal fun fileCardsOf(raw): List<FileCard>` | 从消息正文抽绝对路径 |
+| `private val LOCAL_TEXT_PATH_RE` | `(?<![:/\w])(/(?:[\w.\-]+/)*[\w.\-]+\.(?:txt\|md\|log\|csv\|json))` |
+| `@Composable FileCardRow` | 极客风卡片（CodeBlock 配色 + 边框 + 可点） |
+| `@Composable FileCardList` | 列表 + 阅读器 state（`readerPath`） |
+| `internal const val LONG_TEXT_READ_LIMIT = 2_000_000` | 单次最多读 2MB |
+| `internal fun readLongTextFile(path)` | IO 侧读文件，可抛异常给调用方展示 |
+| `@Composable LongTextReaderDialog` | 全屏 `Dialog` + `LazyColumn` |
+
+**正则为什么要负向后行断言 `(?<![:/\w])`**：没有它，`https://a.com/b.txt` 里的 `/b.txt`
+会被当成绝对路径弹卡片；`notes/a.txt` 这种相对路径也会中招（`/` 前面是字母）。
+**为什么只认 txt/md/log/csv/json**：`.kt` / `.xml` 是工作区源码，代码块里满屏都是，
+全认的话一条消息能弹十几张卡。
+**为什么用 `Dialog(usePlatformDefaultWidth = false)` 而不是新 Activity / 导航**：
+阅读器是纯展示，不需要进返回栈。
+**为什么必须 `LazyColumn`**：三千字以上是几万行，`Column + verticalScroll` 会一次性组合全部子项，
+一帧几百毫秒直接卡死；Lazy 只组合可见的十几行。
+**线程**：`readLongTextFile` 在 `withContext(Dispatchers.IO)` 里跑，主线程读 2MB 会 ANR。
+**状态位置**：`readerPath` 关在 `FileCardList` 内部而不是提到 `ChatBubble` 顶层，
+气泡每 50ms 重组一次，没必要为一个偶发弹层多背一个 state。
+
+### 3) 单测
+新增 `app/src/test/java/com/example/mychat/FileCardTest.kt` 13 条：
+路径识别 10 条（正例 4 / 反例 6：URL、相对路径、源码扩展名、无斜杠、过短、去重）、
+文件读取 3 条（正常 / 不存在抛错 / 目录抛错）。
+
+### 4) 验证结果
+- `compileDebugKotlin` ✅ 0 error / 0 warning
+- `testDebugUnitTest` **307 条 0 失败**（294 旧 + 13 新）
+- `assembleRelease` ✅ `app-release.apk` = 2,088,153 字节 ≈ **1.99 MB**（≤3MB）
+- `FLUSH_INTERVAL_MS = 50L` 未动（现 `MainActivity.kt:487`）
+- `MainActivity.kt` 8372 行
