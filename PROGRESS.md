@@ -432,3 +432,53 @@ $ADB shell am start -n com.example.mychat/.MainActivity
 - `assembleRelease` ✅ `app-release.apk` = 2,088,153 字节 ≈ **1.99 MB**（≤3MB）
 - `FLUSH_INTERVAL_MS = 50L` 未动（现 `MainActivity.kt:487`）
 - `MainActivity.kt` 8372 行
+
+---
+
+## v1.1.6 真机（模拟器）端到端验证 + 长文压测结论
+
+### 端到端跑通的链路
+模拟器 Pixel_9_Pro（API 37，debug 包，保留原有 Room 历史与 API Key）实际驱动：
+1. 让模型 `write_file` 写 `/storage/emulated/0/Documents/CoolStream_Workspace/reader-test.txt`（15 字节）；
+2. 气泡里出现 `📄 reader-test.txt` + 「点击全屏阅读」卡片，**用户气泡与助手气泡各一张**；
+3. 点卡片 → 全屏 `LongTextReaderDialog` 弹出，标题 `reader-test.txt`、`字数: 15`、正文 `HelloCoolStream`，
+   右上「复制全部」「关闭」可用。
+
+**顺带验证的两个边界**：
+- 模型第一次把文件写成**无扩展名**的 `Cool`，卡片**没有**出现 —— 符合设计（只认 txt/md/log/csv/json），
+  证明不是「见到路径就弹卡」。
+- 越界写入时工具失败卡片（`执行失败: write_file`）正常渲染，安全沙箱拦截生效，
+  且回复里出现的 `/Documents/Cool` 这类非文本扩展名路径没有误生成卡片。
+
+### 长文压测（5000 行 / 325,000 字 / 325 KB）
+`adb push` 一个 5000 行文件后让模型 `read_file` 读它，回复里带绝对路径 → 卡片 → 阅读器。
+结果：内容完整显示（`字数: 325000`），连续 6 次快速 fling 无崩溃、无 ANR，滚动位置正常推进（第 1 行 → 第 78 行）。
+
+### 帧率结论（重要，别误读）
+| 场景 | 总帧 | 掉帧率 | 中位帧时 | 90 分位 |
+| --- | --- | --- | --- | --- |
+| 主界面聊天滚动（基线） | 98 | 63.27% | 48ms | 81ms |
+| 阅读器滚动（优化前） | 31 | 96.77% | 65ms | 125ms |
+| 阅读器滚动（优化后） | 78 | 92.31% | 73ms | 150ms |
+
+**这台模拟器是 `-gpu swiftshader_indirect` 纯软件渲染**（`99th gpu percentile: 4950ms` 就是软件光栅的铁证），
+连主界面聊天滚动都只有 48ms 中位帧时 —— 所以这些绝对数字**不能**用来判断真机 60 帧，
+只能横向比：阅读器约为主界面基线的 1.35~1.5 倍，符合「满屏密排等宽字比聊天气泡更重」的预期。
+真机预计落在 16~25ms 区间，快速 fling 时可能短暂低于 60 帧，但不会卡死。
+
+**做过的优化（并诚实记录：没测出收益）**：
+原来每一行 `Text` 都挂 `combinedClickable`，可见的二十几行就是二十几个 InteractionSource。
+但长按复制的是**全文**、与按在哪一行无关 —— 这个交互本身就不自洽。
+已改为：行不挂手势，复制统一走顶部「复制全部」按钮（同时去掉 `@OptIn(ExperimentalFoundationApi)`）。
+复测中位帧时 65ms → 73ms（在噪声范围内，无实质收益），保留改动是因为它更简单、语义更清楚，不是为了性能。
+
+### 已有的性能护栏（为什么不会 OOM / 不会卡死）
+- `LONG_TEXT_READ_LIMIT = 2_000_000`：单次最多读 2MB，超了只读前 2MB 并标注总字节数；
+- `LazyColumn` 只组合可见的十几行，不用 `Column + verticalScroll`；
+- 切行结果用 `remember(text)` 缓存，不随每次重组重切 2MB 字符串；
+- 读盘在 `withContext(Dispatchers.IO)`，主线程零 IO。
+
+### 验证结果
+- `testDebugUnitTest` **307 条 0 失败**（269 基线 + 25 表格 + 13 文件卡片）
+- `assembleRelease` ✅ `app-release.apk` = 2,088,151 字节 ≈ **1.99 MB**（放宽后的 3MB 限制内，余量约 1MB）
+- `FLUSH_INTERVAL_MS = 50L` 未动（`MainActivity.kt:487`）

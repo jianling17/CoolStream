@@ -7941,7 +7941,6 @@ internal fun readLongTextFile(path: String): String {
  *   全量组合会直接卡死（一帧几百 ms），Lazy 只组合可见的十几行。
  * ★ 读取在 Dispatchers.IO：主线程读 2MB 文件会 ANR。
  */
-@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun LongTextReaderDialog(path: String, onClose: () -> Unit) {
     val context = LocalContext.current
@@ -8024,6 +8023,8 @@ private fun LongTextReaderDialog(path: String, onClose: () -> Unit) {
                     )
                     else -> {
                         // split 也算在 remember 里缓存，别每次重组都切一遍 2MB 字符串
+                        // 每行都不挂手势：复制的是全文，挂上去只会给可见的二十几行
+                        // 各建一个 InteractionSource，白花重组与绘制开销。复制走顶部按钮。
                         val lines = remember(text) { text.split('\n') }
                         LazyColumn(
                             modifier = Modifier.fillMaxSize(),
@@ -8037,11 +8038,7 @@ private fun LongTextReaderDialog(path: String, onClose: () -> Unit) {
                                     text = lines[i].ifEmpty { " " },
                                     color = cs.onBackground,
                                     fontFamily = FontFamily.Monospace,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    modifier = Modifier.combinedClickable(
-                                        onClick = {},
-                                        onLongClick = { copyToClipboard(context, text) }
-                                    )
+                                    style = MaterialTheme.typography.bodySmall
                                 )
                             }
                         }
