@@ -7221,7 +7221,7 @@ private fun contentForApi(msg: ChatMessage): Any {
 
     // ★ 文档上下文：只剥两行哨兵，正文原样发给模型。
     //   历史消息重发时靠这条把文档内容带回去，不会出现「翻回去问，模型说不认识那份文档」。
-    val textOnly = ATTACH_MARK_RE.replace(stripDocBlocks(msg.content), "").trim()
+    val textOnly = ATTACH_MARK_RE.replace(unwrapDocBlocks(msg.content), "").trim()
     val images = matches.filter { it.groupValues[1] == "image" }.map { it.groupValues[2] }
     // doc 的正文已经在 textOnly 里了，这里不能再让它走 read_file 那一套，
     // 否则模型会为了「读一个已经读过的文件」白跑一轮工具。
@@ -7306,6 +7306,23 @@ internal fun stripDocBlocks(raw: String): String {
         i = e + DOC_END.length
     }
     return sb.toString()
+}
+
+/**
+ * 只剥哨兵、保留正文 —— 发给模型时用这个。
+ *
+ * ★ 和 stripDocBlocks 的唯一区别就是「正文留不留」：
+ *   · stripDocBlocks 给界面用，begin…end 整段删掉，气泡里只留问题本身；
+ *   · 这个给 API 用，只删掉 <<DOC:begin|名字|字数>> 和 <<DOC:end>> 两行标记，
+ *     中间的文档正文原样留下。
+ *
+ * ★ 为什么必须分成两个函数：曾经 contentForApi 复用了 stripDocBlocks，
+ *   结果正文被连锅端，模型收到的问题前面什么都没有，只能回一句
+ *   「我没有这份文档的上下文」。哨兵是给界面看的，不是给模型看的。
+ */
+internal fun unwrapDocBlocks(raw: String): String {
+    if (!raw.contains("<<DOC:")) return raw
+    return raw.replace(DOC_BEGIN_RE, "").replace(DOC_END, "")
 }
 
 /** 气泡里那张「📄 已读取文档」卡片需要的信息 */

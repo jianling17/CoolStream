@@ -130,4 +130,60 @@ class DocSentinelTest {
         val cards = docCardsOf(block("big.docx", 10000, "x"))
         assertEquals(10000, cards[0].charCount)
     }
+
+    // ==================== unwrapDocBlocks（发给模型的路径） ====================
+
+    @Test
+    fun unwrap_noSentinel_identity() {
+        assertEquals("你好", unwrapDocBlocks("你好"))
+    }
+
+    @Test
+    fun unwrap_bodyKept_markersGone() {
+        val out = unwrapDocBlocks(block("a.docx", 4, "正文正文"))
+        assertTrue(out.contains("正文正文"))
+        assertTrue(!out.contains("<<DOC:begin"))
+        assertTrue(!out.contains(DOC_END))
+    }
+
+    @Test
+    fun unwrap_fullPrompt_keepsQuestionAndBody() {
+        val prompt = block("a.docx", 4, "正文正文") + NL + "问题：结论是什么"
+        val out = unwrapDocBlocks(prompt)
+        assertTrue(out.contains("正文正文"))
+        assertTrue(out.contains("问题：结论是什么"))
+        assertTrue(!out.contains("<<DOC:"))
+    }
+
+    @Test
+    fun unwrap_twoBlocks_bothBodiesKept() {
+        val raw = block("a.docx", 2, "甲甲") + NL + block("b.xlsx", 2, "乙乙")
+        val out = unwrapDocBlocks(raw)
+        assertTrue(out.contains("甲甲"))
+        assertTrue(out.contains("乙乙"))
+        assertTrue(!out.contains("<<DOC:"))
+    }
+
+    @Test
+    fun unwrap_unclosedBlock_bodyKept() {
+        // 发给模型时不能像界面那样把余下全丢：模型宁可多读也不能读不到
+        val raw = "<<DOC:begin|a.docx|4>>" + NL + "正文正文"
+        val out = unwrapDocBlocks(raw)
+        assertTrue(out.contains("正文正文"))
+        assertTrue(!out.contains("<<DOC:begin"))
+    }
+
+    @Test
+    fun unwrap_bodyContainingAngleBrackets_kept() {
+        val out = unwrapDocBlocks(block("a.docx", 6, "a >> b << c"))
+        assertTrue(out.contains("a >> b << c"))
+    }
+
+    @Test
+    fun unwrap_contrastWithStrip_stripDropsBody() {
+        // 这条锁住两个函数的分工：界面丢正文，API 留正文
+        val raw = block("a.docx", 4, "正文正文")
+        assertEquals("", stripDocBlocks(raw))
+        assertTrue(unwrapDocBlocks(raw).contains("正文正文"))
+    }
 }

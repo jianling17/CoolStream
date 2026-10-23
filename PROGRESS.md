@@ -24,7 +24,7 @@
 | 一 | JVM 单测扩到 200+ 并 commit | ✅ 完成（b821ef5，249 条） |
 | 二 | 抽出 `ToolExecutor.kt` 降低 MainActivity 体量 | ✅ 完成（68fda9f） |
 | 三 | 超长工具结果落盘 `.coolstream/temp/` | ✅ 完成（257 条全绿） |
-| 四 | 模拟器 Pixel_9_Pro 视觉验证 + 截图存 `test-screenshots/` | **下一步** |
+| 四 | 模拟器 Pixel_9_Pro 视觉验证 + 截图存 `test-screenshots/` | ✅ 完成（含 1 个真 bug 修复，269 条全绿） |
 
 ---
 
@@ -127,13 +127,51 @@ return if (result.ok) result.copy(output = persistOversizeToolOutput(name, resul
 
 ---
 
-## 阶段四：模拟器视觉验证（下一步）
+## 阶段四 ✅（commit c11ff15，视觉验证 + 修掉一个真 bug）
 
-1. 启动 AVD `Pixel_9_Pro`（`emulator.exe` 在 `/c/Users/20732/AppData/Local/Android/Sdk/emulator/`）
-2. 装 debug APK（`adb` 在 `platform-tools`，**不在 PATH**，用绝对路径）
-3. 走一遍：选文档 → 发送 → 看「📄 已读取文档」卡片 → 看工具卡片
-4. 截图存 `test-screenshots/`
-5. 顺带核验 release APK 体积（debug 包 12 MB 含调试符号，**不作为 3MB 判据**）
+### 发现并修复的真 bug：文档正文从来没到过模型
+现象：选中 `.docx` 发送后，气泡卡片「📄 已读取文档」正常，但模型回
+「I don't have any context for that question」。
+
+根因：`contentForApi()` 用 `stripDocBlocks()` 构造发给模型的内容，而 `stripDocBlocks`
+是**给界面用的**——它把 `<<DOC:begin|…>>` 到 `<<DOC:end>>` 整段（含正文）全删。
+于是 Prompt 里只剩「问题：xxx」，一万字正文一句没发出去。
+
+修法：新增 `internal fun unwrapDocBlocks(raw: String)`，只删两行哨兵标记、正文原样保留；
+`contentForApi` 改用它，`displayContent`（界面）继续用 `stripDocBlocks`。
+两个函数的分工用一条单测锁死：`unwrap_contrastWithStrip_stripDropsBody`。
+
+### 验证结果（Pixel_9_Pro / API 37，截图在 `test-screenshots/`）
+| 项 | 结果 |
+|---|---|
+| 主界面 / 附件面板 / 📄 Upload document 入口 | ✅ 渲染正常（06/08-sheet.png） |
+| SAF 文件选择器拉起 | ✅ `documentsui/.picker.PickActivity`（09/24-picker3.png） |
+| docx 解析 → chip → 气泡卡片 → Prompt → 回答 | ✅ 答出「建议下季度加大华东区域的渠道投入」并复述 520/310/450/1280 万（19-doc-answer.png） |
+| xlsx 解析 → 同上 | ✅ 答出「表格里华东的销售额是 520」（26-xlsx-answer.png） |
+| 残缺 xlsx（缺 sheet1.xml） | ✅ 不崩溃，弹「识别为 Excel 工作簿，但没能从中提取到文字内容（工作表内容（xl/worksheets/sheet1.xml））」 |
+| release APK 体积 | ✅ **2,080,742 字节 ≈ 1.98 MB**（≤ 3MB） |
+| 50ms 防抖 `FLUSH_INTERVAL_MS = 50L` | ✅ 未改动 |
+
+### 模拟器操作备忘（踩过的坑）
+- 无窗口软件渲染要加 `-no-window -gpu swiftshader_indirect -no-snapshot-save`；
+  SystemUI 会反复 ANR 弹「System UI isn't responding」，用
+  `adb shell settings put global hide_error_dialogs 1` 一次性压掉。
+- 存储权限：`adb shell appops set com.example.mychat MANAGE_EXTERNAL_STORAGE allow`，
+  否则 logcat 报「没有存储权限，跳过默认工作区创建」。
+- **MSYS 会把 `/sdcard/...` 当成 Windows 路径改写**，`adb push` 必须写成 `//sdcard/...`，
+  否则报 `remote secure_mkdirs() failed`。
+- 给 Windows 版 python 传路径不要用 `/c/Users/...`，会被解释成 `C:\c\Users\...`，
+  文件悄悄写到别处；一律用 `r"C:\\Users\\..."`。
+- SAF 列表有缓存：推完文件要退出选择器重进（下拉刷新没用）。
+- 底部面板动画未结束时点击会**穿透到输入框**（把键盘/表情面板弹出来）；
+  每次点完先等 3~5s 再截图确认坐标。
+- 坐标换算：截图 1280x2856，预览 717x1600 时缩放比 ≈ 1.785。
+
+### 已知设计取舍（不是 bug，未改）
+`AttachmentSheet` 用 `glassFill()`（`Color.kt:50` `GlassFillDark = 0xFF1C1C1E, alpha 0.80`），
+这是刻意的玻璃拟态——注释明确写了「不用 `Modifier.blur()`，半透明底 + 高光边框，开销几乎为零」。
+副作用是模态面板压在长聊天文本上时字压字、可读性差。要改只动 `AttachmentSheet` 的
+`containerColor`（换成不透明 `surface` 或把 alpha 提到 0.95），**不要动全局 `glassFill`**。
 
 ---
 
