@@ -334,3 +334,47 @@ $ADB shell am start -n com.example.mychat/.MainActivity
 
 ### 未做（等真机）
 菜单展开/收起的视觉与点击热区尚未在真机或模拟器上截图确认；下一轮真机装包时一并核。
+
+---
+
+## v1.1.4 Markdown 表格渲染（用户 m01829 任务二）
+
+### 识别规则
+判据是**两条同时成立**，避免正文里偶尔出现的竖线被误判：
+1. 本行 `trim()` 后以 `|` 开头且以 `|` 结尾（长度 ≥ 3）；
+2. 下一行是分割线 —— 每格只由 `-` 和可选的 `:` 组成，且至少一个 `-`（`|:--|--:|` 这种）。
+
+命中后把后续所有「仍是表格行」的行一次性吃掉（`skipUntil` 跳过），中途遇到非表格行立即停。
+单元格内容里的 `\|` 当转义，解析成字面量竖线。
+
+### 列对齐
+模型给的表格经常列数不一致。解析阶段就统一：`cols = max(表头列数, 所有数据行列数)`，
+短行右侧补空串（`padCells`），这样渲染时不会错位。
+
+### 渲染（`MarkdownTable` / `TableRow`）
+- 深色底 `CodeBlockBackground` + 细边 `CodeBlockBorder`，和代码块同一套配色，风格统一。
+- **不用 `weight` 分列**：weight 要求父级有确定宽度，而宽表必须能横向拖，外层 `horizontalScroll`
+  给的约束是无限宽，weight 会直接塌成 0。改成按「该列最长单元格字符数 × 8dp」估固定宽度，
+  夹在 `64.dp..220.dp`；固定宽度才能跨行对齐。
+- 网格线只画每格的**右 / 下**两条（`drawBehind`），外框交给 `Surface` 的 border，避免叠成双线。
+- 表头 `FontWeight.Bold`，单元格走 `inlineFormat` 所以 `**粗体**` 仍然生效。
+
+### 落点
+| 位置 | 改动 |
+| --- | --- |
+| `MdBlock` | 加 `data class Table(header, rows)`；`private sealed interface` → `internal`（供单测） |
+| `parseMarkdown` | `for (line in lines)` → `for ((idx, line) in lines.withIndex())` + `skipUntil`；`private` → `internal` |
+| 新增 `tableCellsOf` / `isTableSeparatorLine` / `padCells` | 解析辅助，前两个 `internal` 便于单测 |
+| `MarkdownText` | `when` 加 `is MdBlock.Table -> MarkdownTable(...)` |
+| 新增 `MarkdownTable` / `TableRow` | 渲染组件，插在 `CodeBlock` 之后 |
+| `MarkdownTableTest.kt` | 新增 25 条（10 条 cells / 6 条 sep / 9 条 parse） |
+
+### 踩坑（本轮）
+`src.replace(old, () => new)` 里如果 old 以 `\r\n` 结尾、new 却不带结尾换行，
+会把下一行的换行吞掉，粘成 `import ...Offsetimport ...`。编译报的是一堆
+`Expecting a top level declaration`，看着像大范围损坏，实际只是两处换行丢失。
+
+### 验证结果
+- `compileDebugKotlin` ✅ 0 error / 0 warning
+- `testDebugUnitTest` **294 条 0 失败**（269 旧 + 25 新）
+- `FLUSH_INTERVAL_MS = 50L` 未动

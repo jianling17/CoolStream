@@ -45,6 +45,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
@@ -91,6 +92,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.example.mychat.ui.theme.MyChatTheme
 import kotlinx.coroutines.CancellationException
@@ -6410,12 +6412,55 @@ private fun GlassMenuItem(text: String, onClick: () -> Unit) {
 //   一次回复的解析开销大约几十微秒，可以忽略。
 // ============================================================
 
-/** Markdown 的最小块模型：标题 / 段落 / 代码块 */
-private sealed interface MdBlock {
+/** Markdown 的最小块模型：标题 / 段落 / 代码块 / 表格 */
+internal sealed interface MdBlock {
     data class Heading(val level: Int, val text: String) : MdBlock
     data class Paragraph(val text: String) : MdBlock
     data class Code(val code: String) : MdBlock
+    data class Table(val header: List<String>, val rows: List<List<String>>) : MdBlock
 }
+
+/**
+ * 把一行 `| a | b |` 拆成 ["a", "b"]；不像表格行就返回 null。
+ *
+ * 单元格内容里真的要写竖线时用转义写法（反斜杠 + 竖线），要当成普通字符。
+ */
+internal fun tableCellsOf(line: String): List<String>? {
+    val t = line.trim()
+    if (t.length < 3 || !t.startsWith('|') || !t.endsWith('|')) return null
+    val inner = t.substring(1, t.length - 1)
+    val cells = ArrayList<String>()
+    val sb = StringBuilder()
+    val backslash = 92.toChar()
+    var i = 0
+    while (i < inner.length) {
+        val ch = inner[i]
+        if (ch == backslash && i + 1 < inner.length && inner[i + 1] == '|') {
+            sb.append('|')
+            i += 2
+            continue
+        }
+        if (ch == '|') {
+            cells.add(sb.toString().trim())
+            sb.setLength(0)
+        } else {
+            sb.append(ch)
+        }
+        i++
+    }
+    cells.add(sb.toString().trim())
+    return cells
+}
+
+/** `|---|:--:|` 这种分割线：每格只由 - 和可选的 : 组成，且至少有一个 - */
+internal fun isTableSeparatorLine(line: String): Boolean {
+    val cells = tableCellsOf(line) ?: return false
+    return cells.all { c -> c.contains('-') && c.all { it == '-' || it == ':' } }
+}
+
+/** 短行右侧补空串，让所有行列数一致，渲染时才能对齐 */
+private fun padCells(cells: List<String>, cols: Int): List<String> =
+    if (cells.size == cols) cells else List(cols) { cells.getOrElse(it) { "" } }
 
 /**
  * 把 Markdown 文本切成块。逐行扫描，不建语法树。
@@ -6426,7 +6471,7 @@ private sealed interface MdBlock {
  *   空行           段落分隔
  *   **粗体**       行内加粗（在渲染阶段处理）
  */
-private fun parseMarkdown(src: String): List<MdBlock> {
+internal fun parseMarkdown(src: String): List<MdBlock> {
     val out = ArrayList<MdBlock>()
     val lines = src.replace("\r\n", "\n").split('\n')
     val para = StringBuilder()
@@ -6440,7 +6485,11 @@ private fun parseMarkdown(src: String): List<MdBlock> {
         }
     }
 
-    for (line in lines) {
+    // 表格要「向前多看一行」判断分割线，还要把后续数据行一次性吃掉，
+    // 所以这里用带下标的循环 + skipUntil 跳过已消费的行。
+    var skipUntil = -1
+    for ((idx, line) in lines.withIndex()) {
+        if (idx <= skipUntil) continue
         val noTrail = line.trimEnd()
 
         // ---------- 代码块围栏 ----------
@@ -6457,6 +6506,31 @@ private fun parseMarkdown(src: String): List<MdBlock> {
         }
         if (inCode) {
             code.append(line).append('\n')
+            continue
+        }
+
+        // ---------- 表格 ----------
+        // 判据：本行是 |...|，且下一行是 |---|---| 形式的分割线。
+        // 只有表头 + 分割线同时出现才算，避免把正文里偶尔出现的竖线误判成表格。
+        val headerCells = tableCellsOf(noTrail)
+        if (headerCells != null && idx + 1 < lines.size && isTableSeparatorLine(lines[idx + 1])) {
+            flushParagraph()
+            val body = ArrayList<List<String>>()
+            var k = idx + 2
+            while (k < lines.size) {
+                val cells = tableCellsOf(lines[k].trimEnd()) ?: break
+                body.add(cells)
+                k++
+            }
+            skipUntil = k - 1
+            // 列数取表头与所有数据行的最大值，短行补空串
+            val cols = body.fold(headerCells.size) { acc, r -> maxOf(acc, r.size) }
+            out.add(
+                MdBlock.Table(
+                    header = padCells(headerCells, cols),
+                    rows = body.map { padCells(it, cols) }
+                )
+            )
             continue
         }
 
@@ -6592,6 +6666,8 @@ private fun MarkdownText(
                 )
 
                 is MdBlock.Code -> CodeBlock(block.code, onLongPress = onCodeLongPress)
+
+                is MdBlock.Table -> MarkdownTable(block.header, block.rows)
             }
         }
     }
@@ -6634,6 +6710,73 @@ private fun CodeBlock(code: String, onLongPress: (() -> Unit)? = null) {
     }
 }
 
+
+/**
+ * Markdown 表格：极简网格 —— 深色半透明底 + 细白边，风格跟代码块保持一致。
+ *
+ * ★ 为什么不用 weight 分列：weight 要求父级有确定宽度，而宽表在手机上必须能横向拖，
+ *   外层套 horizontalScroll 后约束是无限宽，weight 直接失效（列宽会塌成 0）。
+ *   所以按「该列最长单元格的字符数」估一个固定宽度 —— 固定宽度才能跨行对齐。
+ */
+@Composable
+private fun MarkdownTable(header: List<String>, rows: List<List<String>>) {
+    val widths = remember(header, rows) {
+        List(header.size) { c ->
+            val longest = (listOf(header[c]) + rows.map { it.getOrElse(c) { "" } })
+                .maxOfOrNull { it.length } ?: 1
+            // 8dp/字（bodySmall 下中文按全角估），夹在 64..220dp 之间防极端值
+            (longest * 8).dp.coerceIn(64.dp, 220.dp)
+        }
+    }
+    Surface(
+        color = CodeBlockBackground,
+        shape = RoundedCornerShape(6.dp),
+        border = BorderStroke(1.dp, CodeBlockBorder),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.horizontalScroll(rememberScrollState())) {
+            TableRow(header, widths, header = true)
+            for (r in rows) TableRow(r, widths, header = false)
+        }
+    }
+}
+
+/** 表格的一行。只画右 / 下两条线，外框交给 Surface，避免叠成双线。 */
+@Composable
+private fun TableRow(cells: List<String>, widths: List<Dp>, header: Boolean) {
+    Row {
+        for (c in widths.indices) {
+            Box(
+                modifier = Modifier
+                    .width(widths[c])
+                    .drawBehind {
+                        val stroke = 1.dp.toPx()
+                        val half = stroke / 2f
+                        drawLine(
+                            color = CodeBlockBorder,
+                            start = Offset(size.width - half, 0f),
+                            end = Offset(size.width - half, size.height),
+                            strokeWidth = stroke
+                        )
+                        drawLine(
+                            color = CodeBlockBorder,
+                            start = Offset(0f, size.height - half),
+                            end = Offset(size.width, size.height - half),
+                            strokeWidth = stroke
+                        )
+                    }
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = inlineFormat(cells.getOrElse(c) { "" }),
+                    color = CodeBlockText,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = if (header) FontWeight.Bold else FontWeight.Normal
+                )
+            }
+        }
+    }
+}
 
 // ============================================================
 // 6.2 工具调用卡片（Tool Calling UI 骨架）
