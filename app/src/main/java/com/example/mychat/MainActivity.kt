@@ -201,6 +201,8 @@ import com.example.mychat.ui.theme.GlassEdgeLight
 import com.example.mychat.ui.theme.GlassFillDark
 import com.example.mychat.ui.theme.GlassFillLight
 import com.example.mychat.ui.theme.GlassHighlight
+import com.example.mychat.ui.theme.GlassSheetDark
+import com.example.mychat.ui.theme.GlassSheetLight
 import com.example.mychat.ui.theme.GlassTintDark
 import com.example.mychat.ui.theme.GlassTintLight
 
@@ -2728,6 +2730,11 @@ private fun glassFill(): Color = if (LocalIsDark.current) GlassFillDark else Gla
 
 @Composable
 private fun glassDrawer(): Color = if (LocalIsDark.current) GlassDrawerDark else GlassDrawerLight
+
+// 附件弹层专用：比 glassFill() 更不透明，避免盖住聊天正文时字压字。
+// 刻意不动 glassFill()，输入框 / 顶栏按钮的玻璃质感保持原样。
+@Composable
+private fun glassSheet(): Color = if (LocalIsDark.current) GlassSheetDark else GlassSheetLight
 
 @Composable
 private fun glassEdge(): Color = if (LocalIsDark.current) GlassEdgeDark else GlassEdgeLight
@@ -7455,7 +7462,10 @@ fun InputBar(
                 // 左边距从 18dp 收到 6dp：+ 号按钮自己占 40dp，
                 // 视觉上文字起点和以前基本一致。
                 modifier = Modifier.padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
-                verticalAlignment = Alignment.Bottom,
+                // 必须是 CenterVertically，不能用 Bottom：
+                // + 号 40dp、发送按钮 36dp、输入框自带 6dp 上下内边距，
+                // 底部对齐会让三者的中心线错开 2dp，看着就是「文字偏上、按钮偏下」。
+                verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(2.dp)
             ) {
                 IconButton(
@@ -7625,7 +7635,7 @@ private fun AttachmentSheet(
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(),
-        containerColor = glassFill(),
+        containerColor = glassSheet(),
         contentColor = cs.onSurface,
         dragHandle = null
     ) {

@@ -53,6 +53,11 @@ val GlassFillLight   = Color(0xFFFFFFFF).copy(alpha = 0.88f)
 val GlassDrawerDark  = Color(0xFF1C1C1E).copy(alpha = 0.95f)   // 侧边栏底
 val GlassDrawerLight = Color(0xFFFFFFFF).copy(alpha = 0.97f)
 
+// 底部弹层（附件选择器）专用：它会盖在长聊天文本上，用 alpha 0.80 的 GlassFill*
+// 会把下面的字透出来、字压字读不清。提到 0.97/0.98 后仍带一点玻璃感，正文不再干扰。
+val GlassSheetDark   = Color(0xFF1C1C1E).copy(alpha = 0.97f)   // 附件弹层底
+val GlassSheetLight  = Color(0xFFFFFFFF).copy(alpha = 0.98f)
+
 val GlassEdgeDark    = Color.White.copy(alpha = 0.15f)         // 高光边框（暗色）
 val GlassEdgeLight   = Color.Black.copy(alpha = 0.08f)         // 高光边框（亮色）
 

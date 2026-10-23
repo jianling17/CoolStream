@@ -218,3 +218,25 @@ $ADB shell am start -n com.example.mychat/.MainActivity
 ### 发版前记得改版本号
 `app/build.gradle.kts:91` 的 `val appBaseVersion = "..."`——这是唯一需要手改的版本行，
 `versionCode` 由 `yyMMddHH` 自动生成（同一小时多次构建 versionCode 不变）。
+
+---
+
+## v1.1.1 补丁（两处 UI 修复）
+
+### 1. 底部输入栏垂直不对齐（真问题，已修）
+根因：`MainActivity.kt` 的 `InputBar` 胶囊 `Row` 用的是 `verticalAlignment = Alignment.Bottom`。
+三个子项高度不同 —— `+` 号 `IconButton` 40dp、发送按钮 36dp、`BasicTextField` 自带 6dp 上下内边距，
+底部对齐后三者中心线错开，视觉上就是「文字偏上、按钮偏下」。
+修法：改成 `Alignment.CenterVertically`（现约在 7468 行）。
+
+### 2. AttachmentSheet 玻璃底透字（已修）
+**没有动全局 `glassFill()`**（输入框 / 顶栏按钮继续用它）。新增一套局部色：
+- `ui/theme/Color.kt` 新增 `GlassSheetDark = 0xFF1C1C1E alpha 0.97` / `GlassSheetLight = 0xFFFFFFFF alpha 0.98`
+  （紧挨 `GlassDrawer*`，后者 0.95/0.97 就是为侧边栏透字加的，同一思路）
+- `MainActivity.kt` 新增 `@Composable private fun glassSheet()`，与 `glassFill()` / `glassDrawer()` 并列
+- `AttachmentSheet` 的 `containerColor` 由 `glassFill()` 换成 `glassSheet()`
+
+### 验证状态
+- `compileDebugKotlin` ✅ / `assembleRelease` ✅ / `testDebugUnitTest` **269 条 0 失败**
+- ⚠️ **手机（a2c1bf9c）在装包前从 USB 掉线**，`adb devices` 为空，
+  所以这一版**尚未在真机上截图确认视觉效果**。手机接回后按「装包约定」直接 `adb install -r` 即可。
