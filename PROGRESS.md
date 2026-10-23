@@ -185,3 +185,36 @@ return if (result.ok) result.copy(output = persistOversizeToolOutput(name, resul
 - 命令一律加 `--offline`
 - 单测统计：
   `cd app/build/test-results/testDebugUnitTest && awk -F'"' '/<testsuite /{for(i=1;i<=NF;i++){if($(i)~/tests=$/)t+=$(i+1); if($(i)~/failures=$/)f+=$(i+1); if($(i)~/errors=$/)e+=$(i+1)}} END{print "tests="t" failures="f" errors="e}' *.xml`
+
+---
+
+## 装包约定（用户 m01478 指令，长期有效）
+
+**给用户手机装新版 = 直接取现成的 release 包装，不要重打包、不要装 debug 包。**
+
+```bash
+export JAVA_HOME="/c/Program Files/Android/Android Studio/jbr"   # 见下方注意事项
+ADB=/c/Users/20732/AppData/Local/Android/Sdk/platform-tools/adb.exe
+cd /c/Users/20732/AndroidStudioProjects/MyChat
+$ADB install -r app/build/outputs/apk/release/app-release.apk
+$ADB shell dumpsys package com.example.mychat | grep -E "versionName|versionCode"
+$ADB shell am start -n com.example.mychat/.MainActivity
+```
+
+- APK 路径固定：`C:\Users\20732\AndroidStudioProjects\MyChat\app\build\outputs\apk\release\app-release.apk`
+- 手机设备 id `a2c1bf9c`（24117RK2CC / zorn，Android 16 / SDK 36），覆盖安装保留数据
+- 装完必须核 `versionName` 并截图确认不崩（R8 混淆包有运行时崩溃风险）
+
+### 踩过的三个坑（别重复踩）
+1. **判签名不要比 `META-INF/CERT.RSA` 的字节哈希**：它是 PKCS#7 容器，签名属性不同字节就不同，
+   但证书可以完全一样。一律用 `apksigner.bat verify --print-certs` 看证书 DN / SHA-256。
+   （曾误判「签名不匹配」，实际两包都是 `CN=CoolStream`、SHA-256 `d9ea8e3d…`。）
+2. **win_bash 命令超时被杀后，持久 shell 会重置，`JAVA_HOME` 丢失**，gradle 报
+   `Please set the JAVA_HOME variable`。每次先 export，或直接用 Android Studio 的 jbr。
+3. **MSYS 的 `/tmp` 和 Windows python 看到的 `/tmp` 不是同一个目录**：`adb pull /tmp/x` 与
+   python 读 `/tmp/x` 会错位（症状：adb 说 pull 成功，python 说文件不存在）。
+   临时文件放项目内 `.tmpcmp/`，adb 和 python 都传 Windows 路径，用完 `rm -rf`。
+
+### 发版前记得改版本号
+`app/build.gradle.kts:91` 的 `val appBaseVersion = "..."`——这是唯一需要手改的版本行，
+`versionCode` 由 `yyMMddHH` 自动生成（同一小时多次构建 versionCode 不变）。
