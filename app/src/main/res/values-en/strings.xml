@@ -121,6 +121,7 @@
     <!-- ============ Session long-press menu ============ -->
     <string name="session_menu_title">What do you want to do with this chat?</string>
     <string name="action_rename">Rename</string>
+    <string name="session_more_actions">Session actions</string>
     <string name="action_delete">Delete</string>
     <string name="action_cancel">Cancel</string>
     <string name="delete_session_title">Delete this chat?</string>

@@ -300,3 +300,37 @@ $ADB shell am start -n com.example.mychat/.MainActivity
 手势导航下，屏幕最左约 20dp 是系统返回手势区，起手点落在那里时抽屉抢不到触摸。
 这是 Android 的系统级约束（Material 官方抽屉同样如此），不是 bug；从边缘内约 60px 起手即可。
 
+
+---
+
+## v1.1.3 历史会话菜单改为内联三点 DropdownMenu（用户 m01696 下达）
+
+### 为什么改
+原来重命名 / 删除藏在**长按**弹出的居中 `AlertDialog` 里：动作入口不可见（没人会去长按列表），
+而且弹窗一出来就把列表盖住，选错了还得先关掉再重来。改成每行右侧常驻三点按钮 + 锚定在该行的 `DropdownMenu`。
+
+### 落点
+| 位置 | 改动 |
+| --- | --- |
+| `MainActivity.kt` `SessionRow` | 签名 `onLongClick: () -> Unit` → `onRename: () -> Unit` + `onDelete: () -> Unit`；`Surface` 内改为 `Row`，标题 `Modifier.weight(1f)`，右侧 `Box { IconButton(Icons.Default.MoreVert) + DropdownMenu }` |
+| `MainActivity.kt` `Sidebar` | 删除 `var menuTarget`（连同 2403 字符的旧长按菜单 `AlertDialog` 整块）；列表项改为传 `onRename = { renameText = session.title; renameTarget = session }` / `onDelete = { deleteTarget = session }` |
+| `res/values/strings.xml` `values-en/strings.xml` | 新增 `session_more_actions`（会话操作 / Session actions），供三点按钮的 `contentDescription` |
+| import | 新增 `material.icons.filled.Delete` / `.MoreVert`、`material3.DropdownMenu` / `.DropdownMenuItem` |
+
+### 关键实现点
+- 菜单项 `leadingIcon` 用 `Icons.Default.Edit` / `Icons.Default.Delete`；删除项文字与图标都是 `Color(0xFFF85149)`，和既有危险色一致。
+- `DropdownMenu(containerColor = glassDrawer())`，和侧边栏同一层玻璃底，避免默认 surface 色在深色主题下突兀。
+- 菜单只负责「选动作」，**不直接执行**：重命名要带出当前标题当初始值走文本输入框，删除不可撤销要走二次确认框。
+  这两个弹窗（`renameTarget` / `deleteTarget`）原样保留 —— 旧代码注释里就写过「把删除挂在 dismissButton 上很反人类」，不能因为换成 DropdownMenu 就把二次确认也删了。
+- 行内点击用 `clickable(onClick = onClick)`，`IconButton` 自己消费点击不会冒泡到整行；`combinedClickable` 在本文件其他三处（气泡长按等）仍在用，import 保留。
+- 三点按钮 `Modifier.size(32.dp)` 常驻占位（未选中态也显示），避免标题在选中/未选中之间左右跳动。
+
+### 验证结果
+- `compileDebugKotlin` ✅ 0 error / 0 warning
+- `testDebugUnitTest` **269 条 0 失败**（`BUILD SUCCESSFUL in 2m 5s`）
+- `assembleRelease` ✅，release APK **2,071,780 字节 ≈ 1.98 MB**（≤ 3MB）
+- `FLUSH_INTERVAL_MS = 50L`（`MainActivity.kt:457`）未动
+- 全文件 `menuTarget` 残留引用 = 0（grep 核实）
+
+### 未做（等真机）
+菜单展开/收起的视觉与点击热区尚未在真机或模拟器上截图确认；下一轮真机装包时一并核。

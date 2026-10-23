@@ -170,6 +170,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Menu
@@ -177,6 +179,8 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
@@ -4240,13 +4244,12 @@ fun Sidebar(
     // 搜索关键词。纯内存过滤，不碰数据库。
     var query by remember { mutableStateOf("") }
 
-    // 长按菜单的目标会话
-    var menuTarget by remember { mutableStateOf<SidebarSession?>(null) }
-    // 重命名弹窗的目标 + 输入内容
+    // 重命名弹窗的目标 + 输入内容。
+    // ★ 三点菜单内联在 SessionRow 里，菜单本身不存状态 —— 它只负责把目标
+    //   交给下面这两个弹窗。重命名要文本输入、删除不可撤销，都得再问一次。
     var renameTarget by remember { mutableStateOf<SidebarSession?>(null) }
     var renameText by remember { mutableStateOf("") }
     // 删除确认框的目标。
-    // ★ 刻意和 menuTarget 分开：菜单只是「选动作」，真正下手前必须再问一次。
     var deleteTarget by remember { mutableStateOf<SidebarSession?>(null) }
 
     // ★ 注意 remember 的 key 是 state.sessions（内容比较），
@@ -4364,7 +4367,13 @@ fun Sidebar(
                                 title = session.title,
                                 selected = session.id == state.currentSessionId,
                                 onClick = { onSelect(session.id) },
-                                onLongClick = { menuTarget = session }
+                                // 重命名要带出当前标题当初始值
+                                onRename = {
+                                    renameText = session.title
+                                    renameTarget = session
+                                },
+                                // ★ 删除只负责顶起确认框，真正下手在确认框里
+                                onDelete = { deleteTarget = session }
                             )
                         }
                     }
@@ -4435,69 +4444,6 @@ fun Sidebar(
                 .fillMaxHeight()
                 .width(1.dp)
                 .background(GlassHighlight)
-        )
-    }
-
-    // ---------- 长按菜单：重命名 / 删除 ----------
-    //
-    // ★ 这里原来有个很反人类的设计，已经改掉：
-    //   旧代码把「删除」挂在 dismissButton 上 —— 而 AlertDialog 里
-    //   dismissButton 就长在左边的「取消位」。用户以为自己点的是取消，
-    //   结果会话直接被删，而且没有任何二次确认。
-    //
-    //   现在的做法：
-    //     · 两个动作都是并排的普通文本按钮，谁也不占「确认 / 取消」的位置，
-    //       点哪里就发生什么事，不存在「位置暗示」和实际行为相反的情况
-    //     · 删除只负责打开 deleteTarget 确认框，真正的 onDelete 在确认框里调
-    menuTarget?.let { target ->
-        AlertDialog(
-            onDismissRequest = { menuTarget = null },
-            containerColor = glassDrawer(),
-            titleContentColor = cs.onSurface,
-            textContentColor = cs.onSurfaceVariant,
-            title = {
-                Text(
-                    text = target.title,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            },
-            text = {
-                Column {
-                    Text(
-                        text = stringResource(R.string.session_menu_title),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    TextButton(
-                        onClick = {
-                            renameText = target.title
-                            renameTarget = target
-                            menuTarget = null
-                        },
-                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
-                    ) {
-                        Text(stringResource(R.string.action_rename))
-                    }
-                    TextButton(
-                        onClick = {
-                            // ★ 这里绝不能直接 onDelete —— 只是把确认框顶起来
-                            deleteTarget = target
-                            menuTarget = null
-                        },
-                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
-                    ) {
-                        Text(
-                            text = stringResource(R.string.action_delete),
-                            color = Color(0xFFF85149)
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { menuTarget = null }) {
-                    Text(stringResource(R.string.action_cancel))
-                }
-            }
         )
     }
 
@@ -4608,16 +4554,22 @@ private fun dayBucket(ts: Long): Int {
     }
 }
 
-/** 侧边栏的一行会话：选中时是半透明胶囊高亮 */
-@OptIn(ExperimentalFoundationApi::class)
+/**
+ * 侧边栏的一行会话：选中时是半透明胶囊高亮。
+ *
+ * 重命名 / 删除收进右侧三点菜单（原来是长按弹居中 AlertDialog，动作藏得太深）。
+ * 菜单只负责「选动作」，真正的重命名输入与删除确认仍在 Sidebar 顶层的两个弹窗里。
+ */
 @Composable
 private fun SessionRow(
     title: String,
     selected: Boolean,
     onClick: () -> Unit,
-    onLongClick: () -> Unit
+    onRename: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
+    var menuOpen by remember { mutableStateOf(false) }
     Surface(
         shape = RoundedCornerShape(20.dp),
         color = if (selected) glassTint() else Color.Transparent,
@@ -4625,17 +4577,78 @@ private fun SessionRow(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(20.dp))
-            // 长按 = 重命名 / 删除
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
     ) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (selected) cs.onSurface else cs.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 11.dp)
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                // 点整行 = 打开会话（菜单按钮自己消费点击，不会冒泡到这里）
+                .clickable(onClick = onClick)
+                .padding(start = 12.dp, end = 2.dp, top = 2.dp, bottom = 2.dp)
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (selected) cs.onSurface else cs.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            // 三点按钮只在选中态常亮，未选中时也占位，避免标题左右跳动
+            Box {
+                IconButton(
+                    onClick = { menuOpen = true },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MoreVert,
+                        contentDescription = stringResource(R.string.session_more_actions),
+                        tint = if (selected) cs.onSurface else cs.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                DropdownMenu(
+                    expanded = menuOpen,
+                    onDismissRequest = { menuOpen = false },
+                    containerColor = glassDrawer()
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.action_rename)) },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        },
+                        onClick = {
+                            menuOpen = false
+                            onRename()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = stringResource(R.string.action_delete),
+                                color = Color(0xFFF85149)
+                            )
+                        },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = null,
+                                tint = Color(0xFFF85149),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        },
+                        onClick = {
+                            menuOpen = false
+                            onDelete()
+                        }
+                    )
+                }
+            }
+        }
     }
 }
 
