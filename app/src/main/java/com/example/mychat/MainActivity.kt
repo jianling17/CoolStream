@@ -1075,7 +1075,7 @@ fun sendToDeepSeek(
 //
 // 另外再加一道保险：即使拿到了字符串，也排除空串和字面量 "null"。
 // ============================================================
-private fun parseDelta(json: String): String? {
+internal fun parseDelta(json: String): String? {
     return try {
         val root = JSONObject(json)
 
@@ -1111,19 +1111,19 @@ private fun parseDelta(json: String): String? {
 // 所以必须按 index 累积 id / name / arguments。
 // 直接取最后一次的 arguments 只会拿到一小段残缺 JSON。
 // ============================================================
-private data class ToolCallPiece(
+internal data class ToolCallPiece(
     val index: Int,
     val id: String?,
     val name: String?,
     val arguments: String?
 )
 
-private data class DeltaInfo(
+internal data class DeltaInfo(
     val content: String?,               // 正文分片（可能为空）
     val toolCalls: List<ToolCallPiece>  // 本次分片里的工具调用片段
 )
 
-private fun parseDeltaFull(json: String): DeltaInfo? {
+internal fun parseDeltaFull(json: String): DeltaInfo? {
     return try {
         val delta = JSONObject(json)
             .optJSONArray("choices")
@@ -1519,7 +1519,7 @@ private const val TOOL_LOG_TAG = "ToolExec"
  * 以后加新工具，就在这里加一个 when 分支 + 在 TOOL_DEFINITIONS 里加一段 schema。
  */
 /** 从参数 JSON 里安全取一个字符串（模型偶尔会传不合法的 JSON） */
-private fun argOf(argsJson: String, key: String): String {
+internal fun argOf(argsJson: String, key: String): String {
     return try {
         (JSONObject(argsJson).opt(key) as? String) ?: ""
     } catch (e: Exception) {
@@ -1534,7 +1534,7 @@ private fun argOf(argsJson: String, key: String): String {
  * 模型有时会把 true 写成字符串 "true"，这里只认真正的 Boolean，
  * 其余一律当 false —— 对 replace_all 这种"放权"型参数，宁可保守。
  */
-private fun argBoolOf(argsJson: String, key: String): Boolean {
+internal fun argBoolOf(argsJson: String, key: String): Boolean {
     return try {
         (JSONObject(argsJson).opt(key) as? Boolean) ?: false
     } catch (e: Exception) {
@@ -1549,7 +1549,7 @@ private fun argBoolOf(argsJson: String, key: String): Boolean {
  * 实测：用户输入里常带中文双引号 “ ”，模型会把它一起塞进 path。
  * 这里再兜一层 —— 把首尾的中英文标点和空白全部削掉。
  */
-private fun cleanPath(raw: String): String {
+internal fun cleanPath(raw: String): String {
     return raw.trim().trim(
         '"', '\'', '“', '”', '‘', '’',
         '，', ',', '。', '、', '；', ';', '：', ':', ' ', '\n', '\t', '\r'
@@ -3058,7 +3058,7 @@ private fun jsValuePreview(v: Any?, depth: Int = 0): String {
  *
  * 反引号字符串【故意不抹掉】—— 模板字符串插值失效这一条正是要检测它。
  */
-private fun maskJsLiterals(src: String): String {
+internal fun maskJsLiterals(src: String): String {
     val out = StringBuilder(src)
     var i = 0
     val n = src.length
@@ -3100,7 +3100,7 @@ private fun maskJsLiterals(src: String): String {
 }
 
 /** 把字符下标换算成 1 起的行号 */
-private fun lineAt(src: String, index: Int): Int {
+internal fun lineAt(src: String, index: Int): Int {
     var line = 1
     for (k in 0 until minOf(index, src.length)) if (src[k] == '\n') line++
     return line
@@ -3119,7 +3119,7 @@ private fun lineAt(src: String, index: Int): Int {
  *
  * @return null = 放行；非 null = 给模型看的错误说明（含正确写法）
  */
-private fun ptcPreflight(code: String): String? {
+internal fun ptcPreflight(code: String): String? {
     val masked = maskJsLiterals(code)
 
     // ① 模板字符串插值 —— 不报错但结果是错的，必须拦
@@ -3748,7 +3748,7 @@ data class UsageStats(
 }
 
 /** 现在是高峰时段吗？ */
-private fun isPeakHour(): Boolean {
+internal fun isPeakHour(): Boolean {
     val cal = Calendar.getInstance()
     val dow = cal.get(Calendar.DAY_OF_WEEK)
     if (dow == Calendar.SATURDAY || dow == Calendar.SUNDAY) return false
@@ -3757,7 +3757,7 @@ private fun isPeakHour(): Boolean {
 }
 
 /** 按官方峰谷单价算出这一轮花了多少元 */
-private fun costCny(u: UsageStats): Double {
+internal fun costCny(u: UsageStats): Double {
     val peak = isPeakHour()
     val hitPrice = if (peak) 0.04 else 0.02
     val missPrice = if (peak) 2.0 else 1.0
@@ -3768,7 +3768,7 @@ private fun costCny(u: UsageStats): Double {
 }
 
 /** 费用显示：不到 1 分钱就给 4 位小数，否则 2 位 */
-private fun formatCny(v: Double): String =
+internal fun formatCny(v: Double): String =
     if (v < 0.01) {
         String.format(Locale.US, "¥%.4f", v)
     } else {
@@ -3776,7 +3776,7 @@ private fun formatCny(v: Double): String =
     }
 
 /** token 数显示：1.2K / 3.4M */
-private fun formatTokens(n: Int): String = when {
+internal fun formatTokens(n: Int): String = when {
     n >= 1_000_000 -> String.format(Locale.US, "%.1fM", n / 1_000_000.0)
     n >= 1_000 -> String.format(Locale.US, "%.1fK", n / 1_000.0)
     else -> n.toString()
@@ -3907,7 +3907,7 @@ object UsageLedger {
 }
 
 /** 从任意一条 SSE 数据里尝试抠出 usage（DeepSeek 通常放在最后一条，且那一条 choices 为空） */
-private fun parseUsage(json: String): UsageStats? {
+internal fun parseUsage(json: String): UsageStats? {
     return try {
         val u = JSONObject(json).optJSONObject("usage") ?: return null
         if (u.length() == 0) return null
@@ -8738,7 +8738,7 @@ private val ATTACH_MARK_RE = Regex("""<<ATTACH:(image|file|doc)\|([^>]+)>>""")
 private val DOC_BEGIN_RE = Regex("""<<DOC:begin\|([^|>]*)\|(\d+)>>""")
 
 /** 文档上下文哨兵的结束标记：<<DOC:end>> */
-private val DOC_END = "<<DOC:end>>"
+internal val DOC_END = "<<DOC:end>>"
 
 /** 落盘目录名 */
 private const val ATTACH_DIR = "attachments"
@@ -8938,7 +8938,7 @@ private fun displayContent(raw: String): String {
  *   · 正文里出现「<<DOC:begin|」这种字面内容的概率约等于零，但即便出现了，
  *     indexOf 从头往后找也是「找最近的一个 end」，行为可预测。
  */
-private fun stripDocBlocks(raw: String): String {
+internal fun stripDocBlocks(raw: String): String {
     if (!raw.contains("<<DOC:")) return raw
     val sb = StringBuilder()
     var i = 0
@@ -8961,7 +8961,7 @@ private fun stripDocBlocks(raw: String): String {
 }
 
 /** 气泡里那张「📄 已读取文档」卡片需要的信息 */
-private data class DocCard(val name: String, val charCount: Int)
+internal data class DocCard(val name: String, val charCount: Int)
 
 /**
  * 从消息正文里抽出文档卡片列表（按出现顺序）。
@@ -8969,7 +8969,7 @@ private data class DocCard(val name: String, val charCount: Int)
  * ★ 为什么从正文里反解而不是另存一张表：哨兵里已经带了文件名和字数，
  *   反解一次就够，不值得为一个展示字段加一张表 + 一次查询。
  */
-private fun docCardsOf(raw: String): List<DocCard> {
+internal fun docCardsOf(raw: String): List<DocCard> {
     if (!raw.contains("<<DOC:")) return emptyList()
     return DOC_BEGIN_RE.findAll(raw).map { m ->
         DocCard(name = m.groupValues[1], charCount = m.groupValues[2].toIntOrNull() ?: 0)
