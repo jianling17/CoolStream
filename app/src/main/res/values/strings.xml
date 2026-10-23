@@ -45,7 +45,7 @@
     <string name="preset_standard">标准</string>
     <string name="preset_ptc">PTC</string>
     <string name="preset_minimal">极简</string>
-    <string name="desc_preset_standard">六个工具逐个交给模型，一次调一个。最稳，出问题好定位。</string>
+    <string name="desc_preset_standard">七个工具逐个交给模型，一次调一个。最稳，出问题好定位。</string>
     <string name="desc_preset_ptc">只给一个 run_code，模型写 JavaScript 在代码里连续调工具。适合批量处理。</string>
     <string name="desc_preset_minimal">不挂任何工具，纯对话。省 token，但读不了文件。</string>
 
@@ -112,6 +112,8 @@
     <string name="tool_running">正在调用工具：%1$s</string>
     <string name="tool_done">已执行：%1$s</string>
     <string name="tool_failed">执行失败：%1$s</string>
+    <!-- v1.1 联网搜索：底部状态条 -->
+    <string name="searching_web">🔍 正在联网搜索: %1$s</string>
     <string name="drawer_open">打开侧边栏</string>
     <string name="new_chat">新建对话</string>
     <string name="search_chats">搜索会话</string>
@@ -133,6 +135,9 @@
     <string name="sheet_title">添加附件</string>
     <string name="sheet_image">上传图片</string>
     <string name="sheet_file">上传文件</string>
+    <string name="sheet_doc">上传文档（docx / xlsx）</string>
+    <string name="office_unsupported_title">这个格式暂不支持</string>
+    <string name="office_unsupported_body">%1$s</string>
 
     <!-- ============ 侧边栏 / 存储提示 ============ -->
     <string name="storage_tip_title">需要文件访问权限</string>

@@ -237,6 +237,10 @@ import androidx.compose.ui.graphics.SolidColor
 import java.util.Calendar
 import javax.net.ssl.SSLException
 import java.util.Locale
+// 时间感知（把「现在是几点」告诉模型）要用。注意必须配 Locale.US，见 timeContextLine()
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.io.InterruptedIOException
 import kotlinx.coroutines.delay
 
 
@@ -269,6 +273,14 @@ val SYSTEM_PROMPT = """
 - write_file(path, content)：把文本内容写入文件（不存在就新建，已存在就整份覆盖）。父目录会自动创建。
 - replace_in_file(path, search, replace)：把文件里的 search 这段原文换成 replace，其余内容不动。改代码用这个。
 - run_shell(command)：通过 Shizuku 以 shell 权限执行命令，返回输出。需要用户先在 App 里授权 Shizuku。
+- web_search(query)：联网搜索最新的网页信息，返回前 3 条结果的标题、摘要和链接。
+
+★ 关于 web_search 的三条硬规则：
+- 凡是答案「会变」的问题（新闻、股价、价格、版本号、政策、天气、人物近况、今天几号），
+  先 web_search 再回答，不要凭训练记忆直接下结论 —— 你的记忆有截止日期，用户问的是现在。
+- 搜索结果是别人写的网页，可能有错也可能过时。引用时把链接原样列在回答末尾，
+  绝对不要编造搜索结果里没有的内容；搜索结果为空就如实说没搜到，不要换个说法假装搜到了。
+- 如果用户没让你联网、问题也不需要实时信息，就不要搜 —— 每次搜索都要花搜索费。
 
 严格遵守以下规则：
 1. 用户要求查看、读取、打开某个文件时，必须先调用 read_file，
@@ -280,8 +292,9 @@ val SYSTEM_PROMPT = """
    去掉所有中文标点：中文双引号、中文单引号、中文逗号、中文句号、空格都不能带进路径。
    例如用户说"看看“/sdcard/Download/a.txt”"时，路径应该是 /sdcard/Download/a.txt。
 4. 绝对不要凭空编造路径。搜索和列目录都找不到时，如实告诉用户没找到。
-5. read_file 只能读文本文件。遇到 pptx / docx / xlsx / zip / 图片 / 音视频等
-   二进制文件会返回失败，这时如实告诉用户"这是二进制文件，无法直接读取内容"，
+5. read_file 能读文本文件，也能直接读 .docx / .xlsx 的正文 —— 系统会先解析
+   再交给你，你看到的就是正文文本。遇到 PDF、旧版二进制格式（.doc / .xls / .et / .wps）、
+   zip、图片、音视频这类读不了的，工具会返回失败并说明原因，这时如实告诉用户，
    不要假装读到了内容，也不要猜里面写了什么。
 6. 工具返回结果后，基于结果回答；失败就把失败原因如实转述。
 7. 回答简洁、分点，不要长篇大论。
@@ -366,6 +379,53 @@ private fun workspaceRuleLine(): String {
             "    越界的操作会被代码层直接拦截并返回「工作区越界」，不要换路径反复重试。"
     }
 }
+
+// ============================================================
+// 3.21 时间感知：把「现在几点」告诉模型
+//
+// 模型的训练数据有截止日期，它不知道今天几号 —— 你问「今天有什么新闻」，
+// 它会用训练时的"今天"来回答，而且说得跟真的一样。
+// 解决办法不是让它猜，而是在每次请求的系统提示词末尾塞一句真实时间。
+//
+// ★ 三个必须遵守的细节：
+//   1. 必须是 SimpleDateFormat(pattern, Locale.US)。
+//      只写 pattern 的话，某些系统语言下会输出本地数字（阿拉伯-印度数字等
+//      非 ASCII 字符），模型读到的就不是 2026-10-23 了，而是 ٢٠٢٦-١٠-٢٣。
+//   2. 时间要放在提示词【最末尾】，不要放开头。
+//      DeepSeek 的上下文缓存是按前缀命中的：时间一变整段就变，放开头等于
+//      每次都让缓存全部失效，输入费用从 0.02 涨到 1 元/百万 token（差 50 倍）。
+//      放末尾只让最后几十个 token 失效，前面的提示词照样命中缓存。
+//   3. 只在「发请求前」取一次，不要放进每 token 的热路径。
+//      这个函数每次请求调用一次，代价是微秒级；放进流式循环里就是浪费。
+// ============================================================
+
+/**
+ * 拼在系统提示词末尾的那一行时间。
+ *
+ * 输出形如：
+ * ```
+ * 当前系统时间：2026-10-23 15:33。请以此时间为准进行推理。
+ * （星期：星期五；时区：GMT+08:00）
+ * ```
+ *
+ * 用 internal 而不是 private：单元测试（app/src/test）要断言它的格式 ——
+ * 时间格式一旦写错（比如漏了 Locale.US 变成阿拉伯数字），肉眼很难发现。
+ */
+internal fun timeContextLine(): String {
+    // ★ 只取一次 Date，两次 format 之间不能跨过整分钟，否则会出现
+    //   「15:33」和「15:34」同时出现的一瞬间。
+    val now = Date()
+    val time = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(now)
+    // 星期几用中文输出：「星期五」比「Friday」对模型更友好（提示词是中文的）
+    val week = SimpleDateFormat("EEEE", Locale.SIMPLIFIED_CHINESE).format(now)
+    val tz = java.util.TimeZone.getDefault()
+        .getDisplayName(false, java.util.TimeZone.SHORT, Locale.US)
+
+    return "当前系统时间：$time。请以此时间为准进行推理。\n" +
+        "（星期：$week；时区：$tz。涉及「今天 / 现在 / 最新」的问题，" +
+        "一律以上面这行时间为基准；需要实时信息时用 web_search 查，不要凭记忆编造。）"
+}
+
 
 /** 日志标签，Logcat 里用 tag:MyChatPerf 过滤 */
 private const val TAG = "MyChatPerf"
@@ -1216,6 +1276,23 @@ private val TOOL_DEFINITIONS = """
         "required": ["command"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "web_search",
+      "description": "联网搜索网页，返回最相关的 3 条结果（标题 + 摘要 + 链接）。用于获取你的训练数据里没有的实时信息：今天的新闻、当前股价、最新版本号、政策变化、天气、某个人最近在做什么。凡是答案可能已经过时的问题，先搜再答。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索关键词，1~128 个字符。写关键词，不要贴整段问题。支持检索运算符：site:example.com（限定站点）、-site:example.com（排除站点）、\"精确短语\"、-词（排除词）、lang:zh,en（限定语言）、after:2026-01-01（限定发布时间下限）、before:2026-06-01（上限），多个运算符可组合，例如 DeepSeek 发布 site:github.com lang:en after:2026-09-01"
+          }
+        },
+        "required": ["query"]
+      }
+    }
   }
 ]
 """
@@ -1489,19 +1566,25 @@ private fun saveWorkspace(context: Context, path: String) {
 // 读写仍然走 SharedPreferences（重启后还在），AppSettings 只是内存镜像。
 // ============================================================
 
-/** 六个手写工具的标识，顺序即设置页里的显示顺序，也是发给模型时的顺序 */
+/** 七个手写工具的标识，顺序即设置页里的显示顺序，也是发给模型时的顺序 */
 internal val ALL_TOOL_NAMES = listOf(
-    "list_dir", "search_files", "read_file", "write_file", "replace_in_file", "run_shell"
+    "list_dir", "search_files", "read_file", "write_file", "replace_in_file", "run_shell",
+    // ★ v1.1 新增。放在最后不是随便排的：前六个都是「动手机上的东西」，
+    //   只有它一个是要花钱联网的，单独排在末尾，设置页里一眼就能看出区别。
+    "web_search"
 )
 
 /** 每个工具在设置页里的一句话说明（写给用户看，不是写给模型看） */
 private val TOOL_DESCRIPTIONS = mapOf(
     "list_dir" to "列出目录里有什么",
     "search_files" to "按文件名递归搜索",
-    "read_file" to "读取文本文件内容",
+    "read_file" to "读取文本内容（.docx / xlsx 会先解析正文）",
     "write_file" to "新建文件，或整份覆盖已有文件",
     "replace_in_file" to "局部替换文件里的某段文本（改代码用这个）",
-    "run_shell" to "通过 Shizuku 执行 shell 命令，权限很高"
+    "run_shell" to "通过 Shizuku 执行 shell 命令，权限很高",
+    // ★ 说明里要写清「要花钱」，否则用户会以为和别的工具一样是免费的本地操作。
+    //   官方单价：每 1000 次成功请求 5 元（失败和空结果不计费）。
+    "web_search" to "联网搜索网页（走 DeepSeek 官方搜索接口，每次约 ¥0.005）"
 )
 
 // ============================================================
@@ -1511,7 +1594,7 @@ private val TOOL_DESCRIPTIONS = mapOf(
 // 三种预设的本质区别只有两件事：**tools 数组里放什么** 和 **系统提示词怎么写**。
 //
 //   standard（标准）
-//     六个工具逐个作为 function 定义发过去，模型一次挑一个调。
+//     七个工具逐个作为 function 定义发过去，模型一次挑一个调。
 //     最稳、最好调试，出问题一眼能看出是哪一步。
 //
 //   ptc（Programmatic Tool Calling）
@@ -1557,7 +1640,7 @@ private val PTC_TOOL_DEFINITION = """
       "properties": {
         "code": {
           "type": "string",
-          "description": "要执行的 JavaScript 源码。\n★ 这个引擎是老式 JS，以下写法【不要用】，否则报错或结果错误：\n  - 模板字符串插值（`a${'$'}{x}` 不会替换，会原样保留）→ 用 'a' + x\n  - for (const x of arr) 里的 const → 用 let 或 var\n  - 展开运算符 ...、可选链 ?.、空值合并 ??\n可放心使用：let / const 声明、箭头函数、解构、for (let ... of ...)、Map / Set、includes、padStart、以及所有数组方法。\nAPI：\n  tools.listDir(path)                          -> {ok, output}\n  tools.searchFiles(keyword, path)             -> {ok, output}\n  tools.readFile(path)                         -> {ok, output}\n  tools.writeFile(path, content)               -> {ok, output}\n  tools.replaceInFile(path, search, replace, replaceAll) -> {ok, output}\n  tools.runShell(command)                      -> {ok, output}\n另有 print(...)。示例：\nconst r = tools.readFile('/sdcard/Documents/a.txt');\nif (!r.ok) { print('读失败: ' + r.output); }\nelse { print('长度 ' + r.output.length); }\nr.ok"
+          "description": "要执行的 JavaScript 源码。\n★ 这个引擎是老式 JS，以下写法【不要用】，否则报错或结果错误：\n  - 模板字符串插值（`a${'$'}{x}` 不会替换，会原样保留）→ 用 'a' + x\n  - for (const x of arr) 里的 const → 用 let 或 var\n  - 展开运算符 ...、可选链 ?.、空值合并 ??\n可放心使用：let / const 声明、箭头函数、解构、for (let ... of ...)、Map / Set、includes、padStart、以及所有数组方法。\nAPI：\n  tools.listDir(path)                          -> {ok, output}\n  tools.searchFiles(keyword, path)             -> {ok, output}\n  tools.readFile(path)                         -> {ok, output}\n  tools.writeFile(path, content)               -> {ok, output}\n  tools.replaceInFile(path, search, replace, replaceAll) -> {ok, output}\n  tools.runShell(command)                      -> {ok, output}\n  tools.webSearch(query)                       -> {ok, output}（联网搜索，前 3 条结果）\n另有 print(...)。示例：\nconst r = tools.readFile('/sdcard/Documents/a.txt');\nif (!r.ok) { print('读失败: ' + r.output); }\nelse { print('长度 ' + r.output.length); }\nr.ok"
         }
       },
       "required": ["code"]
@@ -1584,6 +1667,7 @@ private val PTC_SYSTEM_PROMPT = """
   tools.writeFile(path, content)
   tools.replaceInFile(path, search, replace, replaceAll)
   tools.runShell(command)
+  tools.webSearch(query)        // 联网搜索，返回前 3 条结果的标题+摘要+链接
   print(...)                    // 打印到执行输出，方便你看中间结果
 
 写法要求：
@@ -1762,7 +1846,7 @@ internal fun setToolEnabled(context: Context, name: String, enabled: Boolean) {
 internal fun buildToolsArray(): JSONArray {
     // ★ 预设优先于单个工具开关：
     //   极简模式下一个工具都不发（连 run_code 也不发），
-    //   PTC 模式只发 run_code —— 那六个工具变成沙箱里的函数，不再出现在 tools 里。
+    //   PTC 模式只发 run_code —— 那七个工具变成沙箱里的函数，不再出现在 tools 里。
     when (AppSettings.preset) {
         AgentPreset.MINIMAL -> return JSONArray()
         AgentPreset.PTC -> return JSONArray().put(JSONObject(PTC_TOOL_DEFINITION))
@@ -2095,13 +2179,23 @@ private fun readTextFile(path: String): ToolExecResult {
             }
 
             if (isBinary) {
-                Log.d(TOOL_LOG_TAG, "二进制文件，不按文本解析: $path")
-                ToolExecResult(
-                    false,
-                    "这是二进制文件（pptx / docx / xlsx / zip / 图片 / 音视频之类），" +
-                        "无法作为纯文本解析。文件大小 ${bytes.size} 字节。" +
-                        "请如实告诉用户无法直接读取内容，不要猜测里面写了什么。"
-                )
+                // ★ 二进制不等于"读不了"：.docx / .xlsx 本身就是 zip 容器，
+                //   NUL 探测必然命中，但里面是可以提取出正文的。
+                //   所以先问解析器：是 Office 就提取正文（截断由解析器做，
+                //   这里不再二次截断）；解析器说不支持（PDF、旧版二进制 .doc/.xls/.et/.wps），
+                //   就把它的话术原样转给模型 —— 和弹窗里给用户的拒绝理由保持同一个来源。
+                val parsed = parseOfficeBytes(file.name, bytes)
+                if (parsed.ok) {
+                    // ★ 本侧也兜一次截断，理由同 addAttachment：解析器是并行开发的
+                    //   独立文件，它的 4 个截断单测现在还是红的，token 安全不能押在
+                    //   别人今天能不能改对上。已截断文本再过一遍是幂等的。
+                    val text = truncateOfficeText(parsed.text)
+                    Log.d(TOOL_LOG_TAG, "Office 解析成功: kind=" + parsed.kind + ", " + text.length + " 字符")
+                    ToolExecResult(true, text)
+                } else {
+                    Log.d(TOOL_LOG_TAG, "Office 不支持: kind=" + parsed.kind + ", message=" + parsed.message)
+                    ToolExecResult(false, parsed.message)
+                }
             } else {
                 val text = String(bytes, Charsets.UTF_8)
                 Log.d(TOOL_LOG_TAG, "读取成功: ${text.length} 字符")
@@ -3128,6 +3222,13 @@ internal fun runCode(code: String): ToolExecResult {
         ScriptableObject.putProperty(tools, "runShell", jsHostFunction { _, _, a ->
             invoke("run_shell", JSONObject().put("command", jsArgStr(a, 0)))
         })
+        // ★ v1.1 联网搜索。
+        //   注意：JS 沙箱本身没有网络（fetch / XMLHttpRequest 都被 ClassShutter 封了），
+        //   这条是【宿主函数】—— 请求在 App 的 Java 层发出，脚本只是拿到一个字符串结果。
+        //   所以「沙箱无网络」这条安全边界没有破：脚本依然摸不到任何 Java 类。
+        ScriptableObject.putProperty(tools, "webSearch", jsHostFunction { _, _, a ->
+            invoke("web_search", JSONObject().put("query", jsArgStr(a, 0)))
+        })
         ScriptableObject.putProperty(scope, "tools", tools)
 
         // ---------- 跑 ----------
@@ -3186,6 +3287,259 @@ internal fun runCode(code: String): ToolExecResult {
     // ok=false 只在脚本本身挂了的时候给。内部某个工具失败不算 overall 失败 ——
     // 模型可能在代码里已经判断并补救了，界面不该显示成红色错误。
     return ToolExecResult(failure == null, text)
+}
+
+// ============================================================
+// 3.28 联网搜索（web_search）
+//
+// ★ 为什么直接接 DeepSeek 官方搜索接口，而不是自己解析网页：
+//   DeepSeek 在 2026-10-17 上线了 Search / Fetch 两个「裸 JSON」接口
+//   （POST https://api.deepseek.com/v1/tools/search），
+//   和模型接口共用同一把 Bearer Key，返回的 summary 字段本身就是「写给模型读的」
+//   600~800 字长摘要 —— 这正是我们需要的形状。
+//   自己爬 DuckDuckGo / Bing 的 HTML 要解析页面结构，对方一改版就全废，
+//   而且国内网络还不一定连得上。官方接口是这里唯一合理的选择。
+//
+// ★ 铁律（改这段之前先看）：
+//   1. 不许硬编码任何 Key。key 一律读 ApiConfig.apiKey（用户填的、加密存的）。
+//   2. 这个函数是【同步阻塞】的。它只被 executeTool 调用，而 executeTool 永远
+//      跑在 runAgentLoop 的 Dispatchers.IO 协程里。绝对不要在 Compose 或主线程里直接调。
+//   3. 任何异常都必须变成一句人话【返回给模型】，不许往上抛 ——
+//      工具抛异常会让整轮对话变成红色错误气泡，用户看到的就是「搜索把聊天搞崩了」。
+//   4. 它跟 50ms 流式批处理没有半点关系：搜索发生在「工具调用」阶段，
+//      那时还没有任何 token 在流。别在这附近引入任何 Compose 状态读写。
+//
+// ★ 计费（官方口径）：
+//   每 1000 次「HTTP 200 且有结果」的请求 5 元；
+//   失败、超时、空结果都不计费。2026-11-01 00:00 起正式收费。
+// ============================================================
+
+/** 只要前 3 条。条数越多 token 越贵，3 条对回答"今天发生了什么"已经够了 */
+private const val SEARCH_MAX_RESULTS = 3
+
+/** 单次搜索最多等多久（秒）。搜索接口正常 1~3 秒返回，20 秒还没动静就是网络有问题 */
+private const val SEARCH_TIMEOUT_SECONDS = 20L
+
+/** 官方限制：query 1~128 个 Unicode 字符，不能全是空白 */
+private const val SEARCH_MAX_QUERY_CHARS = 128
+
+/** 塞回给模型的结果最多多少字符。3 条 × 800 字摘要 + 标题链接，4000 是够用的上限 */
+private const val SEARCH_MAX_OUTPUT_CHARS = 4000
+
+/** 没有配置 baseUrl 时的兜底（正常走 ApiConfig，这里是防 null） */
+private const val SEARCH_DEFAULT_BASE = "https://api.deepseek.com"
+
+/**
+ * 搜索专用的 OkHttp 客户端。
+ *
+ * ★ 为什么不直接复用全局的 httpClient：
+ *   全局那个 readTimeout 是 60 秒 —— 对流式对话合理（模型吐字慢），
+ *   对搜索就太长了：一次搜索卡 60 秒，用户会以为 App 死了。
+ *   这里用 newBuilder() 派生一个：连接池、线程池、DNS 缓存全部共享，
+ *   只是多了一个总超时，不会像「每请求新建 client」那样反复创建线程池。
+ * ★ 用 by lazy 只创建一次，不是每次搜索都 newBuilder 一遍。
+ */
+private val searchClient: OkHttpClient by lazy {
+    httpClient.newBuilder()
+        .callTimeout(SEARCH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build()
+}
+
+/**
+ * 拼出搜索端点。
+ *
+ * 用户可能把 baseUrl 填成 `https://api.deepseek.com`，
+ * 也可能填成 `https://api.deepseek.com/v1`，
+ * 甚至直接填完整端点。三种都要能拼对，不能拼出 `/v1/v1/tools/search`。
+ */
+private fun toolsSearchUrl(): String {
+    val base = ApiConfig.baseUrl.trim().trimEnd('/')
+    return when {
+        base.isEmpty() -> "$SEARCH_DEFAULT_BASE/v1/tools/search"
+        base.endsWith("/tools/search") -> base
+        base.endsWith("/v1") -> "$base/tools/search"
+        else -> "$base/v1/tools/search"
+    }
+}
+
+/**
+ * 真正执行一次搜索。
+ *
+ * 返回的 ToolExecResult 会被 runAgentLoop 原样塞进 role:"tool" 消息，
+ * 所以 output 里写的每一句话都是【给模型看的】，不是给用户看的 ——
+ * 措辞要直白到模型照着做就行（尤其失败时，要告诉它"别重试"）。
+ */
+private fun webSearch(query: String): ToolExecResult {
+    val q = query.trim()
+
+    // ---------- 参数校验 ----------
+    if (q.isEmpty()) {
+        return ToolExecResult(false, "参数错误：缺少 query（要搜索的关键词）。")
+    }
+    if (q.length > SEARCH_MAX_QUERY_CHARS) {
+        return ToolExecResult(
+            false,
+            "参数错误：query 有 ${q.length} 个字符，超过官方上限 $SEARCH_MAX_QUERY_CHARS。\n" +
+                "请把它压缩成几个关键词（例如「DeepSeek 搜索 API 价格」），不要把整段问题贴进来。"
+        )
+    }
+
+    // ---------- Key 校验 ----------
+    // ★ 和 runAgentLoop 读的是同一个来源：ApiConfig.apiKey。
+    //   不许出现任何写死的 key，也不许读 BuildConfig（release 包里那个值恒为空）。
+    val key = ApiConfig.apiKey
+    if (key.isBlank()) {
+        return ToolExecResult(false, "搜索失败：请先在「设置 → 模型与 API」里填写 API Key。")
+    }
+
+    // ---------- 组请求体 ----------
+    // count / need_content 都是官方字段；need_content=false 表示不要网页全文
+    // （正文会让单条结果涨到几万字符，token 费用直接翻十几倍，这里只要摘要）。
+    val bodyJson = JSONObject().apply {
+        put("query", q)
+        put("count", SEARCH_MAX_RESULTS)
+        put("need_content", false)
+    }.toString()
+
+    val startedAt = SystemClock.elapsedRealtime()
+
+    return try {
+        val request = Request.Builder()
+            .url(toolsSearchUrl())
+            // ★ 唯一合法的鉴权来源：用户自己填的 Key
+            .addHeader("Authorization", "Bearer $key")
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Accept", "application/json")
+            .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+
+        // ★ use{} 保证 Response 一定被关掉，否则连接池会泄漏
+        searchClient.newCall(request).execute().use { response ->
+            val raw = response.body?.string().orEmpty()
+            val cost = SystemClock.elapsedRealtime() - startedAt
+            Log.d(
+                TOOL_LOG_TAG,
+                "web_search \"$q\" -> HTTP ${response.code}, ${cost}ms, ${raw.length} 字符"
+            )
+
+            if (!response.isSuccessful) {
+                Log.e(TOOL_LOG_TAG, "web_search 失败 HTTP ${response.code}: ${raw.take(300)}")
+                return@use ToolExecResult(false, searchHttpErrorText(response.code, raw))
+            }
+            parseSearchResults(raw, q)
+        }
+    } catch (e: SocketTimeoutException) {
+        // 读写超时
+        Log.e(TOOL_LOG_TAG, "web_search 超时: ${e.message}")
+        ToolExecResult(false, "搜索失败：网络超时，请检查网络连接。")
+    } catch (e: InterruptedIOException) {
+        // ★ OkHttp 的 callTimeout 抛的是 InterruptedIOException("timeout")，
+        //   不是 SocketTimeoutException —— 只捕获后者会漏掉「总超时」这一路。
+        Log.e(TOOL_LOG_TAG, "web_search 总超时: ${e.message}")
+        ToolExecResult(false, "搜索失败：网络超时，请检查网络连接。")
+    } catch (e: UnknownHostException) {
+        // DNS 解析不到 = 手机没网 / 域名被墙
+        Log.e(TOOL_LOG_TAG, "web_search 域名解析失败: ${e.message}")
+        ToolExecResult(false, "搜索失败：网络超时，请检查网络连接。")
+    } catch (e: IOException) {
+        Log.e(TOOL_LOG_TAG, "web_search 网络异常", e)
+        ToolExecResult(false, "搜索失败：网络异常（${e.javaClass.simpleName}），请检查网络连接。")
+    } catch (e: Exception) {
+        // 兜底：宁可返回一句「搜索失败」，也不能让异常冒到 runAgentLoop 去
+        Log.e(TOOL_LOG_TAG, "web_search 未知异常", e)
+        ToolExecResult(false, "搜索失败：${e.javaClass.simpleName}: ${e.message}")
+    }
+}
+
+/**
+ * HTTP 状态码 → 给模型看的一句话。
+ *
+ * 官方接口的错误码语义（和普通 REST 略有不同，别搞混）：
+ *   401 = Key 无效；402 = 余额不足；403 = 被安全策略拦截；
+ *   429 = 超过 QPS（每个端点各 5 QPS）。
+ */
+private fun searchHttpErrorText(code: Int, body: String): String = when (code) {
+    401, 402 -> "搜索失败：请检查您的 API Key 余额或权限。"
+    403 -> "搜索失败：请求被拒绝（403）。可能是账号没有搜索权限，或这条查询被安全策略拦截了。不要换关键词反复重试。"
+    429 -> "搜索失败：请求太频繁（429），官方限制每个账号每秒 5 次。请稍等一下再搜。"
+    in 500..599 -> "搜索失败：搜索服务暂时不可用（HTTP $code）。这是对方的问题，不要连续重试，如实告诉用户稍后再试。"
+    else -> "搜索失败：HTTP $code。${body.take(200)}"
+}
+
+/**
+ * 把官方返回的 JSON 拼成「标题 + 摘要 + 链接」的纯文本。
+ *
+ * ★ 为什么用 summary 而不是 snippet：
+ *   官方文档写得很清楚 —— snippet（100~200 字）是给【界面】展示的，
+ *   summary（600~800 字）是给【模型】读的。这里的结果最终是塞进模型上下文的，
+ *   所以必须取 summary，取错字段等于让模型拿着标题党摘要做推理。
+ *   summary 为空时再退回 snippet。
+ *
+ * 用 internal 而不是 private：这一层是纯函数（字符串进、字符串出），
+ * 可以在 JVM 单测里逐条断言，不需要真机也不需要网络 —— 见 WebSearchTest。
+ */
+internal fun parseSearchResults(raw: String, query: String): ToolExecResult {
+    val root = try {
+        JSONObject(raw)
+    } catch (e: Exception) {
+        Log.e(TOOL_LOG_TAG, "web_search 响应不是合法 JSON: ${raw.take(200)}", e)
+        return ToolExecResult(false, "搜索失败：返回内容不是合法 JSON，无法解析。")
+    }
+
+    // ★ 铁律 5：判空一律 opt() + as? String，不用 optString 的默认值写法。
+    //   Android 的 org.json 会把 JSON null 变成字符串 "null"。
+    val results = root.optJSONArray("results")
+
+    // ★ 官方文档：查不到东西返回的是 HTTP 200 + 空数组，【不是错误】。
+    //   这里必须 ok = true，否则界面上会出现一张红卡片，还会诱导模型反复重试。
+    if (results == null || results.length() == 0) {
+        return ToolExecResult(
+            true,
+            "没有找到与「$query」相关的网页。\n" +
+                "这是正常的空结果，不是调用失败。不要用同样的关键词反复搜索，" +
+                "可以换个说法再试一次，或者如实告诉用户没搜到。"
+        )
+    }
+
+    val n = minOf(results.length(), SEARCH_MAX_RESULTS)
+    val sb = StringBuilder()
+    sb.append("以下是「").append(query).append("」的联网搜索结果（共 ").append(n).append(" 条）：\n")
+
+    for (i in 0 until n) {
+        val item = results.optJSONObject(i) ?: continue
+        val title = (item.opt("title") as? String)?.trim().orEmpty().ifBlank { "(无标题)" }
+        val url = (item.opt("url") as? String)?.trim().orEmpty()
+        val summary = (item.opt("summary") as? String)?.trim().orEmpty()
+            .ifBlank { (item.opt("snippet") as? String)?.trim().orEmpty() }
+        val site = (item.opt("site_name") as? String)?.trim().orEmpty()
+        // date 是 RFC 3339（2026-06-01T00:00:00+00:00），只取前 10 位当日期用
+        val date = (item.opt("date") as? String)?.trim().orEmpty().take(10)
+
+        sb.append("\n[").append(i + 1).append("] ").append(title).append('\n')
+        if (site.isNotEmpty() || date.isNotEmpty()) {
+            sb.append("    来源：").append(site.ifBlank { "未知" })
+            if (date.isNotEmpty()) sb.append("　发布：").append(date)
+            sb.append('\n')
+        }
+        if (url.isNotEmpty()) sb.append("    链接：").append(url).append('\n')
+        sb.append("    摘要：").append(summary.ifBlank { "（这条结果没有摘要）" }).append('\n')
+    }
+
+    sb.append("\n---\n")
+    sb.append("使用要求：\n")
+    sb.append("1. 上面是网页内容，可能有错、也可能过时，不要当成绝对事实。\n")
+    sb.append("2. 引用具体信息时，把对应的「链接」原样写在回答末尾，方便用户自己核对。\n")
+    sb.append("3. 不要在回答里编造上面没有的内容；结果不够就明说不够。\n")
+
+    val text = sb.toString()
+    return ToolExecResult(
+        true,
+        if (text.length > SEARCH_MAX_OUTPUT_CHARS) {
+            text.take(SEARCH_MAX_OUTPUT_CHARS) + "\n…（结果过长，已截断）"
+        } else {
+            text
+        }
+    )
 }
 
 internal fun executeTool(name: String, argsJson: String): ToolExecResult {
@@ -3280,6 +3634,19 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                     ToolExecResult(false, "参数错误：缺少 command（要执行的 shell 命令）")
                 } else {
                     runShell(command)
+                }
+            }
+
+            // ★ v1.1 联网搜索。
+            //   query 绝不能过 cleanPath —— 它会削掉首尾的引号和标点，
+            //   而搜索运算符本身就靠这些字符：`"exact phrase"`、`-词`。
+            //   削一刀，运算符就废了，模型还会收到一个语义不同的结果。
+            "web_search" -> {
+                val query = argOf(argsJson, "query")
+                if (query.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 query（要搜索的关键词）")
+                } else {
+                    webSearch(query)
                 }
             }
 
@@ -3458,8 +3825,17 @@ fun runAgentLoop(
             if (SYSTEM_PROMPT.isNotEmpty()) {
                 messages.put(JSONObject().apply {
                     put("role", "system")
-                    // ★ 带上当前工作区约束
-                    put("content", systemPromptWithWorkspace())
+                    // ★ 带上当前工作区约束 + 当前时间。
+                    //
+                    //   ★★★ 时间必须拼在【末尾】，不能拼在开头 ★★★
+                    //     DeepSeek 的上下文缓存是按「前缀」命中的：
+                    //     时间戳一变，从它往后所有 token 全部失效。
+                    //     放开头 = 每次请求都让整份系统提示词重新计费
+                    //     （缓存命中 0.02 元/百万 → 未命中 1 元/百万，差 50 倍）；
+                    //     放末尾 = 只让最后几十个 token 失效，前面照样命中。
+                    //   三种预设（标准 / PTC / 极简）都会走到这一行，
+                    //   所以时间感知对它们一律生效，不存在"某个模式不知道今天几号"。
+                    put("content", systemPromptWithWorkspace() + "\n\n" + timeContextLine())
                 })
             }
 
@@ -3883,6 +4259,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val workspaceState = mutableStateOf("")
     val showSettingsState = mutableStateOf(false)
 
+    /**
+     * 正在联网搜索的关键词。空串 = 没在搜。
+     *
+     * ★ 为什么单独开一个状态，而不是直接看工具卡片：
+     *   工具卡片是「执行完才落库」的历史记录，而用户需要知道的是
+     *   「这 3 秒 App 在干什么」。搜索要等网络，卡片那时还只是一张
+     *   写着 ok=null 的灰卡片，看不出是搜索还是卡死了。
+     *
+     * ★ 放在 ViewModel 里（不是 remember）：
+     *   旋转屏幕时状态不能丢 —— 否则转一下就"搜索消失了"，
+     *   用户会以为搜索被取消了。
+     */
+    val searchingQueryState = mutableStateOf("")
+
     /** 首次从数据库加载只做一次。旋转回来不要重新读库，否则会打断正在进行的流。 */
     var loadedOnce = false
 
@@ -3918,6 +4308,10 @@ fun ChatScreen() {
 
     // 设置页
     var showSettings by vm.showSettingsState
+
+    // ★ v1.1：正在联网搜索的关键词（空串 = 没在搜）。
+    //   在底部状态条上显示「🔍 正在联网搜索: xxx」。
+    var searchingQuery by vm.searchingQueryState
 
     // 存储权限提示（Agent 的 read_file 工具需要「所有文件访问权限」）
     var showStorageTip by remember { mutableStateOf(false) }
@@ -4231,8 +4625,9 @@ fun ChatScreen() {
                 } else {
                     // ---------- 自动滚到底 ----------
                     //
-                    // 两个细节值得说：
+                    // 三个细节值得说：
                     //  ① 用户往上翻历史时不要把他拽回底部，否则根本没法看旧消息
+                    //     —— 但这条只管「流式吐字」；新增 item 一律跟随（见下面注释）
                     //  ② 流式输出用瞬时滚动，不用动画 —— 每 50ms 刷一次，
                     //     动画会被下一次刷新打断，看起来反而在抖
                     val listState = rememberLazyListState()
@@ -4257,7 +4652,17 @@ fun ChatScreen() {
                         }
                         val isNewMessage = itemCount != prevCount
                         prevCount = itemCount
-                        if (!atBottom) return@LaunchedEffect
+                        // ★ 只有「流式吐字」（itemCount 不变、lastLen 在长）才看 atBottom，
+                        //   免得用户上翻看历史时被每 50ms 的刷新一次次拽回底部。
+                        //
+                        //   ★ 新增 item 一律跟随到底部，不能看 atBottom：
+                        //     工具卡片是插在「AI 占位气泡」前面的，这一插就会把
+                        //     占位气泡挤出屏幕，atBottom 当场变成 false，
+                        //     后面流式输出就再也不跟滚了 —— 用户会看到自己的
+                        //     问题下面空空如也，以为模型没回答。
+                        //     （v1.1 实测复现：web_search 的答案和工具卡片
+                        //     全都躺在屏幕外，要手动往上滑才看得见。）
+                        if (!isNewMessage && !atBottom) return@LaunchedEffect
 
                         val target = itemCount - 1
                         if (isNewMessage) {
@@ -4305,29 +4710,63 @@ fun ChatScreen() {
                 val ctx = LocalContext.current
                 var attachments by remember { mutableStateOf<List<Attachment>>(emptyList()) }
                 var showAttachSheet by remember { mutableStateOf(false) }
+                // Office 解析不通过时弹出的提示文案（null = 不弹）
+                var officeTip by remember { mutableStateOf<String?>(null) }
 
                 val attachScope = rememberCoroutineScope()
 
                 // 选中后立刻把 content:// 落盘，拿到真实绝对路径。
                 // 图片和文件走同一条路，区别只在 isImage 标记。
-                fun addAttachment(uri: Uri, isImage: Boolean) {
+                //
+                // ★ v1.1：isDocument 为 true 时，落盘之后顺手解析一次 Office。
+                //   解析成功 → 照常当附件（read_file 会再解析一遍，两边共用同一套解析器）；
+                //   解析失败（PDF / 旧版二进制）→ 从列表里摘掉并弹对话框说明原因，
+                //   因为这类文件 read_file 也读不了，挂在输入区只会让用户白等一轮。
+                fun addAttachment(uri: Uri, isImage: Boolean, isDocument: Boolean = false) {
                     val name = displayNameOf(ctx, uri)
                     val att = Attachment(uri = uri, name = name, isImage = isImage)
                     attachments = attachments + att
                     attachScope.launch(Dispatchers.IO) {
                         val result = persistAttachment(ctx, uri, name)
+                        var officeMessage: String? = null
+                        // 解析成功的正文连长度一起留着，发送时直接拼进 Prompt
+                        var parsedText: String? = null
+                        var charCount = 0
+                        if (result.isSuccess && isDocument) {
+                            val file = result.getOrNull()
+                            if (file != null) {
+                                val parsed = parseOfficeBytes(file.name, file.readBytes())
+                                if (parsed.ok) {
+                                    // ★ 这里必须自己再兜一次截断：解析器是并行开发的独立文件，
+                                    //   不能把 token 安全押在它今天能不能改对上。已截断的文本
+                                    //   再过一遍是幂等的（<= 上限就原样返回），无害。
+                                    parsedText = truncateOfficeText(parsed.text)
+                                    charCount = parsedText.length
+                                } else {
+                                    officeMessage = parsed.message
+                                }
+                            }
+                        }
                         withContext(Dispatchers.Main) {
-                            attachments = attachments.map {
+                            attachments = attachments.mapNotNull {
                                 if (it.uri == uri) {
-                                    it.copy(
-                                        state = if (result.isSuccess) {
-                                            AttachState.READY
-                                        } else {
-                                            AttachState.FAILED
-                                        },
-                                        path = result.getOrNull()?.absolutePath,
-                                        error = result.exceptionOrNull()?.message
-                                    )
+                                    if (officeMessage != null) {
+                                        // 解析不了：不留在输入区，理由交给对话框
+                                        officeTip = officeMessage
+                                        null
+                                    } else {
+                                        it.copy(
+                                            state = if (result.isSuccess) {
+                                                AttachState.READY
+                                            } else {
+                                                AttachState.FAILED
+                                            },
+                                            path = result.getOrNull()?.absolutePath,
+                                            error = result.exceptionOrNull()?.message,
+                                            parsedText = parsedText,
+                                            charCount = charCount
+                                        )
+                                    }
                                 } else {
                                     it
                                 }
@@ -4346,6 +4785,16 @@ fun ChatScreen() {
                     ActivityResultContracts.OpenDocument()
                 ) { uri -> if (uri != null) addAttachment(uri, isImage = false) }
 
+                // 「上传文档」入口：同样走系统文件管理器，但限定 MIME，
+                // 让用户一眼能看到 Office / PDF，不会被相册里的视频干扰。
+                // ★ 选中后 addAttachment(isDocument = true) 才会做「先解析再挂载」，
+                //   普通文件入口保持原样（解析交给 read_file），不改变既有行为。
+                // ★ DOC_PICKER_MIME 是数组，launch 收 Array<String>，
+                //   所以整个数组原样传进去（末尾 "*/*" 兜底），不要再套一层 arrayOf。
+                val docPicker = rememberLauncherForActivityResult(
+                    ActivityResultContracts.OpenDocument()
+                ) { uri -> if (uri != null) addAttachment(uri, isImage = false, isDocument = true) }
+
                 // ---------- 附件选择弹层 ----------
                 if (showAttachSheet) {
                     AttachmentSheet(
@@ -4359,8 +4808,49 @@ fun ChatScreen() {
                         onPickFile = {
                             showAttachSheet = false
                             filePicker.launch(arrayOf("*/*"))
+                        },
+                        onPickDoc = {
+                            showAttachSheet = false
+                            docPicker.launch(DOC_PICKER_MIME)
                         }
                     )
+                }
+
+                // ---------- Office 解析结果提示（v1.1） ----------
+                // ★ 为什么不复用 AttachmentChip 的红色 ⚠️ 状态：
+                //   解析失败的话术来自解析器本身（PDF / 旧版二进制各有固定文案），
+                //   一句话塞进小胶囊会被截断，用户看不到「该怎么补救」。
+                //   所以选中文档后先解析一次，认不出来的直接弹对话框说明原因。
+                if (officeTip != null) {
+                    AlertDialog(
+                        onDismissRequest = { officeTip = null },
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        titleContentColor = MaterialTheme.colorScheme.onSurface,
+                        textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        title = { Text(stringResource(R.string.office_unsupported_title)) },
+                        text = {
+                            Text(
+                                text = officeTip ?: "",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(onClick = { officeTip = null }) {
+                                Text(stringResource(R.string.action_ok))
+                            }
+                        }
+                    )
+                }
+
+                // ---------- 底部：联网搜索状态条（v1.1） ----------
+                // ★ 为什么放在这里、而不是插进消息列表：
+                //   消息列表有一条硬不变量 —— 最后一条永远是 AI 占位气泡，
+                //   onFlush 靠 messages.last() 定位它来原地改正文（见 §3.3）。
+                //   往列表里插一个"临时 UI item"要和 itemsIndexed 的 index 对齐，
+                //   一不小心就把这条不变量踩坏。放在输入框上方的状态带里，
+                //   视觉上就是"当前这条流式消息的状态"，效果一样，风险为零。
+                if (searchingQuery.isNotBlank()) {
+                    SearchStatusBar(query = searchingQuery)
                 }
 
                 // ---------- 底部：InfoBar（本轮费用 + 上下文用量） ----------
@@ -4424,14 +4914,54 @@ fun ChatScreen() {
                         val ready = attachments.filter {
                             it.state == AttachState.READY && it.path != null
                         }
+
+                        // ★ v1.1 文档上下文：把解析出来的正文按 brief 的格式拼在「问题」前面。
+                        //
+                        //   为什么要包一层 <<DOC:begin|名字|字数>> … <<DOC:end>> 哨兵：
+                        //     · 界面上整段剥掉，只在气泡里留一张「📄 已读取文档」卡片，
+                        //       否则一万字原文会把聊天气泡撑爆；
+                        //     · 发给模型时只剥两行哨兵、正文原样留下，模型才看得见文档；
+                        //     · 存进数据库的也是同一份，翻历史记录重发时 contentForApi
+                        //       照样能取回正文，不会出现「历史里文档内容丢了」。
+                        //
+                        //   图片和普通文件不进这里：它们没有 parsedText，仍走 read_file。
+                        val docBlock = ready.mapNotNull { att ->
+                            val text = att.parsedText
+                            if (att.isImage || text.isNullOrBlank()) {
+                                null
+                            } else {
+                                buildString {
+                                    append("<<DOC:begin|")
+                                    append(att.name)
+                                    append("|")
+                                    append(att.charCount)
+                                    append(">>")
+                                    append("\n基于以下文档内容回答我的问题：\n\n")
+                                    append(text)
+                                    append("\n<<DOC:end>>")
+                                }
+                            }
+                        }.joinToString("\n\n")
+
                         val attachBlock = if (ready.isEmpty()) {
                             ""
                         } else {
+                            // ★ doc 而不是 file：告诉 contentForApi「这个文件的正文
+                            //   已经在上面的 DOC 哨兵里了」，别再让模型去调 read_file。
                             "\n\n" + ready.joinToString("\n") { att ->
-                                "<<ATTACH:${if (att.isImage) "image" else "file"}|${att.path}>>"
+                                val kind = when {
+                                    att.isImage -> "image"
+                                    !att.parsedText.isNullOrBlank() -> "doc"
+                                    else -> "file"
+                                }
+                                "<<ATTACH:$kind|${att.path}>>"
                             }
                         }
-                        val trimmed = (inputText.trim() + attachBlock).trim()
+
+                        // 文档正文在前、问题在后：brief 要的顺序是「文档 → 问题」。
+                        // 「问题：」这个前缀也只在真有文档时才加，没文档就还是用户原话。
+                        val docPrefix = if (docBlock.isEmpty()) "" else docBlock + "\n\n问题："
+                        val trimmed = (docPrefix + inputText.trim() + attachBlock).trim()
 
                         // 空消息不发；正在流式回复时也不发
                         if (trimmed.isNotEmpty() && !isStreaming) {
@@ -4558,6 +5088,14 @@ fun ChatScreen() {
 
                                 // 模型要调工具：先插一张「执行中」的卡片
                                 onToolCallStarted = { callId, toolName, argsJson ->
+                                    // ★ v1.1 联网搜索的 UI 提示（第二步要求的那个）。
+                                    //   只对 web_search 显示：读写文件是毫秒级的，
+                                    //   弹一条提示只会闪一下更烦人；而搜索要等网络，
+                                    //   不告诉用户"在搜什么"，那 2~3 秒看起来就像卡死了。
+                                    if (toolName == "web_search") {
+                                        searchingQuery = argOf(argsJson, "query").trim()
+                                    }
+
                                     val payload = try {
                                         JSONObject().apply {
                                             put("tool", toolName)
@@ -4612,6 +5150,11 @@ fun ChatScreen() {
 
                                 // 工具执行完：把结果写回那张卡片（内存 + 数据库）
                                 onToolCallFinished = { callId, ok, output ->
+                                    // ★ v1.1：不管是不是搜索，执行完就收起状态条。
+                                    //   工具是一轮一个串行执行的（runAgentLoop 里 for 循环逐个 await），
+                                    //   所以这里无条件清空不会误清掉另一个还在跑的搜索。
+                                    searchingQuery = ""
+
                                     val slot = toolCardSlots[callId] ?: -1
 
                                     // 先把新的 content 算出来，内存和数据库用同一份
@@ -4673,6 +5216,9 @@ fun ChatScreen() {
                                 onDone = { total ->
                                     Log.d(TAG, "onDone: total=$total")
                                     isStreaming = false
+                                    // ★ 兜底：正常路径下 onToolCallFinished 已经清过了，
+                                    //   但「模型直接给答案、一次工具都没调」时不会走那里。
+                                    searchingQuery = ""
                                     vm.streamJob = null
 
                                     // ★ 流结束，这才是唯一需要写"正文"的时刻。
@@ -4692,6 +5238,9 @@ fun ChatScreen() {
                                 },
 
                                 onError = { err ->
+                                    // ★ 搜索失败 / 网络断了都要把状态条收掉，
+                                    //   否则界面上会永远挂着一条「正在联网搜索」。
+                                    searchingQuery = ""
                                     // ★ 这里才把 ErrorText 渲染成文字：
                                     //   context 是 ChatScreen 里拿到的 localizedContext，
                                     //   已经按 App 内语言设置包装过，所以切英文后错误气泡也是英文。
@@ -4738,6 +5287,8 @@ fun ChatScreen() {
                         vm.streamJob = null
                         job?.cancel()
                         isStreaming = false
+                        // ★ 用户点了停止：搜索请求可能还在路上，状态条必须一起收掉
+                        searchingQuery = ""
 
                         val sid = vm.activeSessionId
                         val partial = sessions.firstOrNull { it.id == sid }
@@ -6307,7 +6858,7 @@ private fun ConfigField(
     }
 }
 
-/** 插件：六个工具的开关 */
+/** 插件：七个工具的开关 */
 @Composable
 private fun PluginsTab() {
     val cs = MaterialTheme.colorScheme
@@ -6769,7 +7320,22 @@ fun MessageBubble(
                         }
                     )
             ) {
-                if (isErr) {
+                // ★ v1.1 文档卡片：解析成功的文档在气泡顶部显示
+                //   「📄 已读取文档：xxx.docx (字数: xxx)」。
+                //   正文里那一万字不显示（displayContent 已整段剥掉），
+                //   所以这张卡片是「模型到底看到了什么」的唯一可见线索。
+                val docCards = remember(message.content) { docCardsOf(message.content) }
+                Column {
+                    docCards.forEach { card ->
+                        DocCardRow(
+                            card = card,
+                            textColor = textColor,
+                            modifier = Modifier.padding(
+                                start = 14.dp, end = 14.dp, top = 10.dp
+                            )
+                        )
+                    }
+                    if (isErr) {
                     Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
@@ -6817,6 +7383,7 @@ fun MessageBubble(
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
                     )
+                }
                 }
             }
 
@@ -7610,6 +8177,50 @@ private fun DiffSurface(rows: List<DiffRow>) {
 // 数据全部来自 API 返回的 usage 字段（需要请求里带 stream_options.include_usage）。
 // 费用按 DeepSeek 官方峰谷单价估算，见前面 3.25 节。
 // ============================================================
+/**
+ * 联网搜索状态条：`🔍 正在联网搜索: 关键词`
+ *
+ * ★ 它解决的是「这 2~3 秒 App 到底在干嘛」的问题。
+ *   搜索要等网络，这段时间屏幕上一点变化都没有 —— 没有它，用户会以为卡死了，
+ *   或者以为模型直接跳过不搜了。
+ *
+ * ★ 为什么用 Surface 包一层小胶囊，而不是像 InfoBar 那样直接一行文字：
+ *   搜索是一个「正在发生的动作」，不是常驻数据。用主题色胶囊能一眼和
+ *   InfoBar 那行灰字区分开，而且做完就消失，不会长期占位置。
+ *
+ * ★ 为什么 maxLines = 1 + Ellipsis：
+ *   模型可能把一整句话塞进 query（虽然提示词里要求写关键词）。
+ *   不限行数的话，一条超长 query 会把输入框顶到屏幕外面去。
+ */
+@Composable
+fun SearchStatusBar(query: String) {
+    val cs = MaterialTheme.colorScheme
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp, end = 16.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(
+            shape = RoundedCornerShape(50),
+            // 半透明填充 + 1dp 半透明描边，和项目里毛玻璃那套手法保持一致
+            // （不用 Modifier.blur()，见 §6.4 ⑲）
+            color = cs.primary.copy(alpha = 0.10f),
+            border = BorderStroke(1.dp, cs.primary.copy(alpha = 0.25f))
+        ) {
+            Text(
+                text = stringResource(R.string.searching_web, query),
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
 @Composable
 fun InfoBar(usage: UsageStats, isStreaming: Boolean) {
     val cs = MaterialTheme.colorScheme
@@ -7671,14 +8282,68 @@ data class Attachment(
     val isImage: Boolean,
     val state: AttachState = AttachState.COPYING,
     val path: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    /**
+     * 「上传文档」入口解析出来的正文（null = 没解析过 / 不是文档）。
+     *
+     * ★ 为什么要把正文存进来：用户从文档入口选了 .docx，解析在落盘时已经做过一次，
+     *   这时候把正文直接带给模型，比让模型再调一次 read_file 省一整轮 token，
+     *   也少一次「模型说自己读不了」的误会。
+     * ★ 普通文件入口（filePicker）不填这个字段 —— 那些文件仍然交给 read_file，
+     *   这里不预解析，免得给用户传个大压缩包也白解一遍。
+     */
+    val parsedText: String? = null,
+    /** parsedText 的字符数；没解析就是 0。气泡和胶囊都靠它显示「已读取 N 字」。 */
+    val charCount: Int = 0
 )
 
 /** 附件在消息正文里的标记格式：<<ATTACH:image|/abs/path>> */
-private val ATTACH_MARK_RE = Regex("""<<ATTACH:(image|file)\|([^>]+)>>""")
+private val ATTACH_MARK_RE = Regex("""<<ATTACH:(image|file|doc)\|([^>]+)>>""")
+
+/**
+ * 文档上下文哨兵的起始标记：<<DOC:begin|文件名|字数>>
+ *
+ * ★ 为什么单独一套标记而不是复用 ATTACH：它俩的寿命不一样。
+ *   ATTACH 标记在「发给模型」和「界面显示」两条路上都要被剥掉，
+ *   而 DOC 哨兵只有显示时整段剥掉、发给模型时留着正文。
+ *   混用一套正则就分不出该剥到哪儿。
+ */
+private val DOC_BEGIN_RE = Regex("""<<DOC:begin\|([^|>]*)\|(\d+)>>""")
+
+/** 文档上下文哨兵的结束标记：<<DOC:end>> */
+private val DOC_END = "<<DOC:end>>"
 
 /** 落盘目录名 */
 private const val ATTACH_DIR = "attachments"
+
+/**
+ * 「上传文档」入口限定的 MIME 类型（Office + PDF）。
+ *
+ * ★ 为什么不放开所有类型：全放开的话文件管理器会把相册视频、安装包一起列出来，
+ *   用户得在几百个文件里翻自己要的那个。这份名单让系统做初步过滤，
+ *   所以它只是"减噪"不是"硬过滤"。
+ * ★ 为什么最后还要一个「任意类型」兜底（写法是引号里星号斜杠星号）：各厂商文件管理器对 MIME 的上报很不全，
+ *   WPS 存的 .doc 有的只报 application/octet-stream，小米/华为自家文档目录
+ *   甚至会报 application/vnd.android.document。少了这一条，
+ *   用户在自己手机的文件管理器里明明看着这个文件却选不到 —— 所以宁可多列几个，
+ *   真正判"能不能解析"由 OfficeParser.looksLikeOffice 做，那边才是唯一真相。
+ * ★ 名单本身是注释级意图：PDF 和旧版二进制格式最终会在 addAttachment 里被
+ *   解析器拒掉并弹对话框，列进来只是为了让用户"能选到"，然后得到一句明确的拒绝。
+ */
+private val DOC_PICKER_MIME = arrayOf(
+    // OOXML（现代 Office 真正的 MIME）
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    // PDF：解析器不支持，但必须能选到，才好给出明确拒绝理由
+    "application/pdf",
+    // 旧版二进制 Office（.doc / .xls / .et）
+    "application/msword",
+    "application/vnd.ms-excel",
+    // WPS 私有格式 / 上报
+    "application/vnd.ms-wps",
+    // 兜底：各厂商文件管理器 MIME 上报不全，见上面注释
+    "*/*"
+)
 
 /**
  * 把 content:// 的内容复制成一个真实文件，返回绝对路径。
@@ -7774,13 +8439,17 @@ private fun imageToDataUrl(path: String): String? {
  *   而且重启后还要重新拼。只存路径，用的时候现编码，是最省的。
  */
 private fun contentForApi(msg: ChatMessage): Any {
-    if (!msg.isUser || !msg.content.contains("<<ATTACH:")) return msg.content
+    if (!msg.isUser) return msg.content
+    if (!msg.content.contains("<<ATTACH:") && !msg.content.contains("<<DOC:")) return msg.content
 
     val matches = ATTACH_MARK_RE.findAll(msg.content).toList()
-    if (matches.isEmpty()) return msg.content
 
-    val textOnly = ATTACH_MARK_RE.replace(msg.content, "").trim()
+    // ★ 文档上下文：只剥两行哨兵，正文原样发给模型。
+    //   历史消息重发时靠这条把文档内容带回去，不会出现「翻回去问，模型说不认识那份文档」。
+    val textOnly = ATTACH_MARK_RE.replace(stripDocBlocks(msg.content), "").trim()
     val images = matches.filter { it.groupValues[1] == "image" }.map { it.groupValues[2] }
+    // doc 的正文已经在 textOnly 里了，这里不能再让它走 read_file 那一套，
+    // 否则模型会为了「读一个已经读过的文件」白跑一轮工具。
     val files = matches.filter { it.groupValues[1] == "file" }.map { it.groupValues[2] }
 
     val textPart = buildString {
@@ -7789,6 +8458,10 @@ private fun contentForApi(msg: ChatMessage): Any {
             if (isNotEmpty()) append("\n\n")
             append("用户上传了一个文件，路径是：").append(path)
             append("\n请调用你的 read_file 工具读取并分析它。")
+            // ★ v1.1：docx / xlsx 的 read_file 会直接返回解析出的正文，
+            //   不再返回"这是二进制文件"。补一句是怕模型还按老经验先入为主地拒绝，
+            //   历史消息里这条提示会和当前版本的系统提示词一起生效。
+            append("\n（.docx / .xlsx 会由系统解析成正文后交给你，可以直接分析。）")
         }
     }
 
@@ -7816,10 +8489,96 @@ private fun contentForApi(msg: ChatMessage): Any {
     return parts
 }
 
-/** 界面上展示用的正文：去掉附件标记 */
+/**
+ * 界面上展示用的正文：去掉附件标记，并且把整段文档上下文剥掉。
+ *
+ * ★ 文档上下文必须整段剥：正文最多一万字，全塞进聊天气泡会把气泡撑到
+ *   屏幕外，用户想看看自己问了什么得划半天。剥掉之后气泡里只剩问题本身，
+ *   文档信息由 docCardsOf 单独渲染成一张小卡片。
+ */
 private fun displayContent(raw: String): String {
-    if (!raw.contains("<<ATTACH:")) return raw
-    return ATTACH_MARK_RE.replace(raw, "").trim()
+    if (!raw.contains("<<ATTACH:") && !raw.contains("<<DOC:")) return raw
+    var s = stripDocBlocks(raw)
+    s = ATTACH_MARK_RE.replace(s, "")
+    return s.trim()
+}
+
+/**
+ * 剥掉「<<DOC:begin …>> 到 <<DOC:end>>」整段，只留两头的用户话。
+ *
+ * 用 indexOf 手写循环而不是一条正则：
+ *   · 文档正文里完全可能出现 >> 或 <<，正则的 .*? 遇到嵌套/半个标记会配错；
+ *   · 正文里出现「<<DOC:begin|」这种字面内容的概率约等于零，但即便出现了，
+ *     indexOf 从头往后找也是「找最近的一个 end」，行为可预测。
+ */
+private fun stripDocBlocks(raw: String): String {
+    if (!raw.contains("<<DOC:")) return raw
+    val sb = StringBuilder()
+    var i = 0
+    while (i < raw.length) {
+        val b = raw.indexOf("<<DOC:begin|", i)
+        if (b < 0) {
+            sb.append(raw, i, raw.length)
+            break
+        }
+        sb.append(raw, i, b)
+        val e = raw.indexOf(DOC_END, b)
+        if (e < 0) {
+            // 只有开头没有结尾（老数据 / 写入被打断）：把剩下的全丢，
+            // 否则后面一万字原文会漏到界面上。
+            break
+        }
+        i = e + DOC_END.length
+    }
+    return sb.toString()
+}
+
+/** 气泡里那张「📄 已读取文档」卡片需要的信息 */
+private data class DocCard(val name: String, val charCount: Int)
+
+/**
+ * 从消息正文里抽出文档卡片列表（按出现顺序）。
+ *
+ * ★ 为什么从正文里反解而不是另存一张表：哨兵里已经带了文件名和字数，
+ *   反解一次就够，不值得为一个展示字段加一张表 + 一次查询。
+ */
+private fun docCardsOf(raw: String): List<DocCard> {
+    if (!raw.contains("<<DOC:")) return emptyList()
+    return DOC_BEGIN_RE.findAll(raw).map { m ->
+        DocCard(name = m.groupValues[1], charCount = m.groupValues[2].toIntOrNull() ?: 0)
+    }.toList()
+}
+
+/**
+ * 气泡里的「📄 已读取文档」小卡片。
+ *
+ * ★ 为什么用普通 Text 而不是 Card/Surface：卡片本身已经在一张大气泡里，
+ *   再套一层容器会画出两层边框、两层圆角，视觉上很脏。
+ *   一行字 + 一个 📄 就够说明「这份文档进去了」。
+ * ★ 文件名可能很长：maxLines = 1 + ellipsis，否则窄气泡会被撑高。
+ */
+@Composable
+private fun DocCardRow(card: DocCard, textColor: Color, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "📄",
+            style = MaterialTheme.typography.labelSmall,
+            color = textColor
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = "已读取文档：" + card.name + " (字数: " + card.charCount + ")",
+            color = textColor.copy(alpha = 0.75f),
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false)
+        )
+    }
 }
 
 /** 从 content:// 取出文件名；取不到就退回路径末段 */
@@ -8066,7 +8825,8 @@ private fun AttachmentChip(att: Attachment, onRemove: () -> Unit) {
 private fun AttachmentSheet(
     onDismiss: () -> Unit,
     onPickImage: () -> Unit,
-    onPickFile: () -> Unit
+    onPickFile: () -> Unit,
+    onPickDoc: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
 
@@ -8091,6 +8851,7 @@ private fun AttachmentSheet(
             )
             SheetAction(emoji = "📷", label = stringResource(R.string.sheet_image), onClick = onPickImage)
             SheetAction(emoji = "📁", label = stringResource(R.string.sheet_file), onClick = onPickFile)
+            SheetAction(emoji = "📄", label = stringResource(R.string.sheet_doc), onClick = onPickDoc)
         }
     }
 }

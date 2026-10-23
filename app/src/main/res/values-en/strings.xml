@@ -45,7 +45,7 @@
     <string name="preset_standard">Standard</string>
     <string name="preset_ptc">PTC</string>
     <string name="preset_minimal">Minimal</string>
-    <string name="desc_preset_standard">All six tools handed over one by one. Most predictable, easiest to debug.</string>
+    <string name="desc_preset_standard">All seven tools handed over one by one. Most predictable, easiest to debug.</string>
     <string name="desc_preset_ptc">Only run_code. The model writes JavaScript that calls tools in sequence. Best for batch work.</string>
     <string name="desc_preset_minimal">No tools at all, plain chat. Saves tokens, but cannot read files.</string>
 
@@ -112,6 +112,8 @@
     <string name="tool_running">Calling: %1$s</string>
     <string name="tool_done">Done: %1$s</string>
     <string name="tool_failed">Failed: %1$s</string>
+    <!-- v1.1 web search: bottom status strip -->
+    <string name="searching_web">🔍 Searching the web: %1$s</string>
     <string name="drawer_open">Open drawer</string>
     <string name="new_chat">New chat</string>
     <string name="search_chats">Search chats</string>
@@ -133,6 +135,9 @@
     <string name="sheet_title">Add attachment</string>
     <string name="sheet_image">Upload image</string>
     <string name="sheet_file">Upload file</string>
+    <string name="sheet_doc">Upload document (docx / xlsx)</string>
+    <string name="office_unsupported_title">This format is not supported</string>
+    <string name="office_unsupported_body">%1$s</string>
 
     <!-- ============ Sidebar / storage tip ============ -->
     <string name="storage_tip_title">File access permission needed</string>
