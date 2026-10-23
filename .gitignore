@@ -34,3 +34,7 @@ local.properties
 /.keystore/
 *.jks
 *.keystore
+
+# 视觉验证的原始截图留档与派发草稿，不进仓库（核心 3 张已放 docs/images）
+/test-screenshots/
+/.dispatch/
