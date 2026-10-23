@@ -184,6 +184,10 @@
     <string name="info_context">上下文 %1$s / %2$s</string>
     <string name="info_generating">生成中…</string>
 
+    <!-- ask_user 工具（v1.1 阶段三） -->
+    <string name="ask_user_title">AGENT 提问</string>
+    <string name="ask_user_hint">输入你的回答…</string>
+
     <!-- ============ 错误文案 ============ -->
     <string name="err_401">API Key 无效或已欠费（401）。\n请到「设置 → 模型与 API」检查 Key 是否填错、账户是否还有余额。</string>
     <string name="err_402">账户余额不足（402）。\n请到 DeepSeek 开放平台充值后再试。</string>

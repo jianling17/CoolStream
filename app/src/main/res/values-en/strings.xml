@@ -184,6 +184,10 @@
     <string name="info_context">Context %1$s / %2$s</string>
     <string name="info_generating">Generating…</string>
 
+    <!-- ask_user tool (v1.1 phase 3) -->
+    <string name="ask_user_title">AGENT ASKS</string>
+    <string name="ask_user_hint">Type your answer…</string>
+
     <!-- ============ Error messages ============ -->
     <string name="err_401">Invalid API key or insufficient balance (401).\nCheck the key under Settings → Model &amp; API and confirm the account still has credit.</string>
     <string name="err_402">Insufficient balance (402).\nTop up on the DeepSeek platform and try again.</string>

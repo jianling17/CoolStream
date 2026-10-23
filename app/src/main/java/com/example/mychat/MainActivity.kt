@@ -39,6 +39,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
@@ -133,6 +134,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.lifecycle.Lifecycle
@@ -227,6 +230,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -281,6 +285,14 @@ val SYSTEM_PROMPT = """
 - 搜索结果是别人写的网页，可能有错也可能过时。引用时把链接原样列在回答末尾，
   绝对不要编造搜索结果里没有的内容；搜索结果为空就如实说没搜到，不要换个说法假装搜到了。
 - 如果用户没让你联网、问题也不需要实时信息，就不要搜 —— 每次搜索都要花搜索费。
+
+★ 关于 ask_user：
+- 它用来「向用户提问并等待回答」：缺少目标路径、格式偏好、确认意图这类只有用户
+  才知道的信息，而任务又无法继续时，调用它，把问题写进 question。
+- 调用它之后对话会暂停，用户的回答会作为工具结果返回给你，继续往下做即可。
+- 用户取消弹窗时会返回「用户取消了操作」，此时不要再追问同一个问题，
+  改用合理默认值继续，或如实说明你缺哪条信息、为什么给不出结果。
+- 不要用它汇报进度、不要自问自答、不要在能从上下文推断出答案时还去问用户。
 
 严格遵守以下规则：
 1. 用户要求查看、读取、打开某个文件时，必须先调用 read_file，
@@ -1293,6 +1305,23 @@ private val TOOL_DEFINITIONS = """
         "required": ["query"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ask_user",
+      "description": "向用户提出一个问题并等待回答。当你缺少关键信息（目标路径、格式偏好、确认意图等）而无法继续时调用它；question 写一句话、说清需要用户提供什么。用户回答后你会收到答案并继续；用户取消则返回「用户取消了操作」。不要用它汇报进度或自问自答。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "要问用户的问题，一句话，1~500 个字符"
+          }
+        },
+        "required": ["question"]
+      }
+    }
   }
 ]
 """
@@ -1571,7 +1600,10 @@ internal val ALL_TOOL_NAMES = listOf(
     "list_dir", "search_files", "read_file", "write_file", "replace_in_file", "run_shell",
     // ★ v1.1 新增。放在最后不是随便排的：前六个都是「动手机上的东西」，
     //   只有它一个是要花钱联网的，单独排在末尾，设置页里一眼就能看出区别。
-    "web_search"
+    "web_search",
+    // ★ v1.1 阶段三新增。排 web_search 后面：它不碰手机、也不花钱，
+    //   但要「暂停等用户输入」，性质和前七个都不同，放在最后单独一组。
+    "ask_user"
 )
 
 /** 每个工具在设置页里的一句话说明（写给用户看，不是写给模型看） */
@@ -1584,7 +1616,8 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "run_shell" to "通过 Shizuku 执行 shell 命令，权限很高",
     // ★ 说明里要写清「要花钱」，否则用户会以为和别的工具一样是免费的本地操作。
     //   官方单价：每 1000 次成功请求 5 元（失败和空结果不计费）。
-    "web_search" to "联网搜索网页（走 DeepSeek 官方搜索接口，每次约 ¥0.005）"
+    "web_search" to "联网搜索网页（走 DeepSeek 官方搜索接口，每次约 ¥0.005）",
+    "ask_user" to "向用户提出问题并等待回答（不花钱，会暂停对话）"
 )
 
 // ============================================================
@@ -3786,6 +3819,18 @@ fun runAgentLoop(
     onToolCallFinished: (id: String, ok: Boolean, output: String) -> Unit,
     onFlush: (String) -> Unit,
     onUsage: (UsageStats) -> Unit,
+    /**
+     * Agent 想问用户一个问题（ask_user 工具）。
+     *
+     * 返回用户的回答；用户取消返回 null。
+     * 这是 runAgentLoop 唯一的 suspend 回调：调用方要弹对话框、
+     * 「等用户打完字再回来」，没有比挂起更自然的写法 ——
+     * IO 协程在这里 park 住，Loop 天然暂停，零轮询零忙等。
+     *
+     * ★ 传 null 表示这一轮没有 UI 可以弹（比如 ask_user 被关掉的场景
+     *   由 tools 数组过滤兜底，走不到这里；防御性留空 = 工具直接报错）。
+     */
+    onAskUser: (suspend (question: String) -> String?)? = null,
     onDone: (totalChars: Int) -> Unit,
     /**
      * 出错回调。
@@ -4032,8 +4077,37 @@ fun runAgentLoop(
                         onToolCallStarted(callId, toolName, argsJson)
                     }
 
-                    // ★ 本地真正执行（不在主线程，不阻塞 UI）
-                    val result = executeTool(toolName, argsJson)
+                    // ★ ask_user 特例：它不在 executeTool 里执行。
+                    //
+                    //   executeTool 是同步纯函数（文件/搜索都毫秒级返回），
+                    //   而 ask_user 的「执行」= 弹对话框 + 等用户打字，秒级甚至分钟级。
+                    //   硬塞进 executeTool 就得把挂起函数传染给它的全部调用链。
+                    //
+                    //   所以在这里拦截：onAskUser 是 suspend 的，
+                    //   runAgentLoop 本来就跑在 IO 协程里，await 它等于让
+                    //   整个 Loop 挂起 —— 对话暂停、不耗 CPU、不发请求。
+                    val result = if (toolName == "ask_user") {
+                        val question = argOf(argsJson, "question").trim()
+                        if (question.isEmpty()) {
+                            ToolExecResult(false, "问题内容为空：question 参数不能为空字符串")
+                        } else {
+                            val answer = onAskUser?.invoke(question)
+                            if (answer == null) {
+                                ToolExecResult(true, "用户取消了操作")
+                            } else if (answer.isBlank()) {
+                                ToolExecResult(
+                                    true,
+                                    "用户提交了空回答。不要把空串当成有意义的答案，" +
+                                        "可以用合理默认值继续，或向用户说明你缺少的信息。"
+                                )
+                            } else {
+                                ToolExecResult(true, "用户的回答：$answer")
+                            }
+                        }
+                    } else {
+                        // ★ 本地真正执行（不在主线程，不阻塞 UI）
+                        executeTool(toolName, argsJson)
+                    }
                     Log.d(TAG, "tool=$toolName ok=${result.ok} len=${result.output.length}")
 
                     withContext(Dispatchers.Main) {
@@ -4243,6 +4317,13 @@ data class ChatSession(
 // ⚠️ 注意：ViewModel 只在「配置变更」时存活；进程被杀（真正退出）依然会丢，
 //    那种情况靠 Room 恢复。
 // ============================================================
+/**
+ * ask_user 的「用户点了取消」哨兵。
+ * ★ 用 === 比较引用而不是字符串内容：用户手动输入恰好这串字的概率为零，
+ *   但引用相等是绝对可靠的 —— 不存在歧义路径。
+ */
+private val ASK_USER_CANCELLED = String(charArrayOf('@'))
+
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ★ 这里刻意不放 dao：
@@ -4281,6 +4362,47 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 本轮 AI 占位行在数据库里的 id（停止生成时落库用） */
     val aiRowId = AtomicInteger(0)
+
+    /**
+     * ask_user 的桥接状态：Agent 正在等用户回答的问题；null = 没有在等。
+     *
+     * ★ 为什么放 ViewModel 而不是 remember：
+     *   旋转屏幕时 Compose 状态会重建，而「Loop 还挂在 IO 协程里等答案」
+     *   这个事实不变。放 remember 的话一旋转 deferred 就丢了，Loop 永远挂起。
+     *
+     * ★ 为什么 deferred 用 CompletableDeferred 而不是 MutableStateFlow：
+     *   挂起中的 runAgentLoop 需要「一次性、可 await」的语义 ——
+     *   StateFlow 是「最新值」，没人消费也没关系；Deferred 是「承诺」，
+     *   IO 协程 park 在 await 上，用户提交/取消的那一次 complete 就是全部。
+     */
+    val pendingQuestionState = mutableStateOf<String?>(null)
+    var askDeferred: CompletableDeferred<String>? = null
+
+    /**
+     * runAgentLoop 传给 onAskUser 的实现：在 IO 协程被调用，
+     * 把问题切到主线程写进状态（触发 Compose 弹窗），然后挂起等答案。
+     */
+    suspend fun askUserAndWait(question: String): String? {
+        val d = CompletableDeferred<String>()
+        withContext(Dispatchers.Main) {
+            askDeferred = d
+            pendingQuestionState.value = question
+        }
+        // ★ 取消传播：用户点「停止生成」会 cancel 整个 runAgentLoop，
+        //   await 在这里抛 CancellationException，弹窗状态必须清掉。
+        try {
+            val raw = d.await()
+            // 哨兵串 = 用户点了取消：归一成 null，让调用方收到「用户取消了操作」
+            return if (raw === ASK_USER_CANCELLED) null else raw
+        } finally {
+            withContext(Dispatchers.Main) {
+                if (askDeferred === d) {
+                    askDeferred = null
+                    pendingQuestionState.value = null
+                }
+            }
+        }
+    }
 
     /** 本轮属于哪个会话 */
     var activeSessionId: String = ""
@@ -4842,6 +4964,25 @@ fun ChatScreen() {
                     )
                 }
 
+                // ---------- ask_user 弹窗（v1.1 阶段三） ----------
+                // ★ pendingQuestion 非 null = runAgentLoop 正挂在 askUserAndWait 上等答案。
+                //   在这里弹极客风毛玻璃对话框；旋转屏幕状态也不丢（存 ViewModel）。
+                vm.pendingQuestionState.value?.let { question ->
+                    AskUserDialog(
+                        question = question,
+                        onSubmit = { answer ->
+                            vm.askDeferred?.complete(answer)
+                            // 状态由 askUserAndWait 的 finally 统一清，这里不重复清，
+                            // 避免竞态下把下一轮刚写进去的问题又抹掉。
+                        },
+                        onCancel = {
+                            // 取消和空回答走两条路：complete 哨兵引用，
+                            // askUserAndWait 里用 === 识别后归一成 null。
+                            vm.askDeferred?.complete(ASK_USER_CANCELLED)
+                        }
+                    )
+                }
+
                 // ---------- 底部：联网搜索状态条（v1.1） ----------
                 // ★ 为什么放在这里、而不是插进消息列表：
                 //   消息列表有一条硬不变量 —— 最后一条永远是 AI 占位气泡，
@@ -5212,6 +5353,9 @@ fun ChatScreen() {
 
                                 // token 用量回来了：更新 InfoBar
                                 onUsage = { u -> lastUsage = u },
+
+                                // ask_user：把问题交给 ChatScreen 的桥接实现
+                                onAskUser = { q -> vm.askUserAndWait(q) },
 
                                 onDone = { total ->
                                     Log.d(TAG, "onDone: total=$total")
@@ -7917,6 +8061,9 @@ private fun toolVisual(name: String): ToolVisual {
         // PTC 的 run_code：用 Build 图标但染成紫色，和六个原子工具区分开 ——
         // 它本身不碰磁盘，是「一段代码指挥了很多次调用」
         "run_code" -> ToolVisual(Icons.Default.Build, Color(0xFFA371F7))
+        // ask_user：问号语义用 Info 表达（core 图标库没有 Help），青色 ——
+        // 它是唯一「要等用户」的工具
+        "ask_user" -> ToolVisual(Icons.Default.Info, Color(0xFF39C5CF))
         else -> ToolVisual(Icons.Default.Build, cs.onSurfaceVariant)
     }
 }
@@ -8192,6 +8339,121 @@ private fun DiffSurface(rows: List<DiffRow>) {
  *   模型可能把一整句话塞进 query（虽然提示词里要求写关键词）。
  *   不限行数的话，一条超长 query 会把输入框顶到屏幕外面去。
  */
+/**
+ * ask_user 工具的毛玻璃输入对话框（v1.1 阶段三）。
+ *
+ * ★ 极客风三件套，全部沿用项目已有手法（§6.4 ⑲）：
+ *   1. 半透明填充 + 1dp 半透明描边模拟毛玻璃 —— 不用 Modifier.blur()，
+ *      那是每帧高斯模糊，对「50ms 防发热」是灾难；
+ *   2. 等宽字体点题「这是 Agent 的终端式提问」；
+ *   3. 深浅两套 glassEdge 高光描边，和 Drawer / 弹层保持一致。
+ *
+ * ★ 不可点外部关闭：这个对话框就是「Loop 正在等你」的化身，
+ *   误触返回键把弹窗关了、Loop 却永远挂着，是最恶性的死锁。
+ *   要退出只有两个按钮：发送 或 取消。
+ */
+@Composable
+private fun AskUserDialog(
+    question: String,
+    onSubmit: (String) -> Unit,
+    onCancel: () -> Unit
+) {
+    val cs = MaterialTheme.colorScheme
+    var answer by remember(question) { mutableStateOf("") }
+    // ★ remember(question)：换了问题就清空输入框（同一轮 Loop 可能连问两次）
+
+    Dialog(
+        onDismissRequest = { /* 刻意空实现：见 KDoc,不允许点外部关掉 */ },
+        properties = DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false
+        )
+    ) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            // 半透明底：透出下面的聊天列表一点影子,毛玻璃感
+            color = if (LocalIsDark.current) Color(0xCC14181F) else Color(0xCCF5F7FA),
+            border = BorderStroke(1.dp, glassEdge())
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(22.dp)
+                    .fillMaxWidth()
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.Info,
+                        contentDescription = null,
+                        tint = Color(0xFF39C5CF),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(R.string.ask_user_title),
+                        style = MaterialTheme.typography.titleSmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = cs.primary
+                    )
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                Text(
+                    text = question,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = cs.onSurface,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(Modifier.height(14.dp))
+
+                OutlinedTextField(
+                    value = answer,
+                    onValueChange = { if (it.length <= 2000) answer = it },
+                    placeholder = {
+                        Text(
+                            stringResource(R.string.ask_user_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = cs.onSurfaceVariant.copy(alpha = 0.5f)
+                        )
+                    },
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                        fontFamily = FontFamily.Monospace
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = cs.primary.copy(alpha = 0.6f),
+                        unfocusedBorderColor = cs.outlineVariant.copy(alpha = 0.4f),
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 52.dp)
+                )
+
+                Spacer(Modifier.height(16.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(onClick = onCancel) {
+                        Text(stringResource(R.string.action_cancel))
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(
+                        onClick = { if (answer.isNotBlank()) onSubmit(answer.trim()) },
+                        enabled = answer.isNotBlank()
+                    ) {
+                        Text(stringResource(R.string.action_send))
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun SearchStatusBar(query: String) {
     val cs = MaterialTheme.colorScheme
