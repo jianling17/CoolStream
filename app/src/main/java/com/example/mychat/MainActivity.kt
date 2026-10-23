@@ -360,7 +360,7 @@ private fun systemPromptWithWorkspace(): String {
                     "不在这份清单里的工具已被用户在设置里关闭，不要调用，也不要假装调用过；" +
                     "如果当前任务确实需要某个被关掉的工具，如实告诉用户去「设置 → 插件」里打开它。"
             }
-            SYSTEM_PROMPT + "\n\n12. " + toolLine + "\n13. " + wsLine
+            "$SYSTEM_PROMPT\n\n12. $toolLine\n13. $wsLine"
         }
     }
 }
@@ -2077,6 +2077,13 @@ internal fun ensureDefaultWorkspace(context: Context): String? {
 // ============================================================
 private const val CONTEXT_WINDOW_TOKENS = 1_000_000   // deepseek-flash 上下文长度 1M
 
+/**
+ * 上下文窗口的人类可读标签：1_000_000 显示成「1M tokens」比「1000K」好读。
+ * 参数化是为了能单测，也让 IDE 不会把比较折叠成「始终为 true」。
+ */
+internal fun contextWindowLabel(tokens: Int = CONTEXT_WINDOW_TOKENS): String =
+    if (tokens >= 1_000_000) "${tokens / 1_000_000}M tokens" else "${tokens / 1000}K tokens"
+
 /** 一轮对话累计的 token 用量（多轮工具调用会逐轮累加） */
 data class UsageStats(
     val promptTokens: Int = 0,
@@ -2166,8 +2173,8 @@ data class UsageLedgerSnapshot(
 }
 
 /** 账本日期键：yyyy-MM-dd。SimpleDateFormat 非线程安全，每次调用新建一个小对象（IO 协程里跑，无性能压力） */
-private fun usageDayFormat(): java.text.SimpleDateFormat =
-    java.text.SimpleDateFormat("yyyy-MM-dd", Locale.US)
+private fun usageDayFormat(): SimpleDateFormat =
+    SimpleDateFormat("yyyy-MM-dd", Locale.US)
 
 object UsageLedger {
     private const val KEY_DAY = "usage_day"                  // 今天是几号（yyyy-MM-dd）
@@ -3501,7 +3508,7 @@ fun ChatScreen() {
                         //   有 `if (msg.isError) continue`），下次请求自动排除。
                         val currentKey = ApiConfig.apiKey
                         if (currentKey.isBlank()) {
-                            val sid = if (currentSessionId.isBlank()) newSession() else currentSessionId
+                            val sid = currentSessionId.ifBlank { newSession() }
                             val errText = context.getString(R.string.err_no_api_key_bubble)
                             val nowTs = System.currentTimeMillis()
                             updateSession(sid) { s ->
@@ -3580,7 +3587,7 @@ fun ChatScreen() {
 
                         // 文档正文在前、问题在后：brief 要的顺序是「文档 → 问题」。
                         // 「问题：」这个前缀也只在真有文档时才加，没文档就还是用户原话。
-                        val docPrefix = if (docBlock.isEmpty()) "" else docBlock + "\n\n问题："
+                        val docPrefix = if (docBlock.isEmpty()) "" else "$docBlock\n\n问题："
                         val trimmed = (docPrefix + inputText.trim() + attachBlock).trim()
 
                         // 空消息不发；正在流式回复时也不发
@@ -3593,7 +3600,7 @@ fun ChatScreen() {
                             // ★ 先把这一刻的会话 id 钉住。后面所有回调都认它，
                             //   不再读 currentSessionId。
                             val sessionId =
-                                if (currentSessionId.isBlank()) newSession() else currentSessionId
+                                currentSessionId.ifBlank { newSession() }
 
                             // ① 在内存里追加「用户消息」+「Mock 工具卡片」+「AI 占位消息」
                             val now = System.currentTimeMillis()
@@ -5418,13 +5425,7 @@ private fun ModelTab() {
         item { SectionHeader(stringResource(R.string.section_runtime)) }
         item { InfoRow(stringResource(R.string.label_batching), "${FLUSH_INTERVAL_MS}ms") }
         item {
-            // 1_000_000 显示成「1M」比「1000K」好读
-            val ctxLabel = if (CONTEXT_WINDOW_TOKENS >= 1_000_000) {
-                "${CONTEXT_WINDOW_TOKENS / 1_000_000}M tokens"
-            } else {
-                "${CONTEXT_WINDOW_TOKENS / 1000}K tokens"
-            }
-            InfoRow(stringResource(R.string.label_context), ctxLabel)
+            InfoRow(stringResource(R.string.label_context), contextWindowLabel())
         }
         item {
             InfoRow(
@@ -6524,11 +6525,8 @@ private fun parseToolCall(content: String): ToolCallView {
         }
 
         val okNode = root.opt("ok")
-        val ok = when (okNode) {
-            true -> true
-            false -> false
-            else -> null                              // JSON null = 还在执行
-        }
+        // JSON null / 缺字段 = 还在执行；非布尔值一律当「不知道」
+        val ok = okNode as? Boolean
 
         // ★ 只在「改成功了」的时候算 diff：
         //   失败时文件一个字都没变，画个红红绿绿的差异图只会误导。
