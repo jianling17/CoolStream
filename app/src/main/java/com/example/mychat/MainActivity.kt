@@ -2,25 +2,20 @@ package com.example.mychat
 
 import android.Manifest
 import android.app.Application
-import android.content.ComponentName
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.SharedPreferences
-import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Base64
-import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.os.IBinder
 import android.os.SystemClock
-import android.provider.DocumentsContract
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -98,17 +93,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import org.mozilla.javascript.BaseFunction
-import org.mozilla.javascript.ClassShutter
 // ★ 必须起别名：本文件里 Context 已经是 android.content.Context（几十处在用），
 //   直接 import org.mozilla.javascript.Context 会变成「Conflicting import」，
 //   而 KSP 只会报一个莫名其妙的 MissingType，把真正的错误盖住。
-import org.mozilla.javascript.Context as RhinoContext
-import org.mozilla.javascript.ContextFactory
-import org.mozilla.javascript.EvaluatorException
-import org.mozilla.javascript.Scriptable
-import org.mozilla.javascript.ScriptableObject
-import org.mozilla.javascript.Undefined
 import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
@@ -244,8 +231,6 @@ import java.util.Locale
 // 时间感知（把「现在是几点」告诉模型）要用。注意必须配 Locale.US，见 timeContextLine()
 import java.text.SimpleDateFormat
 import java.util.Date
-import java.io.InterruptedIOException
-import kotlinx.coroutines.delay
 
 
 // ============================================================
@@ -1165,7 +1150,7 @@ internal fun parseDeltaFull(json: String): DeltaInfo? {
 // ⚠️ 没有这一段，模型根本不知道有工具可用，
 //    只会回「我没有权限读取文件」——这正是之前的现象。
 // ============================================================
-private val TOOL_DEFINITIONS = """
+private const val TOOL_DEFINITIONS = """
 [
   {
     "type": "function",
@@ -1400,7 +1385,7 @@ fun networkErrorText(e: Throwable): ErrorText {
         is UnknownHostException -> ErrorText(R.string.err_no_network)
         is SocketTimeoutException -> ErrorText(R.string.err_timeout)
         is SSLException -> ErrorText(R.string.err_ssl)
-        is java.io.IOException ->
+        is IOException ->
             ErrorText(R.string.err_io, listOf(e.message ?: e.javaClass.simpleName))
         else -> ErrorText(
             R.string.err_unknown,
@@ -1439,7 +1424,7 @@ private fun networkErrorMessage(e: Throwable): String {
             "请求超时。\n网络太慢或服务器没响应，换个网络或稍后重试。"
         is SSLException ->
             "安全连接失败（SSL）。\n多半是代理或证书在中间拦截，关掉代理再试。"
-        is java.io.IOException ->
+        is IOException ->
             "网络异常：${e.message ?: e.javaClass.simpleName}"
         else ->
             "出错了：${e.javaClass.simpleName}: ${e.message ?: "未知原因"}"
@@ -1651,7 +1636,7 @@ enum class AgentPreset(val id: String) {
     companion object {
         /** 从持久化的字符串还原；认不出来就退回标准模式，绝不让 App 起不来 */
         fun of(id: String?): AgentPreset =
-            values().firstOrNull { it.id == id } ?: STANDARD
+            entries.firstOrNull { it.id == id } ?: STANDARD
     }
 }
 
@@ -2887,7 +2872,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         try {
             val raw = d.await()
             // 哨兵串 = 用户点了取消：归一成 null，让调用方收到「用户取消了操作」
-            return if (raw === ASK_USER_CANCELLED) null else raw
+            return if (raw == ASK_USER_CANCELLED) null else raw
         } finally {
             withContext(Dispatchers.Main) {
                 if (askDeferred === d) {
@@ -7103,7 +7088,7 @@ private val ATTACH_MARK_RE = Regex("""<<ATTACH:(image|file|doc)\|([^>]+)>>""")
 private val DOC_BEGIN_RE = Regex("""<<DOC:begin\|([^|>]*)\|(\d+)>>""")
 
 /** 文档上下文哨兵的结束标记：<<DOC:end>> */
-internal val DOC_END = "<<DOC:end>>"
+internal const val DOC_END = "<<DOC:end>>"
 
 /** 落盘目录名 */
 private const val ATTACH_DIR = "attachments"
