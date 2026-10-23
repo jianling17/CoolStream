@@ -53,6 +53,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.automirrored.filled.List
 import rikka.shizuku.Shizuku
 import androidx.compose.material.icons.filled.Search
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.io.InterruptedIOException
 
@@ -1565,7 +1567,7 @@ internal fun parseSearchResults(raw: String, query: String): ToolExecResult {
 internal fun executeTool(name: String, argsJson: String): ToolExecResult {
     Log.d(TOOL_LOG_TAG, "开始执行工具: name=$name, args=$argsJson")
 
-    return try {
+    val result = try {
         when (name) {
             "read_file" -> {
                 val path = cleanPath(argOf(argsJson, "path"))
@@ -1691,4 +1693,67 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
         Log.e(TOOL_LOG_TAG, "读取失败: ${e.message}", e)
         ToolExecResult(false, "执行失败（$name）：${e.javaClass.simpleName}: ${e.message}")
     }
+
+    // ★ 出口统一拦截：超长输出落盘，只把预览交给模型，防 Token 爆炸
+    return if (result.ok) result.copy(output = persistOversizeToolOutput(name, result.output)) else result
+}
+
+// ============================================================
+// ★ 超长工具结果落盘
+//   工具输出太长时（read_file 读到大文件、run_shell 刷屏…），整段塞进模型上下文
+//   会直接吃掉窗口。这里统一在 executeTool 出口拦一道：完整内容写进工作区的
+//   .coolstream/temp/，回给模型的只有开头一段预览 + 文件路径，需要时再让模型
+//   自己用 read_file 配合 offset 分段读。信息不丢，Token 不炸。
+// ============================================================
+
+/** 输出超过这个字符数就落盘 */
+internal const val TOOL_INLINE_LIMIT = 8_000
+
+/** 落盘后回传给模型的预览长度 */
+internal const val TOOL_INLINE_HEAD = 4_000
+
+/** 落盘目录（相对工作区） */
+internal const val TOOL_TEMP_DIR = ".coolstream/temp"
+
+/** 临时文件最多保留几个，超出的按修改时间从旧到新删 */
+internal const val TOOL_TEMP_KEEP = 50
+
+/**
+ * 把过长的工具输出落盘，只回传开头一段预览 + 文件路径。
+ * 短输出原样返回，一个字符都不改。
+ */
+internal fun persistOversizeToolOutput(toolName: String, output: String): String {
+    if (output.length <= TOOL_INLINE_LIMIT) return output
+
+    val head = output.take(TOOL_INLINE_HEAD)
+    val ws = currentWorkspace
+    if (ws.isBlank()) {
+        return head + "\n\n…（输出共 ${output.length} 字符，已截断；当前未设置工作区，完整内容未落盘）"
+    }
+
+    val dir = File(ws, TOOL_TEMP_DIR)
+    if (!dir.isDirectory && !dir.mkdirs()) {
+        return head + "\n\n…（输出共 ${output.length} 字符，已截断；临时目录创建失败：${dir.absolutePath}）"
+    }
+
+    return try {
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())
+        val safeName = toolName.filter { it.isLetterOrDigit() || it == '_' }.ifEmpty { "tool" }
+        val file = File(dir, "$safeName-$stamp.txt")
+        file.writeText(output, Charsets.UTF_8)
+        pruneToolTempDir(dir)
+        head +
+            "\n\n…（输出共 ${output.length} 字符，超过 $TOOL_INLINE_LIMIT 字符上限，已截断）" +
+            "\n完整内容已保存到：${file.absolutePath}" +
+            "\n需要后面的部分，请用 read_file 配合 offset 分段读取，不要一次读完。"
+    } catch (e: Exception) {
+        Log.w(TOOL_LOG_TAG, "工具结果落盘失败: ${e.message}")
+        head + "\n\n…（输出共 ${output.length} 字符，已截断；落盘失败：${e.javaClass.simpleName}）"
+    }
+}
+
+/** 只留最近 TOOL_TEMP_KEEP 个临时文件，避免无限堆积 */
+private fun pruneToolTempDir(dir: File) {
+    val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: return
+    files.drop(TOOL_TEMP_KEEP).forEach { runCatching { it.delete() } }
 }
