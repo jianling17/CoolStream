@@ -234,4 +234,7 @@
     <string name="mcp_url_label">MCP 服务器地址</string>
     <string name="mcp_url_helper">Streamable HTTP / SSE 端点，如 http://10.0.2.2:3000/mcp；清空并保存即关闭</string>
     <string name="mcp_save_test">保存并测试连接</string>
+    <!-- v1.3.0 无障碍服务 -->
+    <string name="accessibility_service_label">CoolStream 屏幕助手</string>
+    <string name="accessibility_service_description">开启后，CoolStream 可读取屏幕上的控件信息并模拟点击、滑动，替你完成发送消息、翻页等自动化操作。不会在后台读取输入密码框内容。</string>
 </resources>

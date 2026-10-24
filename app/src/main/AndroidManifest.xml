@@ -87,6 +87,29 @@
             android:exported="true"
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!--
+            v1.3.0 无障碍服务（纯原生，零第三方依赖）
+            合规要点：BIND_ACCESSIBILITY_SERVICE 让系统独占绑定；
+            exported=true 因服务带 intent-filter 且需跨进程绑定；
+            intent-filter action 和 meta-data name 不可改。
+        -->
+        <service
+            android:name=".CoolStreamAccessibilityService"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:label="@string/accessibility_service_label"
+            android:description="@string/accessibility_service_description">
+
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+
+        </service>
     </application>
 
 </manifest>

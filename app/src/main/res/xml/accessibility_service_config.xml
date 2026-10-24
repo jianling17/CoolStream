@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CoolStream v1.3.0 —— 无障碍服务配置（纯原生，零第三方依赖）
+
+  放置路径：app/src/main/res/xml/accessibility_service_config.xml
+  引用方式：AndroidManifest.xml 的 <service> 内
+            <meta-data android:name="android.accessibilityservice"
+                       android:resource="@xml/accessibility_service_config" />
+
+  需要在 res/values/strings.xml 中补充（描述文字会显示在系统设置页，属合规必需项）：
+      <string name="accessibility_service_label">CoolStream 屏幕助手</string>
+      <string name="accessibility_service_description">开启后，CoolStream 可读取屏幕上的控件信息并模拟点击、滑动，替你完成发送消息、翻页等自动化操作。不会在后台读取输入密码框内容。</string>
+
+  属性与 minSdk 24 的兼容性：
+    - canPerformGestures / accessibilityFlags(flagRetrieveInteractiveWindows) 均为 API 24 引入，正好 minSdk。
+    - android:isAccessibilityTool 需 API 31+，若 compileSdk >= 31 且上架 Google Play（自动化工具类），
+      应显式声明 android:isAccessibilityTool="false"；compileSdk < 31 时该属性不存在于 android 命名空间，
+      写入会导致 aapt2 编译失败，故此处默认不写。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked|typeViewFocused"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:notificationTimeout="80"
+    android:description="@string/accessibility_service_description"
+    />
