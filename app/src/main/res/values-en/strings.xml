@@ -126,6 +126,7 @@
     <string name="action_rename">Rename</string>
     <string name="session_more_actions">Session actions</string>
     <string name="action_delete">Delete</string>
+    <string name="action_export">Export as Markdown</string>
     <string name="action_cancel">Cancel</string>
     <string name="delete_session_title">Delete this chat?</string>
     <string name="delete_session_body">“%1$s” and all of its messages will be deleted. This cannot be undone.</string>

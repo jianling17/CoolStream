@@ -191,6 +191,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import android.widget.Toast
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
@@ -1496,6 +1497,48 @@ private const val TOOL_DEFINITIONS = """
         "required": ["question"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "sqlite_query",
+      "description": "对工作区内的 SQLite 数据库文件（.db / .sqlite）执行只读 SELECT 查询，结果以 Markdown 表格返回。仅允许 SELECT，禁止任何写操作。单次最多返回 50 行，超过请用 LIMIT/OFFSET 分页。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "db_path": {
+            "type": "string",
+            "description": "数据库文件路径，必须是 .db 或 .sqlite 结尾；可写相对工作区的路径，也可写工作区内绝对路径"
+          },
+          "sql": {
+            "type": "string",
+            "description": "只读查询语句，必须且只能以 SELECT 开头，只允许一条语句"
+          }
+        },
+        "required": ["db_path", "sql"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "regex_extract",
+      "description": "传入 text 和 pattern，在 App 端执行正则提取，返回所有匹配（最多 50 个）。适合从长文本里抽结构化片段（邮箱、编号、日期等）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "要被提取的源文本，最长 50000 字符"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "正则表达式，最长 1000 字符"
+          }
+        },
+        "required": ["text", "pattern"]
+      }
+    }
   }
 ]
 """
@@ -1794,6 +1837,8 @@ internal val ALL_TOOL_NAMES = listOf(
     // ★ v1.1 新增。放在最后不是随便排的：前面都是「动手机上的东西」，
     //   只有它一个是要花钱联网的，单独排在末尾，设置页里一眼就能看出区别。
     "web_search",
+    // ★ v1.2.0 战役六：本地极客工具（不花钱、不碰网络）。
+    "sqlite_query", "regex_extract",
     // ★ v1.1 阶段三新增。排 web_search 后面：它不碰手机、也不花钱，
     //   但要「暂停等用户输入」，性质和前七个都不同，放在最后单独一组。
     "ask_user"
@@ -1817,6 +1862,8 @@ private val TOOL_DESCRIPTIONS = mapOf(
     // ★ 说明里要写清「要花钱」，否则用户会以为和别的工具一样是免费的本地操作。
     //   官方单价：每 1000 次成功请求 5 元（失败和空结果不计费）。
     "web_search" to "联网搜索网页（走 内置默认服务搜索接口，每次约 ¥0.005）",
+    "sqlite_query" to "查询工作区 SQLite 数据库（只读，仅支持 SELECT）",
+    "regex_extract" to "用正则表达式从文本中提取匹配内容",
     "ask_user" to "向用户提出问题并等待回答（不花钱，会暂停对话）"
 )
 
@@ -3728,7 +3775,17 @@ fun ChatScreen() {
                             }
                         }
                     },
-                    onSettings = onOpenSettings
+                    onSettings = onOpenSettings,
+                    // ★ 战役六：导出当前会话为 Markdown。Room 查询挂起，写盘在 SessionExporter 内部 Dispatchers.IO，
+                    //   完成后自动回到 Main 弹 Toast。
+                    onExport = { id ->
+                        val title = sessions.firstOrNull { it.id == id }?.title ?: "未命名会话"
+                        streamScope.launch {
+                            val messages = dao.getMessages(id)
+                            val result = exportSessionToMarkdown(messages, title)
+                            Toast.makeText(context, result.output, Toast.LENGTH_LONG).show()
+                        }
+                    }
                 )
                 }
             }
@@ -4625,7 +4682,8 @@ fun Sidebar(
     onSelect: (String) -> Unit,
     onRename: (String, String) -> Unit,
     onDelete: (String) -> Unit,
-    onSettings: () -> Unit
+    onSettings: () -> Unit,
+    onExport: (String) -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
 
@@ -4761,7 +4819,8 @@ fun Sidebar(
                                     renameTarget = session
                                 },
                                 // ★ 删除只负责顶起确认框，真正下手在确认框里
-                                onDelete = { deleteTarget = session }
+                                onDelete = { deleteTarget = session },
+                                onExport = { onExport(session.id) }
                             )
                         }
                     }
@@ -4954,7 +5013,8 @@ private fun SessionRow(
     selected: Boolean,
     onClick: () -> Unit,
     onRename: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onExport: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
     var menuOpen by remember { mutableStateOf(false) }
@@ -5000,6 +5060,13 @@ private fun SessionRow(
                     onDismissRequest = { menuOpen = false },
                     containerColor = glassDrawer()
                 ) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.action_export)) },
+                        onClick = {
+                            menuOpen = false
+                            onExport()
+                        }
+                    )
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.action_rename)) },
                         leadingIcon = {

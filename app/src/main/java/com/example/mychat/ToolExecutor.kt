@@ -1926,6 +1926,23 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                 }
             }
 
+            "sqlite_query" -> {
+                // db_path 可以过 cleanPath（它是路径）；sql 绝对不行 ——
+                // cleanPath 会削掉首尾标点，一段以分号或引号结尾的 SQL 会被削坏。
+                val dbPath = cleanPath(argOf(argsJson, "db_path"))
+                val sql = argOf(argsJson, "sql")
+                if (dbPath.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 db_path。")
+                } else {
+                    sqliteQuery(dbPath, sql)
+                }
+            }
+
+            "regex_extract" -> {
+                // text / pattern 都是正文，同样不能过 cleanPath
+                regexExtract(argOf(argsJson, "text"), argOf(argsJson, "pattern"))
+            }
+
             "run_shell" -> {
                 val command = argOf(argsJson, "command").trim()
                 if (command.isBlank()) {

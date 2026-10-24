@@ -126,6 +126,7 @@
     <string name="action_rename">重命名</string>
     <string name="session_more_actions">会话操作</string>
     <string name="action_delete">删除</string>
+    <string name="action_export">导出为 Markdown</string>
     <string name="action_cancel">取消</string>
     <string name="delete_session_title">删除会话？</string>
     <string name="delete_session_body">「%1$s」和它的全部消息会一起删除，无法恢复。</string>
