@@ -955,13 +955,16 @@ fun sendToDeepSeek(
                 put("stream", true)
                 put("messages", messagesArray)
 
-                // ★★★ 关掉思考模式 ★★★
+                // ★★★ 关掉思考模式（仅 DeepSeek）★★★
                 // deepseek-flash 的思考模式【默认开启】。开启后它会先吐一长串
                 // 思维链，而思维链分片里 content 字段是 JSON null
                 //（思维内容在 reasoning_content 字段里）。
                 // 那些 content=null 的分片，正是"满屏 nullnullnull"的源头之一。
                 // 关掉后：响应更快，且不会再有这种空分片。
-                put("thinking", JSONObject().put("type", "disabled"))
+                // thinking 是 DeepSeek 专有字段，第三方 provider 发了可能 400。
+                if (ApiConfig.provider == ApiProvider.DEEPSEEK) {
+                    put("thinking", JSONObject().put("type", "disabled"))
+                }
             }.toString()
 
             val request = Request.Builder()
@@ -1379,7 +1382,13 @@ private const val TOOL_DEFINITIONS = """
  *     · 单元测试里可以直接断言 resId，不用碰 Android 资源
  *     · 语言切换后旧错误气泡不会「半中半英」
  */
-data class ErrorText(val resId: Int, val args: List<Any> = emptyList())
+data class ErrorText(val resId: Int, val args: List<Any> = emptyList()) {
+    /** v1.2.0：没有对应字符串资源的临时错误（多 provider 的动态场景多）直接给原文 */
+    constructor(raw: String) : this(0, listOf(raw))
+
+    /** 是不是「无资源、直接渲染 args[0]」的形态 */
+    val isRaw: Boolean get() = resId == 0
+}
 
 /**
  * 把 ErrorText 渲染成当前语言的文案。
@@ -1388,6 +1397,7 @@ data class ErrorText(val resId: Int, val args: List<Any> = emptyList())
  * 否则 App 内切换语言后，错误气泡会跟界面语言不一致。
  */
 fun ErrorText.resolve(context: Context): String {
+    if (isRaw) return args.firstOrNull()?.toString() ?: ""
     val arr: Array<out Any> = args.toTypedArray()
     return context.getString(resId, *arr)
 }
@@ -1946,11 +1956,12 @@ private const val SECURE_PREFS_NAME = "coolstream_secure"
 private const val SEC_KEY_API_KEY = "api_key"
 private const val SEC_KEY_BASE_URL = "base_url"
 private const val SEC_KEY_MODEL = "model_name"
+private const val SEC_KEY_PROVIDER = "api_provider"
 
 /** 「引导已完成」标记。放普通 SharedPreferences 就行，它不是敏感信息 */
 private const val KEY_ONBOARD_DONE = "onboard_done"
 
-private const val DEFAULT_API_BASE = "https://api.deepseek.com"
+private const val DEFAULT_API_BASE = "https://api.deepseek.com/v1"
 private const val DEFAULT_MODEL = "deepseek-flash"
 
 @Volatile
@@ -1985,8 +1996,26 @@ private fun securePrefs(context: Context): SharedPreferences? {
     }
 }
 
+/**
+ * API 提供者类型（v1.2.0 多模型泛化）。
+ *
+ * DEEPSEEK          —— 官方 API，带 DeepSeek 专有字段（thinking 等）
+ * OPENAI_COMPATIBLE —— 任何标准 OpenAI 协议的第三方：智谱 GLM、Kimi、
+ *                      本地 Ollama（http://localhost:11434/v1）等。
+ *                      请求体只发 OpenAI 标准字段。
+ */
+internal enum class ApiProvider { DEEPSEEK, OPENAI_COMPATIBLE }
+
+/** 每个 provider 的默认 baseUrl。第三方没有万能默认值，必须由用户填。 */
+internal fun defaultBaseFor(provider: ApiProvider): String = when (provider) {
+    ApiProvider.DEEPSEEK -> DEFAULT_API_BASE
+    // 智谱只是示例地址，绝不能替用户做决定 —— 空 = UI 层要求必填
+    ApiProvider.OPENAI_COMPATIBLE -> ""
+}
+
 /** 运行期的 API 配置。用 mutableStateOf 托着，设置页一改界面立刻跟着变 */
 internal object ApiConfig {
+    var provider by mutableStateOf(ApiProvider.DEEPSEEK)
     var apiKey by mutableStateOf("")
     var baseUrl by mutableStateOf(DEFAULT_API_BASE)
     var model by mutableStateOf(DEFAULT_MODEL)
@@ -2001,6 +2030,10 @@ internal fun loadApiConfig(context: Context) {
         ?.takeIf { it.isNotBlank() } ?: DEFAULT_API_BASE
     ApiConfig.model = p?.getString(SEC_KEY_MODEL, DEFAULT_MODEL)
         ?.takeIf { it.isNotBlank() } ?: DEFAULT_MODEL
+    // 存过脏值（手改过 / 旧版本残留）时 valueOf 会抛 —— 退回 DEEPSEEK
+    ApiConfig.provider = runCatching {
+        ApiProvider.valueOf(p?.getString(SEC_KEY_PROVIDER, "") ?: "")
+    }.getOrDefault(ApiProvider.DEEPSEEK)
     Log.d(
         TAG,
         "API 配置已加载: baseUrl=${ApiConfig.baseUrl}, model=${ApiConfig.model}, " +
@@ -2009,7 +2042,13 @@ internal fun loadApiConfig(context: Context) {
     )
 }
 
-internal fun saveApiConfig(context: Context, key: String, base: String, model: String) {
+internal fun saveApiConfig(
+    context: Context,
+    key: String,
+    base: String,
+    model: String,
+    provider: ApiProvider = ApiConfig.provider
+) {
     val k = key.trim()
     val b = base.trim().ifBlank { DEFAULT_API_BASE }
     val m = model.trim().ifBlank { DEFAULT_MODEL }
@@ -2022,23 +2061,31 @@ internal fun saveApiConfig(context: Context, key: String, base: String, model: S
             putString(SEC_KEY_API_KEY, k)
             putString(SEC_KEY_BASE_URL, b)
             putString(SEC_KEY_MODEL, m)
+            putString(SEC_KEY_PROVIDER, provider.name)
         }
     }
 
     ApiConfig.apiKey = k
     ApiConfig.baseUrl = b
     ApiConfig.model = m
+    ApiConfig.provider = provider
     Log.d(TAG, "API 配置已保存: baseUrl=$b, model=$m, key=${k.length} 字符")
 }
 
 /**
- * 把用户填的地址补成完整的 chat/completions 端点。
+ * 把用户填的地址补成完整的 chat/completions 端点（v1.2.0 起多 provider 通用）。
  *
- * 用户很可能只填 `https://api.deepseek.com`（文档里就是这么写的），
- * 也有人会填全 `.../chat/completions`，两种都得认。
+ * 用户可能填：
+ *   `https://api.deepseek.com` 或 `https://api.deepseek.com/v1`   （DeepSeek 两种都认）
+ *   `https://open.bigmodel.cn/api/paas/v4`                          （智谱 GLM）
+ *   `http://localhost:11434/v1`                                     （本地 Ollama）
+ *   甚至直接贴全 `.../chat/completions` —— 四种都得认。
+ * 规则统一：去掉尾斜杠，已带 /chat/completions 就不再补。
+ * base 为空（第三方没填地址）时返回空串，由调用方在发请求前拦下。
  */
-private fun chatCompletionsUrl(): String {
+internal fun chatCompletionsUrl(): String {
     val base = ApiConfig.baseUrl.trim().trimEnd('/')
+    if (base.isEmpty()) return ""
     return if (base.endsWith("/chat/completions")) base else "$base/chat/completions"
 }
 
@@ -2367,7 +2414,13 @@ fun runAgentLoop(
      *   所以只把「资源 id + 参数」交出去，由调用方（主线程、手里有 localizedContext）
      *   调 resolve(context) 变成当前语言的文字。
      */
-    onError: (ErrorText) -> Unit
+    onError: (ErrorText) -> Unit,
+    /**
+     * v1.2.0：第三方模型不支持 tools 参数时，底层会自动降级为
+     * 「无工具标准对话」重试一轮。此回调用于 UI 层弹友好提示
+     * （「当前模型可能不支持工具调用……」）。可选，默认不弹。
+     */
+    onToolsUnsupported: (String) -> Unit = {}
 ): Job {
     return scope.launch(Dispatchers.IO) {
         try {
@@ -2387,6 +2440,13 @@ fun runAgentLoop(
             if (apiKey.isBlank()) {
                 withContext(Dispatchers.Main) {
                     onError(ErrorText(R.string.err_no_api_key))
+                }
+                return@launch
+            }
+            // 第三方 provider 没填 baseUrl（本地 Ollama 可不填 Key，但地址必须有）
+            if (ApiConfig.baseUrl.isBlank()) {
+                withContext(Dispatchers.Main) {
+                    onError(ErrorText("请先在设置里填写 API 地址（Base URL）"))
                 }
                 return@launch
             }
@@ -2422,9 +2482,12 @@ fun runAgentLoop(
                 })
             }
 
-            // ★ 只把用户开着的那几个工具发给模型（设置 → 插件 里的开关）
-            val toolsArray = buildToolsArray()
-            Log.d(TAG, "本次启用工具 ${toolsArray.length()} 个: ${AppSettings.enabledTools}")
+            // ★ 只把用户开着的那几个工具发给模型（设置 → 插件 里的开关）。
+            //   v1.2.0：真正放进请求体的数组改为【每轮现算】（见 bodyJson 处），
+            //   以支持「模型不支持 tools」时降级重发；这里只保留初始日志。
+            Log.d(TAG, "本次启用工具 ${buildToolsArray().length()} 个: ${AppSettings.enabledTools}")
+            // 请求周期内的 tools 开关（true → 若模型报「不支持 tools」则翻 false 重试）
+            var toolsEnabledForRequest = true
             var totalChars = 0
             var round = 0
             // 多轮工具调用会把 token 用量逐轮累加
@@ -2442,16 +2505,24 @@ fun runAgentLoop(
                     put("stream_options", JSONObject().put("include_usage", true))
                     put("messages", messages)
                     // 工具全被关掉时不要发空数组 —— 有些实现会因此报 400
+                    // v1.2.0：toolsEnabledForRequest 会被「模型不支持 tools」的
+                    // 容错降级翻成 false，之后各轮都发纯对话请求
+                    val toolsArray = if (toolsEnabledForRequest) buildToolsArray() else JSONArray()
                     if (toolsArray.length() > 0) {
                         put("tools", toolsArray)
                     }
-                    put("thinking", JSONObject().put("type", "disabled"))
+                    // ★ thinking 是 DeepSeek 专有字段，不是 OpenAI 协议的一部分。
+                    //   第三方兼容服务（严格实现）遇到未知字段可能直接 400，
+                    //   所以只有 DEEPSEEK provider 才发。
+                    if (ApiConfig.provider == ApiProvider.DEEPSEEK) {
+                        put("thinking", JSONObject().put("type", "disabled"))
+                    }
                 }.toString()
 
                 // 【诊断】把完整请求体打出来 —— 亲眼看 tools 数组在不在
                 Log.d(
                     TAG,
-                    "发送请求 round=$round, tools=${toolsArray.length()} 个, 请求体: $bodyJson"
+                    "发送请求 round=$round, tools=${if (toolsEnabledForRequest) buildToolsArray().length() else 0} 个, 请求体: $bodyJson"
                 )
 
                 val request = Request.Builder()
@@ -2468,6 +2539,30 @@ fun runAgentLoop(
                 if (!response.isSuccessful) {
                     val errBody = response.body?.string() ?: ""
                     Log.e(TAG, "HTTP ${response.code}: ${errBody.take(300)}")
+                    response.close()
+
+                    // ★ v1.2.0 容错：第三方模型（部分 GLM / 本地小模型）不认 tools 参数，
+                    //   服务端一般报 4xx 且错误体里点名 tools / function。
+                    //   首次遇到：去掉 tools 参数降级重试一轮（toolsEnabledForRequest = false），
+                    //   并通知 UI 弹提示；同一请求周期内只降级一次。
+                    val toolsUnsupported = response.code in 400..499 &&
+                        toolsEnabledForRequest && runCatching {
+                            val low = errBody.lowercase()
+                            "tool" in low || "function" in low
+                        }.getOrDefault(false)
+                    if (toolsUnsupported) {
+                        toolsEnabledForRequest = false
+                        Log.w(TAG, "模型疑似不支持 tools，降级为无工具对话重试")
+                        withContext(Dispatchers.Main) {
+                            onToolsUnsupported(
+                                "当前模型可能不支持工具调用，已切换为标准对话模式；" +
+                                    "如需完整功能请切换模型或提供商"
+                            )
+                        }
+                        round--  // 降级重试不算一轮，别烧 MAX_TOOL_ROUNDS 配额
+                        continue  // 同一 round 重新发（消息数组未变）
+                    }
+
                     withContext(Dispatchers.Main) { onError(httpErrorText(response.code, errBody)) }
                     return@launch
                 }

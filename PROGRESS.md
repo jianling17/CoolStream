@@ -510,3 +510,61 @@ $ADB shell am start -n com.example.mychat/.MainActivity
 - `compileDebugKotlin` 0 error；`testDebugUnitTest` **307 条 0 失败**；
 - `assembleRelease` ✅ `app-release.apk` = 2,088,155 字节 ≈ **1.99 MB**；
 - `FLUSH_INTERVAL_MS = 50L` 未动（`MainActivity.kt:487`）。
+
+
+---
+
+## v1.2.0 阶段一/二/三（底层）：多模型泛化（进行中，UI 未接）
+
+用户 brief（m02185）：支持标准 OpenAI 协议第三方（智谱 GLM / Kimi / Ollama 等）。
+铁律：不碰 50ms 防抖；不破坏 7 工具 Tool Calling；API 不兼容要 try-catch 转友好气泡；
+不加新网络库（继续 OkHttp）。
+
+### 已落盘（MainActivity.kt，底层三层）
+
+**第一步 配置层**
+- 新增 `internal enum class ApiProvider { DEEPSEEK, OPENAI_COMPATIBLE }`；
+- `ApiConfig` 加 `provider`（mutableStateOf）；加密存储新 key `api_provider`；
+- `loadApiConfig` 读回时 `runCatching { valueOf() }` 容错，脏值退 DEEPSEEK；
+- `saveApiConfig` 加第 5 参 `provider: ApiProvider = ApiConfig.provider`（带默认值，
+  两处老调用点 4a60345 期写法不动也能编过）；
+- `defaultBaseFor(provider)`：DEEPSEEK → `https://api.deepseek.com/v1`（DEFAULT_API_BASE
+  也改成带 /v1，按 brief）；OPENAI_COMPATIBLE → 空串（UI 层要求必填）；
+- `chatCompletionsUrl()` private → **internal**（供单测），空地址返回空串由调用方拦截。
+
+**第二步 网络层**
+- `runAgentLoop` 开头新增拦截：`ApiConfig.baseUrl.isBlank()` → `ErrorText("请先在设置里填写 API 地址（Base URL）")`；
+- `ErrorText` 加 `constructor(raw: String) : this(0, listOf(raw))` + `isRaw`，
+  `resolve()` 对 raw 形态直接渲染 args[0]（无资源 id 的动态错误不再需要 strings.xml）；
+- `stream_options` 与 `thinking` 两个 DeepSeek 专有字段全部按
+  `ApiConfig.provider == ApiProvider.DEEPSEEK` 门控 —— 严格第三方实现遇未知字段可能 400。
+  两处请求体（agent 循环 / 标题生成）都改了。
+
+**第三步 Tool Calling 容错（底层部分）**
+- `runAgentLoop` 新增可选回调 `onToolsUnsupported: (String) -> Unit = {}`；
+- HTTP 4xx 且错误体含 tool/function 字样时：`toolsEnabledForRequest = false`、
+  `round--`（降级重试不烧 MAX_TOOL_ROUNDS 配额）+ `continue` 去掉 tools 重发一轮，
+  并回调提示「当前模型可能不支持工具调用，已切换为标准对话模式…」；
+- tools 数组改为每轮按 `toolsEnabledForRequest` 现算（原来请求周期开始时算一次）；
+- 同一请求周期只降级一次。
+
+### SSE 解析兼容性结论（第二步审查结果）
+parseDeltaFull / parseUsage 本来就是 opt + as? 容错写法：
+- 无 usage 字段 → parseUsage 返回 null，accUsage 保持 EMPTY，费用显示为 ¥0.0000，不崩；
+- delta.content 缺失 → null 跳过；tool_calls 分片字段缺失 → 空 Map 跳过；
+- 「data: 」前缀 + [DONE] 处理与 OpenAI 协议一致。**无需改动**。
+
+### 新增测试
+`ProviderConfigTest.kt` 13 条：URL 拼接 8 种填法（官方不带/带 v1、智谱、Ollama、
+尾斜杠、全端点、空白、前后空格）+ provider 枚举/默认 base/脏值容错。
+
+### 验证
+compileDebugKotlin 0 error 0 warning；testDebugUnitTest **320 条 0 失败**；
+`MainActivity.kt:487 FLUSH_INTERVAL_MS = 50L` 未动。
+
+### ⚠️ 尚未完成（下一段任务）
+1. 设置页 UI：provider 选择控件（SegmentedButton 或 DropdownMenu）、
+   切 provider 时 base/model 字段联动默认值、OPENAI_COMPATIBLE 必填校验；
+2. `onToolsUnsupported` 回调在调用点（:4032 附近 vm.streamJob = runAgentLoop）接 UI 气泡；
+3. 标题生成那条路径（:953 请求体）没有 tools，天然不受影响，无需容错；
+4. 装真机验证第三方端点（智谱 GLM 或 Ollama）。
