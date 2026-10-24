@@ -562,9 +562,23 @@ parseDeltaFull / parseUsage 本来就是 opt + as? 容错写法：
 compileDebugKotlin 0 error 0 warning；testDebugUnitTest **320 条 0 失败**；
 `MainActivity.kt:487 FLUSH_INTERVAL_MS = 50L` 未动。
 
+### v1.2.0 多模型泛化 ✅（UI 已接，commit 0951c15）
+1. 设置页 UI：ModelTab 加 provider ChoiceRow（DEEPSEEK / OPENAI_COMPATIBLE），
+   切 provider 时 base 字段联动（官方自动回填 `https://api.deepseek.com/v1`；
+   自定义清空逼用户必填，placeholder 为智谱示例地址）；
+   保存按钮 `enabled = keyOk && baseOk && dirty`，baseOk 对自定义强制非空。
+2. `onToolsUnsupported` 回调已在调用点接线：插入一条 isError=true 的提示气泡
+   （「当前模型可能不支持工具调用，已切换为标准对话模式…」），同工具卡片模式，不落库。
+3. strings.xml（values + values-en）新增 6 key：label_provider / provider_deepseek /
+   provider_openai / api_base_helper_custom / api_base_example_custom / save_base_required。
+
+### 验证（commit 0951c15）
+- compileDebugKotlin 0 error 0 warning；`testDebugUnitTest` **320 条 0 失败**；
+- `FLUSH_INTERVAL_MS = 50L`（`MainActivity.kt:487`）未动；
+- 模拟器端到端视觉验证因当时会话模型无图像能力中断（截图已存 test-screenshots/v120-*.png，
+  uiautomator dump 确认主界面与进程存活正常）；真机人工测试清单见下方章节。
+
 ### ⚠️ 尚未完成（下一段任务）
-1. 设置页 UI：provider 选择控件（SegmentedButton 或 DropdownMenu）、
-   切 provider 时 base/model 字段联动默认值、OPENAI_COMPATIBLE 必填校验；
-2. `onToolsUnsupported` 回调在调用点（:4032 附近 vm.streamJob = runAgentLoop）接 UI 气泡；
-3. 标题生成那条路径（:953 请求体）没有 tools，天然不受影响，无需容错；
-4. 装真机验证第三方端点（智谱 GLM 或 Ollama）。
+1. 真机装 release 包（按「装包约定」），人工走一遍：自定义假地址报错兜底、
+   切回官方联网搜索回归；
+2. 有第三方 Key 时实测智谱 / Ollama 流式输出。
