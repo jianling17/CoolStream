@@ -21,7 +21,7 @@
     <string name="ob_step1_title">填入 API Key</string>
     <string name="ob_step2_title">允许访问文件</string>
     <string name="ob_step3_title">Shizuku（可选）</string>
-    <string name="ob_key_helper">在 platform.deepseek.com 申请，只存在本机的加密存储里</string>
+    <string name="ob_key_helper">在模型开放平台申请，只存在本机的加密存储里</string>
     <string name="ob_model_helper">不确定就保持默认</string>
     <string name="ob_step2_body">读文件、写文件、改代码、跑命令都依赖这个权限。不开的话只能纯聊天，工具全部不可用。</string>
     <string name="ob_step2_action">去授权</string>
@@ -82,11 +82,11 @@
 
     <string name="section_model_api">模型与 API</string>
     <string name="section_billing">计费口径</string>
-    <string name="billing_body">费用按 DeepSeek 官方峰谷单价估算，不是账单。\n高峰时段：北京时间周一至周五 09:00–12:00、14:00–18:00（法定节假日除外）。\n节假日无法在客户端判断，那几天会按高峰价算，偏高。</string>
-    <string name="api_base_helper">只填 https://api.deepseek.com 也行，会自动补 /chat/completions</string>
-    <string name="api_key_empty">去 platform.deepseek.com 申请</string>
+    <string name="billing_body">费用按云端模型官方峰谷单价估算，不是账单。\n高峰时段：北京时间周一至周五 09:00–12:00、14:00–18:00（法定节假日除外）。\n节假日无法在客户端判断，那几天会按高峰价算，偏高。</string>
+    <string name="api_base_helper">只填默认服务地址也行，会自动补 /chat/completions</string>
+    <string name="api_key_empty">去模型开放平台申请</string>
     <string name="api_key_saved">已填写 %1$d 位；保存在加密存储里，不写日志、不进备份</string>
-    <string name="model_helper">例：deepseek-flash / deepseek-v4-pro</string>
+    <string name="model_helper">例：模型名 A / 模型名 B</string>
     <string name="save_ok">已保存，下一轮对话生效</string>
     <string name="save_key_required">Key 不能为空</string>
     <string name="save_no_change">当前配置已是最新</string>
@@ -194,7 +194,7 @@
 
     <!-- ============ 错误文案 ============ -->
     <string name="err_401">API Key 无效或已欠费（401）。\n请到「设置 → 模型与 API」检查 Key 是否填错、账户是否还有余额。</string>
-    <string name="err_402">账户余额不足（402）。\n请到 DeepSeek 开放平台充值后再试。</string>
+    <string name="err_402">账户余额不足（402）。\n请到模型开放平台充值后再试。</string>
     <string name="err_403">没有访问权限（403）。\n这个 Key 可能被限制访问该模型。</string>
     <string name="err_404">接口地址不对（404）。\n检查「设置 → 模型与 API」里的 API 地址。</string>
     <string name="err_429">请求太频繁，请休息一下（429）。\n等几十秒再发，或者换到低峰时段。</string>
@@ -224,9 +224,9 @@
     <string name="ob_page_of">第 %1$d / %2$d 页</string>
     <string name="err_no_api_key_bubble">请先在设置中配置 API Key</string>
     <string name="label_provider">API 提供者</string>
-    <string name="provider_deepseek">DeepSeek 官方</string>
+    <string name="provider_builtin">内置默认服务</string>
     <string name="provider_openai">自定义 (OpenAI 兼容)</string>
-    <string name="api_base_helper_custom">填 OpenAI 兼容端点，如智谱 / Kimi / 本地 Ollama</string>
+    <string name="api_base_helper_custom">填 OpenAI 兼容端点，如第三方兼容服务 / 本地 Ollama</string>
     <string name="api_base_example_custom">https://open.bigmodel.cn/api/paas/v4</string>
     <string name="save_base_required">自定义提供者必须填写 API 地址</string>
     <string name="mcp_section_title">MCP 服务器（实验性）</string>

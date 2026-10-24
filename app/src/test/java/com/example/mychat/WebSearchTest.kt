@@ -49,18 +49,18 @@ class WebSearchTest {
     fun `正常结果拼出标题摘要和链接`() {
         val raw = body(
             item(
-                title = "DeepSeek V4 发布",
-                url = "https://example.com/deepseek-v4",
+                title = "示例模型 V4 发布",
+                url = "https://example.com/sample-model-v4",
                 summary = "这是一段写给模型读的长摘要。",
                 date = "2026-06-01T00:00:00+00:00"
             )
         )
 
-        val r = parseSearchResults(raw, "DeepSeek V4")
+        val r = parseSearchResults(raw, "示例模型 V4")
 
         assertTrue("有结果时必须是 ok = true", r.ok)
-        assertTrue(r.output.contains("DeepSeek V4 发布"))
-        assertTrue(r.output.contains("https://example.com/deepseek-v4"))
+        assertTrue(r.output.contains("示例模型 V4 发布"))
+        assertTrue(r.output.contains("https://example.com/sample-model-v4"))
         // ★ 必须取 summary，不能取 snippet（snippet 是给界面看的短句）
         assertTrue(r.output.contains("这是一段写给模型读的长摘要。"))
         assertTrue(r.output.contains("Example News"))

@@ -22,13 +22,13 @@
 
     <!--
         通知权限（Android 13 / API 33 起需要运行时申请）。
-        DSH 后续做后台任务时要用通知告诉用户"正在执行"，没有它就看不到任何提示。
+        后续版本做后台任务时要用通知告诉用户"正在执行"，没有它就看不到任何提示。
     -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!--
         前台服务：让 App 在后台持续跑（比如长任务、工具执行），不被系统回收。
-        这是给后面的 DSH 长任务准备的。
+        这是给后面的长任务准备的。
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Android 14 起，前台服务还必须声明具体类型，否则启动就会崩 -->

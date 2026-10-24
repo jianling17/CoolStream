@@ -15,7 +15,7 @@ plugins {
     id("com.google.devtools.ksp") version "2.0.21-1.0.28"
 }
 
-// ===== 读取 local.properties 里的 DEEPSEEK_API_KEY =====
+// ===== 读取 local.properties 里的 BUILTIN_API_KEY =====
 // 注意：这里必须用 import 进来的 Properties，
 // 不能写成 java.util.Properties() —— 在 Gradle Kotlin DSL 里
 // "java" 会被解析成 Gradle 的 java 扩展，而不是 Java 包名。
@@ -24,7 +24,7 @@ val localPropsFile = rootProject.file("local.properties")
 if (localPropsFile.exists()) {
     localPropsFile.inputStream().use { localProps.load(it) }
 }
-val deepSeekApiKey: String = localProps.getProperty("DEEPSEEK_API_KEY") ?: ""
+val builtinApiKey: String = localProps.getProperty("BUILTIN_API_KEY") ?: ""
 // =====================================================
 
 // ===== 读取 release 签名配置（同样来自 local.properties）=====
@@ -111,7 +111,7 @@ android {
         //
         // 这个默认值在这里是空串，release 的 buildType 里会再覆盖一次空串
         // （见 buildTypes.release 里的 buildConfigField），双保险。
-        buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepSeekApiKey\"")
+        buildConfigField("String", "BUILTIN_API_KEY", "\"$builtinApiKey\"")
 
         // 把版本号也生成进 BuildConfig，UI 里直接读，不用再解析 PackageInfo
         buildConfigField("String", "BUILD_VERSION_NAME", "\"$versionName\"")
@@ -175,7 +175,7 @@ android {
             //
             // 这是第二道保险：defaultConfig 里注入的是 local.properties 的值，
             // 这里在 release 上覆盖成空串，保证打出来的 APK 里
-            // BuildConfig.DEEPSEEK_API_KEY == ""。
+            // BuildConfig.BUILTIN_API_KEY == ""。
             //
             // 用户在 App 里填的 Key 存在 EncryptedSharedPreferences，
             // 跟 APK 无关，所以清空它不影响正常使用。
@@ -183,7 +183,7 @@ android {
             // 验证方法（发版前必做）：
             //   ./gradlew assembleRelease
             //   解压 APK，在 classes*.dex 里 grep "sk-" —— 必须搜不到。
-            buildConfigField("String", "DEEPSEEK_API_KEY", "\"\"")
+            buildConfigField("String", "BUILTIN_API_KEY", "\"\"")
         }
     }
 
@@ -211,7 +211,7 @@ android {
 
 dependencies {
 
-    // OkHttp：流式请求 DeepSeek API
+    // OkHttp：流式请求云端大模型 API
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // ===== Rhino：PTC 预设的 JavaScript 运行时 =====

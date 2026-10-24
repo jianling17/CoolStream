@@ -454,7 +454,7 @@ private fun workspaceRuleLine(): String {
 //      只写 pattern 的话，某些系统语言下会输出本地数字（阿拉伯-印度数字等
 //      非 ASCII 字符），模型读到的就不是 2026-10-23 了，而是 ٢٠٢٦-١٠-٢٣。
 //   2. 时间要放在提示词【最末尾】，不要放开头。
-//      DeepSeek 的上下文缓存是按前缀命中的：时间一变整段就变，放开头等于
+//      云端模型的上下文缓存是按前缀命中的：时间一变整段就变，放开头等于
 //      每次都让缓存全部失效，输入费用从 0.02 涨到 1 元/百万 token（差 50 倍）。
 //      放末尾只让最后几十个 token 失效，前面的提示词照样命中缓存。
 //   3. 只在「发请求前」取一次，不要放进每 token 的热路径。
@@ -893,7 +893,7 @@ abstract class AppDatabase : RoomDatabase() {
 
 
 // ============================================================
-// 2. 网络层：调用 DeepSeek 流式 API
+// 2. 网络层：调用云端大模型流式 API
 //
 // ★ 多轮上下文：参数从"一句话"改成"整个对话历史"。
 //   每次请求都把之前的 user / assistant 消息按顺序一起发过去，
@@ -914,7 +914,7 @@ abstract class AppDatabase : RoomDatabase() {
 //     ② 作为最干净的 50ms 批处理参考实现
 //   所以你要是往这里加日志想看请求体，是看不到的 —— 请看 runAgentLoop。
 // ============================================================
-fun sendToDeepSeek(
+fun sendToCloudModel(
     history: List<ChatMessage>,
     scope: CoroutineScope,
     onFlush: (String) -> Unit,
@@ -924,7 +924,7 @@ fun sendToDeepSeek(
     scope.launch(Dispatchers.IO) {
         try {
             // ---------- 1. 检查 API Key ----------
-            val apiKey = BuildConfig.DEEPSEEK_API_KEY
+            val apiKey = BuildConfig.BUILTIN_API_KEY
             Log.d(TAG, "stream start: key length=${apiKey.length}, history=${history.size} messages")
 
             if (apiKey.isBlank()) {
@@ -974,14 +974,14 @@ fun sendToDeepSeek(
                 put("stream", true)
                 put("messages", messagesArray)
 
-                // ★★★ 关掉思考模式（仅 DeepSeek）★★★
-                // deepseek-flash 的思考模式【默认开启】。开启后它会先吐一长串
+                // ★★★ 关掉思考模式（仅内置服务）★★★
+                // 默认模型 的思考模式【默认开启】。开启后它会先吐一长串
                 // 思维链，而思维链分片里 content 字段是 JSON null
                 //（思维内容在 reasoning_content 字段里）。
                 // 那些 content=null 的分片，正是"满屏 nullnullnull"的源头之一。
                 // 关掉后：响应更快，且不会再有这种空分片。
-                // thinking 是 DeepSeek 专有字段，第三方 provider 发了可能 400。
-                if (ApiConfig.provider == ApiProvider.DEEPSEEK) {
+                // thinking 是 云端模型专有字段，第三方 provider 发了可能 400。
+                if (ApiConfig.provider == ApiProvider.BUILTIN) {
                     put("thinking", JSONObject().put("type", "disabled"))
                 }
             }.toString()
@@ -1473,7 +1473,7 @@ private const val TOOL_DEFINITIONS = """
         "properties": {
           "query": {
             "type": "string",
-            "description": "搜索关键词，1~128 个字符。写关键词，不要贴整段问题。支持检索运算符：site:example.com（限定站点）、-site:example.com（排除站点）、\"精确短语\"、-词（排除词）、lang:zh,en（限定语言）、after:2026-01-01（限定发布时间下限）、before:2026-06-01（上限），多个运算符可组合，例如 DeepSeek 发布 site:github.com lang:en after:2026-09-01"
+            "description": "搜索关键词，1~128 个字符。写关键词，不要贴整段问题。支持检索运算符：site:example.com（限定站点）、-site:example.com（排除站点）、\"精确短语\"、-词（排除词）、lang:zh,en（限定语言）、after:2026-01-01（限定发布时间下限）、before:2026-06-01（上限），多个运算符可组合，例如 示例查询 发布 site:github.com lang:en after:2026-09-01"
           }
         },
         "required": ["query"]
@@ -1591,16 +1591,16 @@ fun networkErrorText(e: Throwable): ErrorText {
 }
 
 /**
- * ⚠️ 下面这两个是【退化路径 sendToDeepSeek】专用的旧实现，故意保留。
+ * ⚠️ 下面这两个是【退化路径 sendToCloudModel】专用的旧实现，故意保留。
  *
- * 铁律 3：sendToDeepSeek 一个字不改。它现在没有任何调用点，
+ * 铁律 3：sendToCloudModel 一个字不改。它现在没有任何调用点，
  * 但仍保留作参照。它的 onError 收的是 String，所以这里继续返回中文。
  * 真正在跑的 runAgentLoop 已经改用上面的 httpErrorText / networkErrorText。
  */
 private fun httpErrorMessage(code: Int, body: String): String {
     return when (code) {
         401 -> "API Key 无效或已欠费（401）。\n请到「设置 → 模型与 API」检查 Key 是否填错、账户是否还有余额。"
-        402 -> "账户余额不足（402）。\n请到 DeepSeek 开放平台充值后再试。"
+        402 -> "账户余额不足（402）。\n请到 模型开放平台充值后再试。"
         403 -> "没有访问权限（403）。\n这个 Key 可能被限制访问该模型。"
         404 -> "接口地址不对（404）。\n检查「设置 → 模型与 API」里的 API 地址。"
         429 -> "请求太频繁，请休息一下（429）。\n等几十秒再发，或者换到低峰时段。"
@@ -1816,7 +1816,7 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "open_app" to "按包名拉起一个应用（Shizuku）",
     // ★ 说明里要写清「要花钱」，否则用户会以为和别的工具一样是免费的本地操作。
     //   官方单价：每 1000 次成功请求 5 元（失败和空结果不计费）。
-    "web_search" to "联网搜索网页（走 DeepSeek 官方搜索接口，每次约 ¥0.005）",
+    "web_search" to "联网搜索网页（走 内置默认服务搜索接口，每次约 ¥0.005）",
     "ask_user" to "向用户提出问题并等待回答（不花钱，会暂停对话）"
 )
 
@@ -1833,7 +1833,7 @@ private val TOOL_DESCRIPTIONS = mapOf(
 //   ptc（Programmatic Tool Calling）
 //     只发一个 run_code 工具。模型写一段 JavaScript，在代码里连续调用工具 ——
 //     能循环、能分支、能一次读十个文件再汇总，省掉「一次只能调一个」的往返。
-//     概念对齐 DSH 的 PTC 预设（其原文：「标准模式直接向模型提供各个工具；
+//     概念对齐编程模式的预设（其原文：「标准模式直接向模型提供各个工具；
 //     PTC 让模型用代码组织工具调用」），只是把它的 TS 运行时换成了 Rhino。
 //
 //   minimal（极简）
@@ -2136,8 +2136,8 @@ private const val SEC_KEY_PROVIDER = "api_provider"
 /** 「引导已完成」标记。放普通 SharedPreferences 就行，它不是敏感信息 */
 private const val KEY_ONBOARD_DONE = "onboard_done"
 
-private const val DEFAULT_API_BASE = "https://api.deepseek.com/v1"
-private const val DEFAULT_MODEL = "deepseek-flash"
+private const val DEFAULT_API_BASE = "https://api.example.com/v1"
+private const val DEFAULT_MODEL = "默认模型"
 
 @Volatile
 private var securePrefsCache: SharedPreferences? = null
@@ -2174,23 +2174,23 @@ private fun securePrefs(context: Context): SharedPreferences? {
 /**
  * API 提供者类型（v1.2.0 多模型泛化）。
  *
- * DEEPSEEK          —— 官方 API，带 DeepSeek 专有字段（thinking 等）
- * OPENAI_COMPATIBLE —— 任何标准 OpenAI 协议的第三方：智谱 GLM、Kimi、
+ * BUILTIN          —— 内置默认服务 API，带云端模型专有字段（thinking 等）
+ * OPENAI_COMPATIBLE —— 任何标准 OpenAI 协议的第三方兼容模型：
  *                      本地 Ollama（http://localhost:11434/v1）等。
  *                      请求体只发 OpenAI 标准字段。
  */
-internal enum class ApiProvider { DEEPSEEK, OPENAI_COMPATIBLE }
+internal enum class ApiProvider { BUILTIN, OPENAI_COMPATIBLE }
 
 /** 每个 provider 的默认 baseUrl。第三方没有万能默认值，必须由用户填。 */
 internal fun defaultBaseFor(provider: ApiProvider): String = when (provider) {
-    ApiProvider.DEEPSEEK -> DEFAULT_API_BASE
+    ApiProvider.BUILTIN -> DEFAULT_API_BASE
     // 智谱只是示例地址，绝不能替用户做决定 —— 空 = UI 层要求必填
     ApiProvider.OPENAI_COMPATIBLE -> ""
 }
 
 /** 运行期的 API 配置。用 mutableStateOf 托着，设置页一改界面立刻跟着变 */
 internal object ApiConfig {
-    var provider by mutableStateOf(ApiProvider.DEEPSEEK)
+    var provider by mutableStateOf(ApiProvider.BUILTIN)
     var apiKey by mutableStateOf("")
     var baseUrl by mutableStateOf(DEFAULT_API_BASE)
     var model by mutableStateOf(DEFAULT_MODEL)
@@ -2200,15 +2200,15 @@ internal fun loadApiConfig(context: Context) {
     val p = securePrefs(context)
     val savedKey = p?.getString(SEC_KEY_API_KEY, "").orEmpty()
     // 用户没配过就用编译期那把（开发者本机），两者都没有就是空
-    ApiConfig.apiKey = savedKey.ifBlank { BuildConfig.DEEPSEEK_API_KEY }
+    ApiConfig.apiKey = savedKey.ifBlank { BuildConfig.BUILTIN_API_KEY }
     ApiConfig.baseUrl = p?.getString(SEC_KEY_BASE_URL, DEFAULT_API_BASE)
         ?.takeIf { it.isNotBlank() } ?: DEFAULT_API_BASE
     ApiConfig.model = p?.getString(SEC_KEY_MODEL, DEFAULT_MODEL)
         ?.takeIf { it.isNotBlank() } ?: DEFAULT_MODEL
-    // 存过脏值（手改过 / 旧版本残留）时 valueOf 会抛 —— 退回 DEEPSEEK
+    // 存过脏值（手改过 / 旧版本残留）时 valueOf 会抛 —— 退回 BUILTIN
     ApiConfig.provider = runCatching {
         ApiProvider.valueOf(p?.getString(SEC_KEY_PROVIDER, "") ?: "")
-    }.getOrDefault(ApiProvider.DEEPSEEK)
+    }.getOrDefault(ApiProvider.BUILTIN)
     Log.d(
         TAG,
         "API 配置已加载: baseUrl=${ApiConfig.baseUrl}, model=${ApiConfig.model}, " +
@@ -2251,8 +2251,8 @@ internal fun saveApiConfig(
  * 把用户填的地址补成完整的 chat/completions 端点（v1.2.0 起多 provider 通用）。
  *
  * 用户可能填：
- *   `https://api.deepseek.com` 或 `https://api.deepseek.com/v1`   （DeepSeek 两种都认）
- *   `https://open.bigmodel.cn/api/paas/v4`                          （智谱 GLM）
+ *   `https://api.example.com` 或 `https://api.example.com/v1`   （两种都认）
+ *   `https://open.bigmodel.cn/api/paas/v4`                          （示例：第三方兼容服务商）
  *   `http://localhost:11434/v1`                                     （本地 Ollama）
  *   甚至直接贴全 `.../chat/completions` —— 四种都得认。
  * 规则统一：去掉尾斜杠，已带 /chat/completions 就不再补。
@@ -2328,9 +2328,9 @@ internal fun ensureDefaultWorkspace(context: Context): String? {
 // ============================================================
 // 3.25 Token 用量与费用估算
 //
-// 单价来源：DeepSeek 官方文档（2026-08-17 起的峰谷定价）
-//   https://api-docs.deepseek.com/zh-cn/quick_start/pricing
-//   deepseek-flash = DeepSeek-V4.1-Flash-1017
+// 单价来源：内置默认服务文档（2026-08-17 起的峰谷定价）
+//   https://example.com/docs/pricing
+//   默认模型 = 内置默认模型（示例端点）
 //
 //   元 / 百万 tokens          空闲时段   高峰时段
 //   输入（缓存命中）            0.02      0.04
@@ -2343,7 +2343,7 @@ internal fun ensureDefaultWorkspace(context: Context): String? {
 //    · 法定节假日无法在客户端判断（需要一张节假日表），那几天会按高峰价算，偏高
 //    · 官方随时可能调价，单价写死在代码里就有过期风险
 // ============================================================
-private const val CONTEXT_WINDOW_TOKENS = 1_000_000   // deepseek-flash 上下文长度 1M
+private const val CONTEXT_WINDOW_TOKENS = 1_000_000   // 默认模型 上下文长度 1M
 
 /**
  * 上下文窗口的人类可读标签：1_000_000 显示成「1M tokens」比「1000K」好读。
@@ -2531,7 +2531,7 @@ object UsageLedger {
     }
 }
 
-/** 从任意一条 SSE 数据里尝试抠出 usage（DeepSeek 通常放在最后一条，且那一条 choices 为空） */
+/** 从任意一条 SSE 数据里尝试抠出 usage（云端模型通常放在最后一条，且那一条 choices 为空） */
 internal fun parseUsage(json: String): UsageStats? {
     return try {
         val u = JSONObject(json).optJSONObject("usage") ?: return null
@@ -2550,8 +2550,8 @@ internal fun parseUsage(json: String): UsageStats? {
 // ============================================================
 // 3.3 ★★★ Agent 执行闭环（带工具调用）★★★
 //
-// 和 sendToDeepSeek 的关系：
-//   · sendToDeepSeek 一个字都没改，保留作「无工具」的退化路径
+// 和 sendToCloudModel 的关系：
+//   · sendToCloudModel 一个字都没改，保留作「无工具」的退化路径
 //   · 这个函数是它的升级版：
 //       请求带 tools → 收 tool_calls → 本地执行 → 结果作为 role:"tool" 回填
 //       → 再发一次请求 → 拿到最终回答
@@ -2601,7 +2601,7 @@ fun runAgentLoop(
         try {
             // ---------- 1. 检查 API Key ----------
             //
-            // ★ 这里必须读 ApiConfig.apiKey，不能读 BuildConfig.DEEPSEEK_API_KEY。
+            // ★ 这里必须读 ApiConfig.apiKey，不能读 BuildConfig.BUILTIN_API_KEY。
             //
             //   历史 bug：原来读的是 BuildConfig，而 release 包里那个值是空串，
             //   于是「用户明明在设置里填了 Key，一发送还是报没配置」——
@@ -2635,7 +2635,7 @@ fun runAgentLoop(
                     // ★ 带上当前工作区约束 + 当前时间。
                     //
                     //   ★★★ 时间必须拼在【末尾】，不能拼在开头 ★★★
-                    //     DeepSeek 的上下文缓存是按「前缀」命中的：
+                    //     云端模型的上下文缓存是按「前缀」命中的：
                     //     时间戳一变，从它往后所有 token 全部失效。
                     //     放开头 = 每次请求都让整份系统提示词重新计费
                     //     （缓存命中 0.02 元/百万 → 未命中 1 元/百万，差 50 倍）；
@@ -2715,7 +2715,7 @@ fun runAgentLoop(
                     put("model", ApiConfig.model)
                     put("stream", true)
                     // ★ 关键：不加这个，流式响应里【根本不会返回 usage】
-                    //   DeepSeek 默认只在非流式请求里给 usage
+                    //   云端模型默认只在非流式请求里给 usage
                     put("stream_options", JSONObject().put("include_usage", true))
                     put("messages", messages)
                     // 工具全被关掉时不要发空数组 —— 有些实现会因此报 400
@@ -2725,10 +2725,10 @@ fun runAgentLoop(
                     if (toolsArray.length() > 0) {
                         put("tools", toolsArray)
                     }
-                    // ★ thinking 是 DeepSeek 专有字段，不是 OpenAI 协议的一部分。
+                    // ★ thinking 是 云端模型专有字段，不是 OpenAI 协议的一部分。
                     //   第三方兼容服务（严格实现）遇到未知字段可能直接 400，
-                    //   所以只有 DEEPSEEK provider 才发。
-                    if (ApiConfig.provider == ApiProvider.DEEPSEEK) {
+                    //   所以只有 BUILTIN provider 才发。
+                    if (ApiConfig.provider == ApiProvider.BUILTIN) {
                         put("thinking", JSONObject().put("type", "disabled"))
                     }
                 }.toString()
@@ -2755,7 +2755,7 @@ fun runAgentLoop(
                     Log.e(TAG, "HTTP ${response.code}: ${errBody.take(300)}")
                     response.close()
 
-                    // ★ v1.2.0 容错：第三方模型（部分 GLM / 本地小模型）不认 tools 参数，
+                    // ★ v1.2.0 容错：第三方模型（部分兼容服务 / 本地小模型）不认 tools 参数，
                     //   服务端一般报 4xx 且错误体里点名 tools / function。
                     //   首次遇到：去掉 tools 参数降级重试一轮（toolsEnabledForRequest = false），
                     //   并通知 UI 弹提示；同一请求周期内只降级一次。
@@ -2789,7 +2789,7 @@ fun runAgentLoop(
 
                 val reader = BufferedReader(InputStreamReader(bodyStream.byteStream()))
 
-                // ---------- 50ms 批处理（和 sendToDeepSeek 同一套） ----------
+                // ---------- 50ms 批处理（和 sendToCloudModel 同一套） ----------
                 val buffer = StringBuilder()
                 var lastFlushAt = 0L
                 var roundChars = 0
@@ -3610,7 +3610,7 @@ fun ChatScreen() {
     }
 
     // ===== 通知权限（Android 13 / API 33 起是运行时权限）=====
-    // 拒绝也不影响聊天，只是后续 DSH 的前台服务通知看不见。
+    // 拒绝也不影响聊天，只是后续版本的前台服务通知看不见。
     val notifLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -4300,7 +4300,7 @@ fun ChatScreen() {
 
                             // ⑤ ★ 发起 Agent 闭环请求
                             //
-                            //    sendToDeepSeek 原样保留、一个字没改。
+                            //    sendToCloudModel 原样保留、一个字没改。
                             //    这里换成 runAgentLoop —— 它在它的基础上多了：
                             //      请求带 tools / 解析 tool_calls / 本地执行 / 结果回填 / 二次请求
                             //
@@ -5947,8 +5947,8 @@ private fun ModelTab() {
     var hintIsOk by remember { mutableStateOf(false) }
 
     val keyOk = draftKey.isNotBlank()
-    // 第三方地址必填；DeepSeek 官方有默认 base（空了也会兜 DEFAULT_API_BASE）
-    val baseOk = draftProvider == ApiProvider.DEEPSEEK || draftBase.isNotBlank()
+    // 第三方地址必填；内置默认服务有默认 base（空了也会兜 DEFAULT_API_BASE）
+    val baseOk = draftProvider == ApiProvider.BUILTIN || draftBase.isNotBlank()
     val dirty = draftKey != ApiConfig.apiKey ||
         draftBase != ApiConfig.baseUrl ||
         draftModel != ApiConfig.model ||
@@ -5961,12 +5961,12 @@ private fun ModelTab() {
         item { SectionHeader(stringResource(R.string.section_model_api)) }
 
         item {
-            // ★ v1.2.0：提供者选择。切回 DeepSeek 自动填官方地址（不给手滑留机会），
+            // ★ v1.2.0：提供者选择。切回内置服务自动填默认地址（不给手滑留机会），
             //   切到第三方清空 base 让用户必填 —— 绝不能拿智谱地址当默认值替用户做决定。
             ChoiceRow(
                 label = stringResource(R.string.label_provider),
                 options = listOf(
-                    "DEEPSEEK" to stringResource(R.string.provider_deepseek),
+                    "BUILTIN" to stringResource(R.string.provider_builtin),
                     "OPENAI_COMPATIBLE" to stringResource(R.string.provider_openai)
                 ),
                 selected = draftProvider.name,
@@ -5975,7 +5975,7 @@ private fun ModelTab() {
                     hintRes = null
                     hintIsOk = false
                     when (draftProvider) {
-                        ApiProvider.DEEPSEEK -> {
+                        ApiProvider.BUILTIN -> {
                             // 官方：恢复默认地址（用户此前填的第三方地址不再有意义）
                             if (draftBase != DEFAULT_API_BASE) {
                                 draftBase = DEFAULT_API_BASE
@@ -5994,12 +5994,12 @@ private fun ModelTab() {
             ConfigField(
                 label = stringResource(R.string.field_api_base),
                 value = draftBase,
-                placeholder = if (draftProvider == ApiProvider.DEEPSEEK) {
+                placeholder = if (draftProvider == ApiProvider.BUILTIN) {
                     DEFAULT_API_BASE
                 } else {
                     stringResource(R.string.api_base_example_custom)
                 },
-                helper = if (draftProvider == ApiProvider.DEEPSEEK) {
+                helper = if (draftProvider == ApiProvider.BUILTIN) {
                     stringResource(R.string.api_base_helper)
                 } else {
                     stringResource(R.string.api_base_helper_custom)
@@ -7553,7 +7553,7 @@ private fun TableRow(cells: List<String>, widths: List<Dp>, header: Boolean) {
 // ============================================================
 // 6.2 工具调用卡片（Tool Calling UI 骨架）
 //
-// DSH 的灵魂就是工具调用：模型说「我要调用 read_file」，
+// 本 App 的灵魂就是工具调用：模型说「我要调用 read_file」，
 // 界面得能看见这次调用、点开能看见传了什么参数。
 //
 // 数据约定：type == TOOL_CALL 时，message.content 存的是
@@ -7998,7 +7998,7 @@ private fun DiffSurface(rows: List<DiffRow>) {
 // 6.5 InfoBar —— 本轮费用 + 上下文用量
 //
 // 数据全部来自 API 返回的 usage 字段（需要请求里带 stream_options.include_usage）。
-// 费用按 DeepSeek 官方峰谷单价估算，见前面 3.25 节。
+// 费用按 内置默认服务峰谷单价估算，见前面 3.25 节。
 // ============================================================
 /**
  * 联网搜索状态条：`🔍 正在联网搜索: 关键词`

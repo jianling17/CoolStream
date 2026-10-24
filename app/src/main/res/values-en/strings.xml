@@ -21,7 +21,7 @@
     <string name="ob_step1_title">Enter your API Key</string>
     <string name="ob_step2_title">Allow file access</string>
     <string name="ob_step3_title">Shizuku (optional)</string>
-    <string name="ob_key_helper">Get one at platform.deepseek.com. Stored only in this device\'s encrypted storage.</string>
+    <string name="ob_key_helper">Get one at the model open platform. Stored only in this device\'s encrypted storage.</string>
     <string name="ob_model_helper">Leave it as is if you\'re not sure</string>
     <string name="ob_step2_body">Reading, writing, editing files and running commands all need this. Without it you can only chat — every tool stays disabled.</string>
     <string name="ob_step2_action">Grant access</string>
@@ -82,11 +82,11 @@
 
     <string name="section_model_api">Model &amp; API</string>
     <string name="section_billing">Billing basis</string>
-    <string name="billing_body">Cost is estimated from DeepSeek\'s official peak/off-peak rates, not a bill.\nPeak hours: Mon–Fri 09:00–12:00 and 14:00–18:00 Beijing time (public holidays excluded).\nHolidays cannot be detected on the client, so those days are charged at peak rates and may read high.</string>
-    <string name="api_base_helper">https://api.deepseek.com is enough — /chat/completions is appended automatically</string>
-    <string name="api_key_empty">Get one at platform.deepseek.com</string>
+    <string name="billing_body">Cost is estimated from the cloud model\'s official peak/off-peak rates, not a bill.\nPeak hours: Mon–Fri 09:00–12:00 and 14:00–18:00 Beijing time (public holidays excluded).\nHolidays cannot be detected on the client, so those days are charged at peak rates and may read high.</string>
+    <string name="api_base_helper">The built-in default service URL is enough — /chat/completions is appended automatically</string>
+    <string name="api_key_empty">Get one at the model open platform</string>
     <string name="api_key_saved">%1$d characters; kept in encrypted storage, never logged or backed up</string>
-    <string name="model_helper">e.g. deepseek-flash / deepseek-v4-pro</string>
+    <string name="model_helper">e.g. model-a / model-b</string>
     <string name="save_ok">Saved — takes effect on the next turn</string>
     <string name="save_key_required">Key cannot be empty</string>
     <string name="save_no_change">Already up to date</string>
@@ -194,7 +194,7 @@
 
     <!-- ============ Error messages ============ -->
     <string name="err_401">Invalid API key or insufficient balance (401).\nCheck the key under Settings → Model &amp; API and confirm the account still has credit.</string>
-    <string name="err_402">Insufficient balance (402).\nTop up on the DeepSeek platform and try again.</string>
+    <string name="err_402">Insufficient balance (402).\nTop up on the model open platform and try again.</string>
     <string name="err_403">Access denied (403).\nThis key may not be allowed to use that model.</string>
     <string name="err_404">Wrong endpoint (404).\nCheck the API base URL under Settings → Model &amp; API.</string>
     <string name="err_429">Too many requests (429).\nWait a few dozen seconds, or retry during off-peak hours.</string>
@@ -224,9 +224,9 @@
     <string name="ob_page_of">Page %1$d / %2$d</string>
     <string name="err_no_api_key_bubble">Please configure your API key in Settings first</string>
     <string name="label_provider">API provider</string>
-    <string name="provider_deepseek">DeepSeek official</string>
+    <string name="provider_builtin">Built-in default</string>
     <string name="provider_openai">Custom (OpenAI-compatible)</string>
-    <string name="api_base_helper_custom">Any OpenAI-compatible endpoint: GLM / Kimi / local Ollama</string>
+    <string name="api_base_helper_custom">Any OpenAI-compatible endpoint: Third-party compatible services / local Ollama</string>
     <string name="api_base_example_custom">https://open.bigmodel.cn/api/paas/v4</string>
     <string name="save_base_required">Custom provider requires the API base URL</string>
     <string name="mcp_section_title">MCP server (experimental)</string>

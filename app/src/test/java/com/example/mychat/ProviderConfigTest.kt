@@ -25,16 +25,16 @@ class ProviderConfigTest {
     // ---------- chatCompletionsUrl：四种用户填法都得认 ----------
 
     @Test fun url_深seek官方不带v1() {
-        ApiConfig.baseUrl = "https://api.deepseek.com"
-        assertEquals("https://api.deepseek.com/chat/completions", chatCompletionsUrl())
+        ApiConfig.baseUrl = "https://api.example.com"
+        assertEquals("https://api.example.com/chat/completions", chatCompletionsUrl())
     }
 
     @Test fun url_深seek官方带v1() {
-        ApiConfig.baseUrl = "https://api.deepseek.com/v1"
-        assertEquals("https://api.deepseek.com/v1/chat/completions", chatCompletionsUrl())
+        ApiConfig.baseUrl = "https://api.example.com/v1"
+        assertEquals("https://api.example.com/v1/chat/completions", chatCompletionsUrl())
     }
 
-    @Test fun url_智谱glm() {
+    @Test fun url_第三方示例() {
         ApiConfig.baseUrl = "https://open.bigmodel.cn/api/paas/v4"
         assertEquals("https://open.bigmodel.cn/api/paas/v4/chat/completions", chatCompletionsUrl())
     }
@@ -45,8 +45,8 @@ class ProviderConfigTest {
     }
 
     @Test fun url_尾斜杠要削掉() {
-        ApiConfig.baseUrl = "https://api.deepseek.com/v1/"
-        assertEquals("https://api.deepseek.com/v1/chat/completions", chatCompletionsUrl())
+        ApiConfig.baseUrl = "https://api.example.com/v1/"
+        assertEquals("https://api.example.com/v1/chat/completions", chatCompletionsUrl())
     }
 
     @Test fun url_用户直接贴了全端点不再补() {
@@ -63,18 +63,18 @@ class ProviderConfigTest {
     }
 
     @Test fun url_首尾空格要trim() {
-        ApiConfig.baseUrl = "  https://api.deepseek.com  "
-        assertEquals("https://api.deepseek.com/chat/completions", chatCompletionsUrl())
+        ApiConfig.baseUrl = "  https://api.example.com  "
+        assertEquals("https://api.example.com/chat/completions", chatCompletionsUrl())
     }
 
     // ---------- provider 枚举与默认 base ----------
 
     @Test fun provider_默认是深seek() {
-        assertEquals(ApiProvider.DEEPSEEK, ApiConfig.provider.coerceAtLeastDefault())
+        assertEquals(ApiProvider.BUILTIN, ApiConfig.provider.coerceAtLeastDefault())
     }
 
     @Test fun defaultBase_深seek有默认地址() {
-        assertEquals("https://api.deepseek.com/v1", defaultBaseFor(ApiProvider.DEEPSEEK))
+        assertEquals("https://api.example.com/v1", defaultBaseFor(ApiProvider.BUILTIN))
     }
 
     @Test fun defaultBase_第三方没有万能默认值必须用户填() {
@@ -90,7 +90,7 @@ class ProviderConfigTest {
 
     @Test fun provider_降级容错_脏字符串退回深seek() {
         val bad = runCatching { ApiProvider.valueOf("not_a_provider") }
-        assertTrue(bad.isFailure)  // loadApiConfig 里正是靠这个失败退 DEEPSEEK
+        assertTrue(bad.isFailure)  // loadApiConfig 里正是靠这个失败退 BUILTIN
     }
 }
 

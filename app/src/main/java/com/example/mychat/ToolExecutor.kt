@@ -1573,9 +1573,9 @@ internal fun runCode(code: String): ToolExecResult {
 // ============================================================
 // 3.28 联网搜索（web_search）
 //
-// ★ 为什么直接接 DeepSeek 官方搜索接口，而不是自己解析网页：
-//   DeepSeek 在 2026-10-17 上线了 Search / Fetch 两个「裸 JSON」接口
-//   （POST https://api.deepseek.com/v1/tools/search），
+// ★ 为什么直接接 云端搜索服务，而不是自己解析网页：
+//   云端搜索服务在 2026-10-17 上线了 Search / Fetch 两个「裸 JSON」接口
+//   （POST https://api.example.com/v1/tools/search），
 //   和模型接口共用同一把 Bearer Key，返回的 summary 字段本身就是「写给模型读的」
 //   600~800 字长摘要 —— 这正是我们需要的形状。
 //   自己爬 DuckDuckGo / Bing 的 HTML 要解析页面结构，对方一改版就全废，
@@ -1608,7 +1608,7 @@ private const val SEARCH_MAX_QUERY_CHARS = 128
 private const val SEARCH_MAX_OUTPUT_CHARS = 4000
 
 /** 没有配置 baseUrl 时的兜底（正常走 ApiConfig，这里是防 null） */
-private const val SEARCH_DEFAULT_BASE = "https://api.deepseek.com"
+private const val SEARCH_DEFAULT_BASE = "https://api.example.com"
 
 /**
  * 搜索专用的 OkHttp 客户端。
@@ -1629,8 +1629,8 @@ private val searchClient: OkHttpClient by lazy {
 /**
  * 拼出搜索端点。
  *
- * 用户可能把 baseUrl 填成 `https://api.deepseek.com`，
- * 也可能填成 `https://api.deepseek.com/v1`，
+ * 用户可能把 baseUrl 填成 `https://api.example.com`，
+ * 也可能填成 `https://api.example.com/v1`，
  * 甚至直接填完整端点。三种都要能拼对，不能拼出 `/v1/v1/tools/search`。
  */
 private fun toolsSearchUrl(): String {
@@ -1661,7 +1661,7 @@ internal fun webSearch(query: String): ToolExecResult {
         return ToolExecResult(
             false,
             "参数错误：query 有 ${q.length} 个字符，超过官方上限 $SEARCH_MAX_QUERY_CHARS。\n" +
-                "请把它压缩成几个关键词（例如「DeepSeek 搜索 API 价格」），不要把整段问题贴进来。"
+                "请把它压缩成几个关键词（例如「示例关键词 价格」），不要把整段问题贴进来。"
         )
     }
 
