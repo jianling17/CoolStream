@@ -2191,9 +2191,11 @@ internal fun mcpListTools(): Pair<List<McpTool>, String?> {
             val schema = t.optJSONObject("inputSchema")?.toString() ?: "{}"
             tools.add(McpTool(t.optString("name"), t.optString("description"), schema))
         }
+        MCPTransport.reportToolCount(tools.size)
         tools to null
     } catch (e: Exception) {
         Log.w(TOOL_LOG_TAG, "mcpListTools 失败: " + e.message)
+        MCPTransport.reportToolCount(0)
         emptyList<McpTool>() to "MCP 服务器连接失败：" + e.message
     }
 }
@@ -2280,7 +2282,8 @@ internal fun mcpPromptSection(mcpTools: List<McpTool>): String {
         "- " + t.name + "：" + t.description.ifBlank { "（外部 MCP 工具，无描述）" }
     }
     return buildString {
-        append("\n\n16. 以下是用户配置的 MCP 服务器提供的外部工具，本轮可以直接调用（调用方式与内置工具相同）：")
+        append("\n\n16. 当前已外接 MCP 工具，请优先考虑使用。")
+        append("\n以下是用户配置的 MCP 服务器提供的外部工具，本轮可以直接调用（调用方式与内置工具相同）：")
         append("\n")
         append(lines)
         append("\n调用成功后基于返回结果回答；调用失败就把失败原因如实告诉用户。")

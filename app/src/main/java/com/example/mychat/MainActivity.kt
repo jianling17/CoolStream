@@ -4966,6 +4966,30 @@ fun Sidebar(
                 )
             }
 
+            // ---------- v1.3.0：MCP 全局状态行 ----------
+            //   连接正常 -> 🟢 MCP 已连接 (X 个工具)
+            //   未配置/未连接 -> ⚪ MCP 未配置
+            //   只读 MCPTransport 的缓存状态，不做网络请求，不碰 50ms 防抖。
+            val mcpConnected = MCPTransport.peekConnected()
+            val mcpToolCount = MCPTransport.peekToolCount()
+            val mcpConfigured = AppSettings.mcpServerUrl.isNotBlank()
+            val mcpStatusText = if (mcpConnected && mcpToolCount > 0) {
+                "🟢 " + stringResource(R.string.mcp_connected, mcpToolCount)
+            } else if (mcpConfigured) {
+                "⚪ MCP 已配置，未连接"
+            } else {
+                "⚪ " + stringResource(R.string.mcp_not_configured)
+            }
+            Text(
+                text = mcpStatusText,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = cs.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 4.dp)
+            )
+
             // ---------- 左下角：设置（透明底 + 齿轮 + 文字） ----------
             TextButton(
                 onClick = onSettings,
@@ -6468,6 +6492,7 @@ private fun McpServerCard() {
     var hint by remember { mutableStateOf("") }
     var hintIsOk by remember { mutableStateOf(false) }
     var testing by remember { mutableStateOf(false) }
+    var discoveredTools by remember { mutableStateOf<List<McpTool>>(emptyList()) }
     val scope = rememberCoroutineScope()
 
     Column(
@@ -6508,10 +6533,12 @@ private fun McpServerCard() {
                     testing = true
                     hint = ""
                     scope.launch {
-                        val (_, err) = withContext(Dispatchers.IO) { mcpListTools() }
+                        val (tools, err) = withContext(Dispatchers.IO) { mcpListTools() }
                         testing = false
+                        discoveredTools = tools
                         hint = when {
-                            err == null -> "连接成功"
+                            err == null && tools.isEmpty() -> context.getString(R.string.mcp_no_tools)
+                            err == null -> context.getString(R.string.mcp_tools_found, tools.size)
                             else -> err
                         }
                         hintIsOk = err == null
@@ -6541,6 +6568,45 @@ private fun McpServerCard() {
                 color = if (hintIsOk) cs.primary else MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(start = 4.dp, top = 6.dp)
             )
+        }
+        // ★ v1.3.0：测试连接成功后展示工具列表（只读极简 UI）
+        if (discoveredTools.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            discoveredTools.forEach { tool ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 4.dp, top = 4.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Text(
+                        text = "•",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = cs.primary
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Column {
+                        Text(
+                            text = tool.name,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = cs.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (tool.description.isNotBlank()) {
+                            Text(
+                                text = tool.description,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = cs.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }

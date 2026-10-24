@@ -243,6 +243,10 @@
     <string name="mcp_url_label">MCP server URL</string>
     <string name="mcp_url_helper">Streamable HTTP / SSE endpoint, e.g. http://10.0.2.2:3000/mcp; save empty to disable</string>
     <string name="mcp_save_test">Save &amp; test</string>
+    <string name="mcp_tools_found">Discovered %1$d tools</string>
+    <string name="mcp_no_tools">Connected, but no tools provided</string>
+    <string name="mcp_connected">MCP connected (%1$d tools)</string>
+    <string name="mcp_not_configured">MCP not configured</string>
     <!-- v1.3.0 Accessibility service -->
     <string name="accessibility_service_label">CoolStream Screen Assistant</string>
     <string name="accessibility_service_description">When enabled, CoolStream can read on-screen control information and simulate taps and swipes to automate sending messages, paging, and other actions for you. It does not read password input fields in the background.</string>

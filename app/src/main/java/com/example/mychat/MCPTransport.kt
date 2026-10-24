@@ -81,7 +81,19 @@ internal object MCPTransport {
         initialized = false
         state = State.DISCONNECTED
         backoffMs = BASE_BACKOFF_MS
+        lastToolCount = 0
         Log.d(TAG, "连接状态已重置")
+    }
+
+    /** UI 只读：当前是否已建立会话（无需网络请求） */
+    internal fun peekConnected(): Boolean = initialized && sessionId != null && state == State.CONNECTED
+
+    /** UI 只读：上次成功拉取的工具数（无需网络请求） */
+    internal fun peekToolCount(): Int = lastToolCount
+
+    /** 供 ToolExecutor 在 mcpListTools 成功后回写工具计数 */
+    internal fun reportToolCount(count: Int) {
+        lastToolCount = count
     }
 
     /**
@@ -89,6 +101,11 @@ internal object MCPTransport {
      * 已初始化且 sessionId 仍有效 -> 直接返回（会话复用）。
      * 未初始化 -> 执行 initialize 握手 + notifications/initialized。
      */
+    /** 上次成功拉取的工具数量（供 UI 侧边栏显示，无需网络请求） */
+    @Volatile
+    internal var lastToolCount: Int = 0
+        private set
+
     /** 上次成功连接时的服务器地址，变更时自动重置会话 */
     @Volatile
     private var connectedUrl: String = ""
