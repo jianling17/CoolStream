@@ -284,6 +284,8 @@ val SYSTEM_PROMPT = """
 - get_clipboard()：读取当前手机的系统剪贴板文本内容。
 - send_notification(title, content)：在手机通知栏发一条系统通知。
 - take_screenshot()：截取当前手机屏幕，保存到工作区 .cache_screenshot.png，返回文件路径。
+- search_workspace(query)：在整个工作区的文本文件里搜索包含 query 的行，返回「文件路径:行号: 内容」。
+- 如果需要找文件、找代码或找某段内容，先调 search_workspace 搜索，然后再针对性地用 read_file 读取。
 - web_search(query)：联网搜索最新的网页信息，返回前 3 条结果的标题、摘要和链接。
 
 ★ 关于 web_search 的三条硬规则：
@@ -1375,6 +1377,23 @@ private const val TOOL_DEFINITIONS = """
   {
     "type": "function",
     "function": {
+      "name": "search_workspace",
+      "description": "在整个工作区里搜索文件内容包含关键字的文本行，返回「文件路径:行号: 内容」列表。当你需要查找某个具体变量、关键字、配置项，或者不知道目标代码/内容在哪个文件里时，优先使用此工具搜索工作区，再针对性地用 read_file 读取。只搜文本文件，自动跳过二进制和超过 2MB 的大文件与隐藏目录。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "要搜索的关键字，例如函数名、变量名、配置项、一段文案。写短而精确的词，不要贴整句话。"
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "web_search",
       "description": "联网搜索网页，返回最相关的 3 条结果（标题 + 摘要 + 链接）。用于获取你的训练数据里没有的实时信息：今天的新闻、当前股价、最新版本号、政策变化、天气、某个人最近在做什么。凡是答案可能已经过时的问题，先搜再答。",
       "parameters": {
@@ -1581,6 +1600,12 @@ internal const val MAX_BACKUP_BYTES = 1_048_576L
 /** 单次 search_files 最多返回多少条匹配 */
 internal const val MAX_SEARCH_HITS = 20
 
+/** search_workspace：单次最多返回多少条「文件:行号」匹配 */
+internal const val MAX_GREP_HITS = 30
+
+/** search_workspace：超过这个大小的文件直接跳过（防 OOM） */
+internal const val MAX_GREP_FILE_BYTES = 2_097_152L
+
 /** 单次 search_files 最多访问多少个文件（防止在 /sdcard 里扫到天荒地老） */
 internal const val MAX_SEARCH_VISITS = 50_000
 
@@ -1690,6 +1715,8 @@ internal val ALL_TOOL_NAMES = listOf(
     "list_dir", "search_files", "read_file", "write_file", "replace_in_file", "run_shell",
     // ★ v1.4 新增：Shizuku 系统级三件套（剪贴板 / 通知 / 截屏），都是「动手机系统」的工具。
     "get_clipboard", "send_notification", "take_screenshot",
+    // ★ v1.4 战役二：工作区全文检索（本地轻量 RAG）。
+    "search_workspace",
     // ★ v1.1 新增。放在最后不是随便排的：前面都是「动手机上的东西」，
     //   只有它一个是要花钱联网的，单独排在末尾，设置页里一眼就能看出区别。
     "web_search",
@@ -1709,6 +1736,7 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "get_clipboard" to "读取系统剪贴板文本",
     "send_notification" to "发一条系统通知到通知栏",
     "take_screenshot" to "截屏保存到工作区并返回路径",
+    "search_workspace" to "在工作区所有文本文件里搜关键字（全文检索）",
     // ★ 说明里要写清「要花钱」，否则用户会以为和别的工具一样是免费的本地操作。
     //   官方单价：每 1000 次成功请求 5 元（失败和空结果不计费）。
     "web_search" to "联网搜索网页（走 DeepSeek 官方搜索接口，每次约 ¥0.005）",

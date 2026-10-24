@@ -716,6 +716,133 @@ internal fun searchFiles(keyword: String, rootPath: String): ToolExecResult {
 private const val MAX_SHELL_OUTPUT = 20_000
 
 // ============================================================
+// v1.4 战役二：search_workspace —— 工作区全文检索（本地轻量 RAG，纯字符串匹配）
+// ============================================================
+
+/**
+ * search_workspace：在整个工作区里搜「文件内容包含关键字」的文本行。
+ *
+ * 铁律对齐：
+ *  · 纯字符串匹配（String.contains，忽略大小写），无向量库、无 Embedding、无网络。
+ *  · useLines 逐行流式读取，超大文件不整份进内存。
+ *  · >2MB 的文件直接跳过并记日志；二进制（前 8KB 有 NUL）跳过；
+ *    隐藏目录（.git / node_modules 等）整个不进。
+ *  · 由 executeTool 在 IO 协程调用，天然不阻塞主线程。
+ */
+internal fun searchWorkspace(query: String): ToolExecResult {
+    val q = query.trim()
+    if (q.isEmpty()) {
+        return ToolExecResult(false, "参数错误：缺少 query（要搜索的关键字）")
+    }
+
+    val rootPath = currentWorkspace
+    if (rootPath.isBlank()) {
+        return ToolExecResult(
+            false,
+            "还没有设置工作区，无法搜索。请在「设置 → 工作区」里选择一个目录。"
+        )
+    }
+    workspaceViolation(rootPath)?.let { return ToolExecResult(false, it) }
+    val root = File(rootPath)
+    if (!root.isDirectory) {
+        return ToolExecResult(false, "工作区目录无效：$rootPath")
+    }
+
+    val ql = q.lowercase()
+    val hits = ArrayList<String>()
+    var visited = 0
+    var skippedLarge = 0
+    var truncated = false
+    fun walk(dir: File, depth: Int) {
+        if (hits.size >= MAX_GREP_HITS) { truncated = true; return }
+        if (depth > MAX_SEARCH_DEPTH) return
+        if (visited >= MAX_SEARCH_VISITS) { truncated = true; return }
+
+        val children = dir.listFiles() ?: return
+        for (child in children) {
+            if (hits.size >= MAX_GREP_HITS || visited >= MAX_SEARCH_VISITS) {
+                truncated = true
+                return
+            }
+            visited++
+
+            val hidden = child.name.startsWith(".")
+            if (child.isDirectory) {
+                // 隐藏目录整个跳过（.git / .gradle / node_modules 这类既深又无关）
+                if (!hidden) walk(child, depth + 1)
+                continue
+            }
+            if (hidden) continue
+
+            if (child.length() > MAX_GREP_FILE_BYTES) {
+                skippedLarge++
+                Log.d(TOOL_LOG_TAG, "search_workspace 跳过大文件: ${child.absolutePath} (${child.length()} 字节)")
+                continue
+            }
+
+            // 二进制探测：前 8KB 有 NUL 字节就当二进制跳过
+            val probe = runCatching {
+                child.inputStream().use { ins ->
+                    val buf = ByteArray(8192)
+                    val n = ins.read(buf)
+                    var bin = false
+                    for (i in 0 until (n.coerceAtLeast(0))) {
+                        if (buf[i] == 0.toByte()) { bin = true; break }
+                    }
+                    bin
+                }
+            }.getOrDefault(true)
+            if (probe) continue
+
+            try {
+                child.useLines { lines ->
+                    var lineNo = 0
+                    for (line in lines) {
+                        lineNo++
+                        if (line.lowercase().contains(ql)) {
+                            hits.add("${child.absolutePath}:$lineNo: ${line.trim().take(200)}")
+                            if (hits.size >= MAX_GREP_HITS) {
+                                truncated = true
+                                break
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // 读不动的文件（权限/编码怪癖）跳过，不中断整轮搜索
+                Log.d(TOOL_LOG_TAG, "search_workspace 读取失败，跳过: ${child.absolutePath}: ${e.message}")
+            }
+        }
+    }
+
+    walk(root, 0)
+
+    Log.d(
+        TOOL_LOG_TAG,
+        "search_workspace query=$q, 命中 ${hits.size} 条, 检查 $visited 项, 跳过大文件 $skippedLarge"
+    )
+
+    return if (hits.isEmpty()) {
+        ToolExecResult(
+            true,
+            "未找到包含 \"$q\" 的内容（搜索范围：$rootPath，共检查 $visited 项" +
+                (if (skippedLarge > 0) "，跳过 $skippedLarge 个超大文件" else "") +
+                "）。可以先 search_files 按文件名找，或确认关键字拼写。"
+        )
+    } else {
+        val sb = StringBuilder()
+        sb.append("在工作区 \"").append(rootPath).append("\" 中找到 ")
+            .append(hits.size).append(" 条包含 \"").append(q).append("\" 的内容：\n")
+        hits.forEach { sb.append(it).append('\n') }
+        if (truncated) {
+            sb.append("…（结果已截断：最多返回 ").append(MAX_GREP_HITS)
+                .append(" 条匹配，可换更精确的关键字缩小范围）")
+        }
+        ToolExecResult(true, sb.toString().trimEnd())
+    }
+}
+
+// ============================================================
 // run_shell 的三段式结构
 //
 // ⚠️ 重要事实：Shizuku 13.1.5 里 **没有** 公开的 Shizuku.newProcess()。
@@ -1744,6 +1871,9 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
             }
 
             "take_screenshot" -> takeScreenshot(currentWorkspace)
+
+            // ★ v1.4 战役二：工作区全文检索。
+            "search_workspace" -> searchWorkspace(argOf(argsJson, "query"))
 
             // ★ v1.1 联网搜索。
             //   query 绝不能过 cleanPath —— 它会削掉首尾的引号和标点，
