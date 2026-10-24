@@ -4211,6 +4211,27 @@ fun ChatScreen() {
                                 // ask_user：把问题交给 ChatScreen 的桥接实现
                                 onAskUser = { q -> vm.askUserAndWait(q) },
 
+                                // v1.2.0：第三方模型不支持 tools，已自动降级为标准对话。
+                                // 插一条 isError 气泡提示用户（不落库 —— 降级后正常对话
+                                // 仍会继续，这条只是提示，别污染历史）。
+                                onToolsUnsupported = { msg ->
+                                    Log.w(TAG, "tools 降级: $msg")
+                                    val card = ChatMessage(
+                                        sessionId = sessionId,
+                                        content = msg,
+                                        isUser = false,
+                                        isError = true,
+                                        timestamp = now + 1,
+                                        type = MessageType.AI_TEXT
+                                    )
+                                    updateSession(sessionId) { s ->
+                                        val list = s.messages.toMutableList()
+                                        val at = (list.size - 1).coerceAtLeast(0)
+                                        list.add(at, card)
+                                        s.copy(messages = list)
+                                    }
+                                },
+
                                 onDone = { total ->
                                     Log.d(TAG, "onDone: total=$total")
                                     isStreaming = false
@@ -5671,6 +5692,8 @@ private fun ModelTab() {
     var draftKey by remember { mutableStateOf(ApiConfig.apiKey) }
     var draftBase by remember { mutableStateOf(ApiConfig.baseUrl) }
     var draftModel by remember { mutableStateOf(ApiConfig.model) }
+    // v1.2.0：provider 草稿。切换时联动 base/model 默认值（见 onSelect）
+    var draftProvider by remember { mutableStateOf(ApiConfig.provider) }
     var showKey by remember { mutableStateOf(false) }
     // 保存结果的提示：只存 key，真正的文案在渲染时用 stringResource 拼。
     // ★ 以前是直接存中文、再用 hint.startsWith("已保存") 判断颜色 ——
@@ -5681,9 +5704,12 @@ private fun ModelTab() {
     var hintIsOk by remember { mutableStateOf(false) }
 
     val keyOk = draftKey.isNotBlank()
+    // 第三方地址必填；DeepSeek 官方有默认 base（空了也会兜 DEFAULT_API_BASE）
+    val baseOk = draftProvider == ApiProvider.DEEPSEEK || draftBase.isNotBlank()
     val dirty = draftKey != ApiConfig.apiKey ||
         draftBase != ApiConfig.baseUrl ||
-        draftModel != ApiConfig.model
+        draftModel != ApiConfig.model ||
+        draftProvider != ApiConfig.provider
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -5692,11 +5718,49 @@ private fun ModelTab() {
         item { SectionHeader(stringResource(R.string.section_model_api)) }
 
         item {
+            // ★ v1.2.0：提供者选择。切回 DeepSeek 自动填官方地址（不给手滑留机会），
+            //   切到第三方清空 base 让用户必填 —— 绝不能拿智谱地址当默认值替用户做决定。
+            ChoiceRow(
+                label = stringResource(R.string.label_provider),
+                options = listOf(
+                    "DEEPSEEK" to stringResource(R.string.provider_deepseek),
+                    "OPENAI_COMPATIBLE" to stringResource(R.string.provider_openai)
+                ),
+                selected = draftProvider.name,
+                onSelect = { id ->
+                    draftProvider = ApiProvider.valueOf(id)
+                    hintRes = null
+                    hintIsOk = false
+                    when (draftProvider) {
+                        ApiProvider.DEEPSEEK -> {
+                            // 官方：恢复默认地址（用户此前填的第三方地址不再有意义）
+                            if (draftBase != DEFAULT_API_BASE) {
+                                draftBase = DEFAULT_API_BASE
+                            }
+                        }
+                        ApiProvider.OPENAI_COMPATIBLE -> {
+                            // 第三方：清空，逼用户填自己的地址
+                            if (draftBase.isNotBlank()) draftBase = ""
+                        }
+                    }
+                }
+            )
+        }
+
+        item {
             ConfigField(
                 label = stringResource(R.string.field_api_base),
                 value = draftBase,
-                placeholder = DEFAULT_API_BASE,
-                helper = stringResource(R.string.api_base_helper),
+                placeholder = if (draftProvider == ApiProvider.DEEPSEEK) {
+                    DEFAULT_API_BASE
+                } else {
+                    stringResource(R.string.api_base_example_custom)
+                },
+                helper = if (draftProvider == ApiProvider.DEEPSEEK) {
+                    stringResource(R.string.api_base_helper)
+                } else {
+                    stringResource(R.string.api_base_helper_custom)
+                },
                 onValueChange = { draftBase = it; hintRes = null; hintIsOk = false }
             )
         }
@@ -5748,12 +5812,12 @@ private fun ModelTab() {
             ) {
                 Button(
                     onClick = {
-                        saveApiConfig(context, draftKey, draftBase, draftModel)
+                        saveApiConfig(context, draftKey, draftBase, draftModel, draftProvider)
                         hintRes = R.string.save_ok
                         hintArgs = emptyArray()
                         hintIsOk = true
                     },
-                    enabled = keyOk && dirty,
+                    enabled = keyOk && baseOk && dirty,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = cs.primary,
                         contentColor = cs.onPrimary
@@ -5772,6 +5836,7 @@ private fun ModelTab() {
                     } else {
                         when {
                             !keyOk -> stringResource(R.string.save_key_required)
+                            !baseOk -> stringResource(R.string.save_base_required)
                             !dirty -> stringResource(R.string.save_no_change)
                             else -> stringResource(R.string.save_dirty)
                         }

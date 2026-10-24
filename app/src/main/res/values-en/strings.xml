@@ -220,4 +220,10 @@
     <string name="ob_skip_short">Skip</string>
     <string name="ob_page_of">Page %1$d / %2$d</string>
     <string name="err_no_api_key_bubble">Please configure your API key in Settings first</string>
+    <string name="label_provider">API provider</string>
+    <string name="provider_deepseek">DeepSeek official</string>
+    <string name="provider_openai">Custom (OpenAI-compatible)</string>
+    <string name="api_base_helper_custom">Any OpenAI-compatible endpoint: GLM / Kimi / local Ollama</string>
+    <string name="api_base_example_custom">https://open.bigmodel.cn/api/paas/v4</string>
+    <string name="save_base_required">Custom provider requires the API base URL</string>
 </resources>

@@ -220,4 +220,10 @@
     <string name="ob_skip_short">跳过</string>
     <string name="ob_page_of">第 %1$d / %2$d 页</string>
     <string name="err_no_api_key_bubble">请先在设置中配置 API Key</string>
+    <string name="label_provider">API 提供者</string>
+    <string name="provider_deepseek">DeepSeek 官方</string>
+    <string name="provider_openai">自定义 (OpenAI 兼容)</string>
+    <string name="api_base_helper_custom">填 OpenAI 兼容端点，如智谱 / Kimi / 本地 Ollama</string>
+    <string name="api_base_example_custom">https://open.bigmodel.cn/api/paas/v4</string>
+    <string name="save_base_required">自定义提供者必须填写 API 地址</string>
 </resources>
