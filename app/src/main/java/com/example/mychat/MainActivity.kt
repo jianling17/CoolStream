@@ -134,6 +134,7 @@ import androidx.security.crypto.MasterKey
 import android.content.Context
 import android.provider.OpenableColumns
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -1539,6 +1540,27 @@ private const val TOOL_DEFINITIONS = """
         "required": ["text", "pattern"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "semantic_search",
+      "description": "按语义搜索工作区文件（TF-IDF 相似度排序，按意思搜而非精确关键字匹配）。适合搜「含义相近但用词不同」的内容。首次调用会自动建索引，之后复用缓存。单次最多返回 10 条结果。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "要搜索的自然语言查询，例如「用户登录流程」或「数据库连接配置」"
+          },
+          "top_k": {
+            "type": "integer",
+            "description": "返回结果数量，默认 5，最大 10"
+          }
+        },
+        "required": ["query"]
+      }
+    }
   }
 ]
 """
@@ -1839,6 +1861,8 @@ internal val ALL_TOOL_NAMES = listOf(
     "web_search",
     // ★ v1.2.0 战役六：本地极客工具（不花钱、不碰网络）。
     "sqlite_query", "regex_extract",
+    // ★ v1.2.0 本地语义检索（TF-IDF，按"意思"搜，区别于 search_workspace 的关键字匹配）。
+    "semantic_search",
     // ★ v1.1 阶段三新增。排 web_search 后面：它不碰手机、也不花钱，
     //   但要「暂停等用户输入」，性质和前七个都不同，放在最后单独一组。
     "ask_user"
@@ -1864,6 +1888,7 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "web_search" to "联网搜索网页（走 内置默认服务搜索接口，每次约 ¥0.005）",
     "sqlite_query" to "查询工作区 SQLite 数据库（只读，仅支持 SELECT）",
     "regex_extract" to "用正则表达式从文本中提取匹配内容",
+    "semantic_search" to "按语义搜索工作区文件（TF-IDF 相似度，按意思搜而非关键字）",
     "ask_user" to "向用户提出问题并等待回答（不花钱，会暂停对话）"
 )
 
@@ -3550,6 +3575,10 @@ fun ChatScreen() {
     // 存储权限提示（Agent 的 read_file 工具需要「所有文件访问权限」）
     var showStorageTip by remember { mutableStateOf(false) }
 
+    // ★ v1.2.0：应用内自动检查更新
+    var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
+    var showUpdateDialog by remember { mutableStateOf(false) }
+
     // Shizuku 授权状态（run_shell 工具需要）
     var shizukuGranted by remember { mutableStateOf(false) }
 
@@ -3572,6 +3601,15 @@ fun ChatScreen() {
         //   所以用一个 @Volatile 的全局变量传递。
         currentWorkspace = workspace
         Log.d(TAG, "已加载工作区: ${workspace.ifBlank { "(未设置)" }}")
+    }
+
+    // ★ v1.2.0：启动时静默检查更新（Dispatchers.IO 内网络请求）
+    LaunchedEffect(Unit) {
+        val info = checkGitHubRelease(BuildConfig.BUILD_VERSION_NAME)
+        if (info != null) {
+            updateInfo = info
+            showUpdateDialog = true
+        }
     }
 
     // ===== 流式任务 / 费用统计（状态都在 ViewModel 里） =====
@@ -4107,6 +4145,65 @@ fun ChatScreen() {
                         confirmButton = {
                             TextButton(onClick = { officeTip = null }) {
                                 Text(stringResource(R.string.action_ok))
+                            }
+                        }
+                    )
+                }
+
+                // ---------- 更新提示对话框（v1.2.0） ----------
+                if (showUpdateDialog && updateInfo != null) {
+                    val info = updateInfo!!
+                    AlertDialog(
+                        onDismissRequest = { showUpdateDialog = false },
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        titleContentColor = MaterialTheme.colorScheme.onSurface,
+                        textContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        title = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(text = "🚀 ", style = MaterialTheme.typography.headlineSmall)
+                                Text(
+                                    text = stringResource(R.string.update_available),
+                                    style = MaterialTheme.typography.titleLarge
+                                )
+                            }
+                        },
+                        text = {
+                            Column {
+                                Text(
+                                    text = stringResource(R.string.update_current) + ": " + BuildConfig.BUILD_VERSION_NAME,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = stringResource(R.string.update_latest) + ": " + info.latestVersion,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = info.releaseNotes.ifBlank { info.releaseTitle },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 12,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                val intent = Intent(Intent.ACTION_VIEW, info.githubUrl.toUri())
+                                context.startActivity(intent)
+                            }) {
+                                Text(stringResource(R.string.update_download_github))
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = {
+                                val intent = Intent(Intent.ACTION_VIEW, info.lanzouUrl.toUri())
+                                context.startActivity(intent)
+                            }) {
+                                Text(stringResource(R.string.update_download_lanzou))
                             }
                         }
                     )
@@ -5989,6 +6086,18 @@ private fun GeneralTab(
                 }
             )
         }
+        // ★ v1.2.0：无障碍自动化服务开关
+        item {
+            val a11yOk = remember(resumeTick) {
+                CoolStreamAccessibilityService.isEnabled(context)
+            }
+            PermissionRow(
+                label = stringResource(R.string.accessibility_automation),
+                status = if (a11yOk) stringResource(R.string.common_on) else stringResource(R.string.accessibility_automation_off),
+                ok = a11yOk,
+                onClick = { CoolStreamAccessibilityService.openSettings(context) }
+            )
+        }
     }
 }
 
@@ -6466,6 +6575,72 @@ private fun AboutTab() {
                 color = cs.onSurface,
                 modifier = Modifier.padding(vertical = 8.dp)
             )
+        }
+        item {
+            // ★ v1.2.0：手动检查更新按钮
+            // stringResource 必须在组合上下文调，协程里不能调，所以先取出来
+            var checking by remember { mutableStateOf(false) }
+            var updateMsg by remember { mutableStateOf("") }
+            var foundInfo by remember { mutableStateOf<UpdateInfo?>(null) }
+            val scope = rememberCoroutineScope()
+            val ctx = LocalContext.current
+            val strChecking = stringResource(R.string.update_checking)
+            val strCheck = stringResource(R.string.check_update)
+            val strLatest = stringResource(R.string.update_latest)
+            val strNoUpdate = stringResource(R.string.update_no_update)
+            val strGithub = stringResource(R.string.update_download_github)
+            val strLanzou = stringResource(R.string.update_download_lanzou)
+            OutlinedButton(
+                onClick = {
+                    checking = true
+                    updateMsg = ""
+                    foundInfo = null
+                    scope.launch {
+                        val info = checkGitHubRelease(BuildConfig.BUILD_VERSION_NAME)
+                        checking = false
+                        if (info != null) {
+                            foundInfo = info
+                            updateMsg = strLatest + ": " + info.latestVersion
+                        } else {
+                            updateMsg = strNoUpdate
+                        }
+                    }
+                },
+                enabled = !checking,
+                modifier = Modifier.fillMaxWidth(),
+                border = BorderStroke(1.dp, cs.outline)
+            ) {
+                Text(
+                    text = if (checking) strChecking else strCheck,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+            if (updateMsg.isNotBlank()) {
+                Text(
+                    text = updateMsg,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+            // 发现新版本时直接在按钮下方放两个下载入口
+            foundInfo?.let { info ->
+                Row(
+                    modifier = Modifier.padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            ctx.startActivity(Intent(Intent.ACTION_VIEW, info.githubUrl.toUri()))
+                        }
+                    ) { Text(strGithub, style = MaterialTheme.typography.labelSmall) }
+                    OutlinedButton(
+                        onClick = {
+                            ctx.startActivity(Intent(Intent.ACTION_VIEW, info.lanzouUrl.toUri()))
+                        }
+                    ) { Text(strLanzou, style = MaterialTheme.typography.labelSmall) }
+                }
+            }
         }
 
         item { SectionHeader(stringResource(R.string.section_stack)) }

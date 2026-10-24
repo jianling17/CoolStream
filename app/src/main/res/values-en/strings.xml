@@ -127,6 +127,15 @@
     <string name="session_more_actions">Session actions</string>
     <string name="action_delete">Delete</string>
     <string name="action_export">Export as Markdown</string>
+    <string name="check_update">Check for Updates</string>
+    <string name="update_available">New version available</string>
+    <string name="update_current">Current version</string>
+    <string name="update_latest">Latest version</string>
+    <string name="update_download_github">Download from GitHub</string>
+    <string name="update_download_lanzou">Fast mirror (Lanzou)</string>
+    <string name="update_no_update">Already up to date ✅</string>
+    <string name="update_checking">Checking for updates…</string>
+    <string name="update_failed">Update check failed, please try again later</string>
     <string name="action_cancel">Cancel</string>
     <string name="delete_session_title">Delete this chat?</string>
     <string name="delete_session_body">“%1$s” and all of its messages will be deleted. This cannot be undone.</string>
@@ -237,4 +246,6 @@
     <!-- v1.3.0 Accessibility service -->
     <string name="accessibility_service_label">CoolStream Screen Assistant</string>
     <string name="accessibility_service_description">When enabled, CoolStream can read on-screen control information and simulate taps and swipes to automate sending messages, paging, and other actions for you. It does not read password input fields in the background.</string>
+    <string name="accessibility_automation">Accessibility Automation</string>
+    <string name="accessibility_automation_off">Not enabled, tap to open system settings</string>
 </resources>

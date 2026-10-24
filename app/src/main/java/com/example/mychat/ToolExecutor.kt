@@ -29,6 +29,7 @@ import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -842,6 +843,68 @@ internal fun searchWorkspace(query: String): ToolExecResult {
         ToolExecResult(true, sb.toString().trimEnd())
     }
 }
+
+// ============================================================
+// v1.2.0 semantic_search -- 本地语义检索（TF-IDF 相似度，按"意思"搜）
+// 区别于 search_workspace 的纯关键字匹配：用 2-gram CJK 分词 + TF-IDF 权重 +
+// 稀疏余弦相似度，能搜到「用词不同但含义相近」的内容。
+// ============================================================
+
+/** 懒加载的语义搜索实例 + 已索引路径（workspace 变了就重建索引）。 */
+@Volatile
+private var semanticSearcher: LocalSemanticSearch? = null
+
+@Volatile
+private var semanticIndexPath: String = ""
+
+internal fun semanticSearch(query: String, topK: Int): ToolExecResult {
+    val q = query.trim()
+    val rootPath = currentWorkspace
+    if (rootPath.isBlank()) {
+        return ToolExecResult(false, "还没有设置工作区，无法搜索。请在「设置 → 工作区」里选择一个目录。")
+    }
+    workspaceViolation(rootPath)?.let { return ToolExecResult(false, it) }
+    val root = File(rootPath)
+    if (!root.isDirectory) {
+        return ToolExecResult(false, "工作区目录无效：$rootPath")
+    }
+
+    val k = topK.coerceIn(1, 10)
+    var searcher = semanticSearcher
+    // 工作区变了或首次调用 -> 重建索引
+    if (searcher == null || semanticIndexPath != rootPath) {
+        searcher = LocalSemanticSearch()
+        runBlocking {
+            searcher.indexDirectory(
+                root = root,
+                extensions = DEFAULT_SEARCH_EXTENSIONS,
+                parallelism = 4
+            )
+        }
+        semanticSearcher = searcher
+        semanticIndexPath = rootPath
+        Log.d(TOOL_LOG_TAG, "semantic_search 索引构建完成: " + searcher.indexedChunkCount + " chunks, 词表 " + searcher.vocabularySize)
+    }
+
+    val hits = runBlocking { searcher.search(q, topK = k) }
+    if (hits.isEmpty()) {
+        return ToolExecResult(
+            true,
+            "未找到与「" + q + "」语义相近的内容（索引 " + searcher.indexedChunkCount + " 块，词表 " + searcher.vocabularySize + " 词）。可以换个说法再试。"
+        )
+    }
+
+    val sb = StringBuilder()
+    sb.append("按语义相似度排序，找到 ").append(hits.size).append(" 条与「").append(q).append("」相关的内容：\n")
+    hits.forEachIndexed { i, hit ->
+        val preview = hit.chunk.text.take(200).replace('\n', ' ')
+        sb.append((i + 1).toString() + ". [" + hit.chunk.source + "] (score=" + "%.3f".format(hit.score) + ")\n   " + preview + "\n")
+    }
+    return ToolExecResult(true, sb.toString().trimEnd())
+}
+
+/** 语义搜索默认索引的文件扩展名。 */
+private val DEFAULT_SEARCH_EXTENSIONS = setOf("txt", "md", "kt", "java", "py", "js", "ts", "json", "xml", "csv", "yaml", "yml", "html", "css", "sql")
 
 // ============================================================
 // run_shell 的三段式结构
@@ -1941,6 +2004,16 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
             "regex_extract" -> {
                 // text / pattern 都是正文，同样不能过 cleanPath
                 regexExtract(argOf(argsJson, "text"), argOf(argsJson, "pattern"))
+            }
+
+            "semantic_search" -> {
+                val q = argOf(argsJson, "query").trim()
+                val k = argOf(argsJson, "top_k").trim().toIntOrNull() ?: 5
+                if (q.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 query（要搜索的自然语言查询）")
+                } else {
+                    semanticSearch(q, k)
+                }
             }
 
             "run_shell" -> {
