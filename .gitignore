@@ -39,3 +39,6 @@ local.properties
 /test-screenshots/
 /.dispatch/
 release.log
+
+# Release APK copies
+CoolStream_v*.apk
