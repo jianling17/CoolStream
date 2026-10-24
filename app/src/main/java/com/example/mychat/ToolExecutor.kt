@@ -912,6 +912,58 @@ internal fun runShell(command: String): ToolExecResult {
 }
 
 // ============================================================
+// v1.4 系统级工具：get_clipboard / send_notification / take_screenshot
+// 全部复用 runShell（Shizuku 通道），零新权限逻辑，天然带黑名单与状态检查。
+// ============================================================
+
+/** shell 单引号包裹：把参数里的单引号转成 '\'' 防注入拆参数 */
+private fun shellQuote(s: String): String = "'" + s.replace("'", "'\\''") + "'"
+
+/** get_clipboard：读系统剪贴板文本（cmd clipboard get，Android 10+ shell 可用） */
+internal fun getClipboard(): ToolExecResult {
+    val r = runShell("cmd clipboard get")
+    if (!r.ok) return r
+    // cmd clipboard get 的输出里可能混有 warning 行，取最后一个非空行作为剪贴板内容
+    val text = r.output.lines().lastOrNull { it.isNotBlank() } ?: ""
+    return if (text.isBlank() || text == "null") {
+        ToolExecResult(true, "剪贴板当前是空的（或只有非文本内容）")
+    } else {
+        ToolExecResult(true, "剪贴板内容：\n$text")
+    }
+}
+
+/** send_notification：发系统通知（cmd notification post，title/content 已做引号包裹） */
+internal fun sendNotification(title: String, content: String): ToolExecResult {
+    val t = shellQuote(title)
+    val c = shellQuote(content)
+    val r = runShell("cmd notification post -S bigtext -t $t CoolStream $c")
+    return if (r.ok) {
+        ToolExecResult(true, "已发送系统通知：\n标题：$title\n内容：$content")
+    } else r
+}
+
+/** 工作区未设置时的截屏兜底目录（与 MainActivity DEFAULT_WORKSPACE 一致） */
+internal const val FALLBACK_SCREENSHOT_DIR = "/storage/emulated/0/Documents/CoolStream_Workspace"
+
+/** take_screenshot：截屏保存到工作区，返回图片路径 */
+internal fun takeScreenshot(workspace: String): ToolExecResult {
+    val dir = (if (workspace.isNotBlank()) workspace else FALLBACK_SCREENSHOT_DIR).trimEnd('/')
+    val path = "$dir/.cache_screenshot.png"
+    val r = runShell("screencap -p $path")
+    if (!r.ok) return r
+    // screencap 失败也可能退出码 0（个别 ROM），补一个文件存在性校验
+    val check = runShell("ls -l $path")
+    if (!check.ok || check.output.contains("No such file")) {
+        return ToolExecResult(false, "截屏命令执行了，但没有找到生成的文件：$path")
+    }
+    return ToolExecResult(
+        true,
+        "已截屏并保存到：$path\n（PNG 图片。如果你具备读图能力，可以引导用户查看；" +
+        "文本模型可提示用户在文件管理器中打开该路径。）"
+    )
+}
+
+// ============================================================
 // 3.27 PTC 沙箱：run_code 的 JavaScript 运行时
 //
 // 这一段回答一个问题：**凭什么敢让大模型写的代码在你手机上跑？**
@@ -1677,6 +1729,21 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                     runShell(command)
                 }
             }
+
+            // ★ v1.4 系统级工具：全部复用 runShell 的 Shizuku 通道（自带黑名单+状态检查）。
+            "get_clipboard" -> getClipboard()
+
+            "send_notification" -> {
+                val title = argOf(argsJson, "title")
+                val content = argOf(argsJson, "content")
+                if (title.isBlank() || content.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 title 或 content")
+                } else {
+                    sendNotification(title, content)
+                }
+            }
+
+            "take_screenshot" -> takeScreenshot(currentWorkspace)
 
             // ★ v1.1 联网搜索。
             //   query 绝不能过 cleanPath —— 它会削掉首尾的引号和标点，

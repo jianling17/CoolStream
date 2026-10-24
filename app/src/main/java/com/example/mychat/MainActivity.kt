@@ -281,6 +281,9 @@ val SYSTEM_PROMPT = """
 - write_file(path, content)：把文本内容写入文件（不存在就新建，已存在就整份覆盖）。父目录会自动创建。
 - replace_in_file(path, search, replace)：把文件里的 search 这段原文换成 replace，其余内容不动。改代码用这个。
 - run_shell(command)：通过 Shizuku 以 shell 权限执行命令，返回输出。需要用户先在 App 里授权 Shizuku。
+- get_clipboard()：读取当前手机的系统剪贴板文本内容。
+- send_notification(title, content)：在手机通知栏发一条系统通知。
+- take_screenshot()：截取当前手机屏幕，保存到工作区 .cache_screenshot.png，返回文件路径。
 - web_search(query)：联网搜索最新的网页信息，返回前 3 条结果的标题、摘要和链接。
 
 ★ 关于 web_search 的三条硬规则：
@@ -1327,6 +1330,51 @@ private const val TOOL_DEFINITIONS = """
   {
     "type": "function",
     "function": {
+      "name": "get_clipboard",
+      "description": "读取当前手机的系统剪贴板文本内容。用户说「看看我复制的」「剪贴板里是什么」时使用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "send_notification",
+      "description": "在手机通知栏发送一条系统通知。用户说「提醒我」「给我发个通知」时使用。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "通知标题，一句话概括，例如 计时结束"
+          },
+          "content": {
+            "type": "string",
+            "description": "通知正文内容"
+          }
+        },
+        "required": ["title", "content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "take_screenshot",
+      "description": "截取当前手机屏幕，保存 PNG 到工作区的 .cache_screenshot.png，并返回文件路径。用户说「截个屏」「看看我现在屏幕上是什么」时使用。你无法直接看图时，把返回的路径告诉用户即可。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "web_search",
       "description": "联网搜索网页，返回最相关的 3 条结果（标题 + 摘要 + 链接）。用于获取你的训练数据里没有的实时信息：今天的新闻、当前股价、最新版本号、政策变化、天气、某个人最近在做什么。凡是答案可能已经过时的问题，先搜再答。",
       "parameters": {
@@ -1640,7 +1688,9 @@ private fun saveWorkspace(context: Context, path: String) {
 /** 七个手写工具的标识，顺序即设置页里的显示顺序，也是发给模型时的顺序 */
 internal val ALL_TOOL_NAMES = listOf(
     "list_dir", "search_files", "read_file", "write_file", "replace_in_file", "run_shell",
-    // ★ v1.1 新增。放在最后不是随便排的：前六个都是「动手机上的东西」，
+    // ★ v1.4 新增：Shizuku 系统级三件套（剪贴板 / 通知 / 截屏），都是「动手机系统」的工具。
+    "get_clipboard", "send_notification", "take_screenshot",
+    // ★ v1.1 新增。放在最后不是随便排的：前面都是「动手机上的东西」，
     //   只有它一个是要花钱联网的，单独排在末尾，设置页里一眼就能看出区别。
     "web_search",
     // ★ v1.1 阶段三新增。排 web_search 后面：它不碰手机、也不花钱，
@@ -1656,6 +1706,9 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "write_file" to "新建文件，或整份覆盖已有文件",
     "replace_in_file" to "局部替换文件里的某段文本（改代码用这个）",
     "run_shell" to "通过 Shizuku 执行 shell 命令，权限很高",
+    "get_clipboard" to "读取系统剪贴板文本",
+    "send_notification" to "发一条系统通知到通知栏",
+    "take_screenshot" to "截屏保存到工作区并返回路径",
     // ★ 说明里要写清「要花钱」，否则用户会以为和别的工具一样是免费的本地操作。
     //   官方单价：每 1000 次成功请求 5 元（失败和空结果不计费）。
     "web_search" to "联网搜索网页（走 DeepSeek 官方搜索接口，每次约 ¥0.005）",
