@@ -226,4 +226,8 @@
     <string name="api_base_helper_custom">Any OpenAI-compatible endpoint: GLM / Kimi / local Ollama</string>
     <string name="api_base_example_custom">https://open.bigmodel.cn/api/paas/v4</string>
     <string name="save_base_required">Custom provider requires the API base URL</string>
+    <string name="mcp_section_title">MCP server (experimental)</string>
+    <string name="mcp_url_label">MCP server URL</string>
+    <string name="mcp_url_helper">Streamable HTTP / SSE endpoint, e.g. http://10.0.2.2:3000/mcp; save empty to disable</string>
+    <string name="mcp_save_test">Save &amp; test</string>
 </resources>

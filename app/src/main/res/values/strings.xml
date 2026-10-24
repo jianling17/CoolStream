@@ -226,4 +226,8 @@
     <string name="api_base_helper_custom">填 OpenAI 兼容端点，如智谱 / Kimi / 本地 Ollama</string>
     <string name="api_base_example_custom">https://open.bigmodel.cn/api/paas/v4</string>
     <string name="save_base_required">自定义提供者必须填写 API 地址</string>
+    <string name="mcp_section_title">MCP 服务器（实验性）</string>
+    <string name="mcp_url_label">MCP 服务器地址</string>
+    <string name="mcp_url_helper">Streamable HTTP / SSE 端点，如 http://10.0.2.2:3000/mcp；清空并保存即关闭</string>
+    <string name="mcp_save_test">保存并测试连接</string>
 </resources>

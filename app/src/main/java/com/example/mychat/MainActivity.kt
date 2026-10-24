@@ -62,6 +62,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -1804,6 +1805,7 @@ private const val KEY_FONT_SCALE = "font_scale"      // 0.9 / 1.0 / 1.15
 private const val KEY_CARD_EXPANDED = "tool_card_expanded"
 private const val KEY_TOOL_PREFIX = "tool_enabled_"
 private const val KEY_LANGUAGE = "language"   // system / zh / en
+private const val KEY_MCP_SERVER_URL = "mcp_server_url"   // v1.3 MCP 服务器地址（普通 prefs，不是敏感信息）
 
 /**
  * 全局设置的内存镜像。
@@ -1837,6 +1839,9 @@ internal object AppSettings {
      *   也要让设置页上的选中态立刻跟着变。
      */
     var preset by mutableStateOf(AgentPreset.STANDARD)
+
+    /** v1.3：MCP 服务器地址（Streamable HTTP / SSE 端点），空 = 未启用 */
+    var mcpServerUrl by mutableStateOf("")
 }
 
 /**
@@ -1860,6 +1865,8 @@ internal fun loadAppSettings(context: Context) {
     AppSettings.cardExpanded = p.getBoolean(KEY_CARD_EXPANDED, false)
     AppSettings.language = p.getString(KEY_LANGUAGE, "system") ?: "system"
     AppSettings.preset = AgentPreset.of(p.getString(KEY_PRESET, AgentPreset.STANDARD.id))
+    AppSettings.mcpServerUrl = p.getString(KEY_MCP_SERVER_URL, "").orEmpty()
+    mcpServerUrl = AppSettings.mcpServerUrl
     // 没写过的工具默认开启
     AppSettings.enabledTools = ALL_TOOL_NAMES.filter {
         p.getBoolean(KEY_TOOL_PREFIX + it, true)
@@ -6021,7 +6028,118 @@ private fun PluginsTab() {
                 modifier = Modifier.padding(start = 4.dp)
             )
         }
+
+        // ---------- v1.3 MCP 服务器配置 ----------
+        item {
+            Spacer(Modifier.height(14.dp))
+            Text(
+                text = stringResource(R.string.mcp_section_title),
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.titleSmall,
+                color = cs.onSurface,
+                modifier = Modifier.padding(horizontal = 4.dp)
+            )
+        }
+        item {
+            McpServerCard()
+        }
     }
+}
+
+/** v1.3：MCP 服务器地址配置卡片（输入 + 测试连接 + 保存） */
+@Composable
+private fun McpServerCard() {
+    val cs = MaterialTheme.colorScheme
+    val context = LocalContext.current
+
+    var draftUrl by remember { mutableStateOf(AppSettings.mcpServerUrl) }
+    var hint by remember { mutableStateOf("") }
+    var hintIsOk by remember { mutableStateOf(false) }
+    var testing by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp)
+    ) {
+        ConfigField(
+            label = stringResource(R.string.mcp_url_label),
+            value = draftUrl,
+            placeholder = "http://10.0.2.2:3000/mcp",
+            helper = stringResource(R.string.mcp_url_helper),
+            onValueChange = { draftUrl = it; hint = "" }
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(
+                onClick = {
+                    val url = draftUrl.trim()
+                    if (url.isEmpty()) {
+                        // 清空保存 = 关闭 MCP
+                        saveMcpServerUrl(context, "")
+                        hint = "已清除 MCP 服务器地址"
+                        hintIsOk = true
+                        return@Button
+                    }
+                    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                        hint = "地址必须以 http:// 或 https:// 开头"
+                        hintIsOk = false
+                        return@Button
+                    }
+                    // 先落盘再测试 —— mcpListTools 读的是 mcpServerUrl 全局
+                    saveMcpServerUrl(context, url)
+                    testing = true
+                    hint = ""
+                    scope.launch {
+                        val (_, err) = withContext(Dispatchers.IO) { mcpListTools() }
+                        testing = false
+                        hint = when {
+                            err == null -> "连接成功"
+                            else -> err
+                        }
+                        hintIsOk = err == null
+                    }
+                },
+                enabled = !testing
+            ) {
+                Text(
+                    text = stringResource(R.string.mcp_save_test),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+            if (testing) {
+                Spacer(Modifier.width(10.dp))
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp
+                )
+            }
+        }
+        if (hint.isNotEmpty()) {
+            Text(
+                text = hint,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (hintIsOk) cs.primary else MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(start = 4.dp, top = 6.dp)
+            )
+        }
+    }
+}
+
+/** MCP 地址落盘：内存镜像 + SharedPreferences 同步写 */
+internal fun saveMcpServerUrl(context: Context, url: String) {
+    val v = url.trim()
+    prefsOf(context).edit { putString(KEY_MCP_SERVER_URL, v) }
+    AppSettings.mcpServerUrl = v
+    mcpServerUrl = v
+    Log.d(TAG, "MCP 服务器地址已保存: " + if (v.isBlank()) "(空)" else v)
 }
 
 /** 关于 */

@@ -12,6 +12,7 @@ package com.example.mychat
  *   · Shell 工具（run_shell + Shizuku 提权）
  *   · PTC 沙箱（run_code + Rhino 宿主函数 + 执行前守卫）
  *   · 联网搜索（web_search）
+ *   · MCP 轻量客户端（v1.3：initialize / tools/list / tools/call）
  *   · 派发器 executeTool
  *
  * ★ 搬迁是纯移动：函数体一行未改，行为与之前完全一致。
@@ -32,6 +33,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import org.mozilla.javascript.BaseFunction
 import org.mozilla.javascript.ClassShutter
@@ -1757,3 +1759,217 @@ private fun pruneToolTempDir(dir: File) {
     val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: return
     files.drop(TOOL_TEMP_KEEP).forEach { runCatching { it.delete() } }
 }
+
+// ============================================================
+// MCP（Model Context Protocol）轻量客户端 —— v1.3
+//
+//   纯 OkHttp + JSONObject 手搓 JSON-RPC 2.0，不引入任何 MCP SDK。
+//   只做无状态 Streamable HTTP 交互：initialize 握手 -> tools/list
+//   -> tools/call，每个请求回传服务器下发的 Mcp-Session-Id。
+//   ★ 全部阻塞式实现，调用方必须包在 Dispatchers.IO 里
+//     （铁律：绝不阻塞主线程）。executeTool 本身就跑在 IO 协程里。
+// ============================================================
+
+/** 单次 MCP 请求超时（毫秒）——外部服务器可能很慢，给足余量 */
+internal const val MCP_TIMEOUT_MS = 15_000L
+
+/** initialize 请求里上报的协议版本（不匹配时 server 会回它支持的版本） */
+internal const val MCP_PROTOCOL_VERSION = "2025-03-26"
+
+/** JSON-RPC id 自增器（App 进程内唯一即可） */
+private var mcpRpcId: Int = 0
+
+/** 当前会话 id：initialize 成功后从响应头取，之后每个请求回传 */
+private var mcpSessionId: String? = null
+
+/** App 设置页里的 MCP 地址（内存镜像，重启由 loadAppSettings 灌回） */
+internal var mcpServerUrl: String = ""
+
+/** MCP 专用 OkHttp —— 超时和主链路分开，互不影响 */
+internal val mcpClient: OkHttpClient by lazy {
+    OkHttpClient.Builder()
+        .connectTimeout(MCP_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .readTimeout(MCP_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .writeTimeout(MCP_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .build()
+}
+
+private fun nextMcpId(): Int = ++mcpRpcId
+
+/**
+ * MCP 请求公共骨架：组 JSON-RPC body -> POST -> 校验 HTTP -> 解析响应。
+ * 返回 result 节点；出错抛 IllegalStateException，由调用方兜底转 ToolExecResult(false, ...)。
+ */
+private fun mcpRpcCall(method: String, params: JSONObject): JSONObject {
+    val url = mcpServerUrl.trim()
+    if (url.isBlank()) throw IllegalStateException("未配置 MCP 服务器地址")
+
+    val id = nextMcpId()
+    val body = JSONObject()
+        .put("jsonrpc", "2.0")
+        .put("id", id)
+        .put("method", method)
+        .put("params", params)
+        .toString()
+
+    val builder = Request.Builder()
+        .url(url)
+        .addHeader("Content-Type", "application/json")
+        .addHeader("Accept", "application/json, text/event-stream")
+        .addHeader("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+        .post(body.toRequestBody(JSON_MEDIA_TYPE))
+    mcpSessionId?.let { builder.addHeader("Mcp-Session-Id", it) }
+
+    mcpClient.newCall(builder.build()).execute().use { response ->
+        // initialize 的会话 id 在响应头里，先记下再读 body
+        response.header("Mcp-Session-Id")?.let { mcpSessionId = it }
+
+        val raw = response.body?.string().orEmpty()
+        if (!response.isSuccessful) {
+            throw IllegalStateException("MCP 服务器返回 HTTP " + response.code + "：" + raw.take(200))
+        }
+
+        // Streamable HTTP 响应可能是纯 JSON，也可能是 SSE（data: 行），两种都接
+        val payload = if (raw.contains("data:")) {
+            raw.lineSequence().lastOrNull { it.trimStart().startsWith("data:") }
+                ?.removePrefix("data:")?.trim()
+                ?: throw IllegalStateException("MCP 响应是 SSE 但没有 data 行")
+        } else raw
+
+        val obj = try { JSONObject(payload) } catch (e: Exception) {
+            throw IllegalStateException("MCP 响应不是合法 JSON：" + payload.take(120))
+        }
+        // 我们发的每个请求都带 id，响应必带；带 error 节点 = 服务器侧拒绝
+        if (obj.has("error")) {
+            val err = obj.optJSONObject("error")
+            throw IllegalStateException(
+                "MCP 错误 " + (err?.optInt("code") ?: -1) + "：" + (err?.optString("message") ?: "未知")
+            )
+        }
+        val result = obj.optJSONObject("result")
+            ?: throw IllegalStateException("MCP 响应缺少 result 节点：" + payload.take(120))
+        if (result.optBoolean("isError", false)) {
+            throw IllegalStateException("MCP 工具执行失败：" + result.optString("content"))
+        }
+        return result
+    }
+}
+
+/** initialize 握手 + notifications/initialized（部分实现要求） */
+private fun mcpInitialize() {
+    val params = JSONObject()
+        .put("protocolVersion", MCP_PROTOCOL_VERSION)
+        .put("capabilities", JSONObject())
+        .put("clientInfo", JSONObject().put("name", "CoolStream").put("version", "1.3"))
+    mcpRpcCall("initialize", params)
+    runCatching {
+        val notify = JSONObject()
+            .put("jsonrpc", "2.0")
+            .put("method", "notifications/initialized")
+        val req = Request.Builder()
+            .url(mcpServerUrl.trim())
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Accept", "application/json, text/event-stream")
+            .post(notify.toString().toRequestBody(JSON_MEDIA_TYPE))
+        mcpSessionId?.let { req.addHeader("Mcp-Session-Id", it) }
+        mcpClient.newCall(req.build()).execute().close()
+    }
+}
+
+/** 外部工具三元组：原名 / 描述 / 参数 JSON Schema 字符串 */
+internal data class McpTool(val name: String, val description: String, val schema: String)
+
+/**
+ * 对外：列出 MCP Server 上的全部工具。
+ * 返回 (工具列表, 失败原因)；没配置地址静默跳过（null），连接失败给原因。
+ */
+internal fun mcpListTools(): Pair<List<McpTool>, String?> {
+    if (mcpServerUrl.isBlank()) return emptyList<McpTool>() to null
+    return try {
+        mcpInitialize()
+        val result = mcpRpcCall("tools/list", JSONObject())
+        val tools = mutableListOf<McpTool>()
+        val arr = result.optJSONArray("tools")
+        for (i in 0 until (arr?.length() ?: 0)) {
+            val t = arr!!.optJSONObject(i) ?: continue
+            val schema = t.optJSONObject("inputSchema")?.toString() ?: "{}"
+            tools.add(McpTool(t.optString("name"), t.optString("description"), schema))
+        }
+        tools to null
+    } catch (e: Exception) {
+        Log.w(TOOL_LOG_TAG, "mcpListTools 失败: " + e.message)
+        emptyList<McpTool>() to "MCP 服务器连接失败：" + e.message
+    }
+}
+
+/**
+ * 对外：调用 MCP 工具，content 数组里的 text 全部拼接返回。
+ * 非 text 类型（image / resource）标注占位说明，不硬塞二进制。
+ */
+internal fun mcpCallTool(toolName: String, argsJson: String): ToolExecResult {
+    if (mcpServerUrl.isBlank()) {
+        return ToolExecResult(false, "MCP 未配置：请先在「设置 -> 插件」里填写 MCP 服务器地址。")
+    }
+    return try {
+        // 每次调用都重新握手 —— 无状态实现最抗服务器重启，代价是多一个往返
+        mcpInitialize()
+        val args = if (argsJson.isBlank()) JSONObject() else JSONObject(argsJson)
+        val params = JSONObject()
+            .put("name", toolName)
+            .put("arguments", args)
+        val result = mcpRpcCall("tools/call", params)
+
+        val sb = StringBuilder()
+        val content = result.optJSONArray("content")
+        for (i in 0 until (content?.length() ?: 0)) {
+            val item = content!!.optJSONObject(i) ?: continue
+            when (item.optString("type")) {
+                "text" -> {
+                    if (sb.isNotEmpty()) sb.append("\n")
+                    sb.append(item.optString("text"))
+                }
+                "image" -> sb.append("\n[该 MCP 工具返回了一张图片，CoolStream 暂不支持展示]")
+                else -> sb.append("\n[该 MCP 工具返回了不支持的内容类型: " + item.optString("type") + "]")
+            }
+        }
+        if (sb.isEmpty()) {
+            ToolExecResult(true, "（MCP 工具 " + toolName + " 执行完成，无文本输出）")
+        } else {
+            ToolExecResult(true, sb.toString())
+        }
+    } catch (e: Exception) {
+        Log.w(TOOL_LOG_TAG, "mcpCallTool(" + toolName + ") 失败: " + e.message)
+        ToolExecResult(false, "MCP 工具 " + toolName + " 调用失败：" + e.message)
+    }
+}
+
+/**
+ * 把外部工具合并进内置 tools 数组：名字冲突加 mcp_ 前缀。
+ * 返回 (合并后的 JSONArray, 冲突改名映射 原名 -> mcp_原名)。
+ */
+internal fun mergeMcpTools(builtin: JSONArray, external: List<McpTool>): Pair<JSONArray, Map<String, String>> {
+    val out = JSONArray()
+    val renamed = mutableMapOf<String, String>()
+    val builtinNames = mutableSetOf<String>()
+    for (i in 0 until builtin.length()) {
+        val item = builtin.optJSONObject(i) ?: continue
+        builtinNames.add(item.optJSONObject("function")?.optString("name").orEmpty())
+        out.put(item)
+    }
+    for (t in external) {
+        val finalName = if (t.name in builtinNames) "mcp_" + t.name else t.name
+        if (finalName != t.name) renamed[t.name] = finalName
+        out.put(
+            JSONObject()
+                .put("type", "function")
+                .put(
+                    "function", JSONObject()
+                        .put("name", finalName)
+                        .put("description", t.description.ifBlank { "（外部 MCP 工具，无描述）" })
+                        .put("parameters", runCatching { JSONObject(t.schema) }.getOrDefault(JSONObject()))
+                )
+        )
+    }
+    return out to renamed
+}
+
