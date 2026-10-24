@@ -33,6 +33,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.mozilla.javascript.BaseFunction
@@ -1069,6 +1070,83 @@ internal fun sendNotification(title: String, content: String): ToolExecResult {
     } else r
 }
 
+
+/** http_request 返回的最大字符数 */
+private const val HTTP_TOOL_MAX_CHARS = 5000
+
+/** calculate：用现有 Rhino 沙箱算数学表达式，避免模型脑算出错 */
+internal fun calculate(expression: String): ToolExecResult {
+    val expr = expression.trim()
+    if (expr.isEmpty()) {
+        return ToolExecResult(false, "参数错误：缺少 expression（数学表达式）")
+    }
+    return try {
+        // 复用 run_code 的沙箱 ContextFactory：禁 Java 类、解释执行、超时保护。
+        val cx = PtcContextFactory.enterContext()
+        try {
+            val deadlineBackup = runCodeDeadline.get()
+            runCodeDeadline.set(SystemClock.elapsedRealtime() + RUN_CODE_TIMEOUT_MS)
+            val result = cx.evaluateString(
+                cx.initStandardObjects(),
+                "(" + expr + ")",
+                "<calculate>",
+                1,
+                null
+            )
+            runCodeDeadline.set(deadlineBackup)
+            val text = RhinoContext.toString(result)
+            ToolExecResult(true, "$expr = $text")
+        } finally {
+            RhinoContext.exit()
+        }
+    } catch (e: Exception) {
+        Log.d(TOOL_LOG_TAG, "calculate 失败: ${e.message}")
+        ToolExecResult(false, "表达式无法计算：${e.message?.take(200)}。请检查括号与运算符是否配对。")
+    }
+}
+
+/** http_request：OkHttp 发请求，返回前 5000 字。让 AI 能直接对接天气等公共 API */
+internal fun httpRequest(url: String, method: String, body: String): ToolExecResult {
+    val m = method.trim().uppercase().ifBlank { "GET" }
+    if (m !in setOf("GET", "POST", "PUT", "DELETE", "HEAD")) {
+        return ToolExecResult(false, "不支持的 method：$method（仅 GET/POST/PUT/DELETE/HEAD）")
+    }
+    return try {
+        val client = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .build()
+        val builder = okhttp3.Request.Builder().url(url)
+        when (m) {
+            "POST" -> builder.post(body.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+            "PUT" -> builder.put(body.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+            "DELETE" -> builder.delete()
+            "HEAD" -> builder.head()
+        }
+        client.newCall(builder.build()).execute().use { resp ->
+            val text = resp.body?.string() ?: ""
+            val clipped = if (text.length > HTTP_TOOL_MAX_CHARS) {
+                text.take(HTTP_TOOL_MAX_CHARS) + "\n…（响应过长，已截断为前 $HTTP_TOOL_MAX_CHARS 字符）"
+            } else text
+            val ctype = resp.header("Content-Type") ?: "unknown"
+            ToolExecResult(true, "HTTP ${resp.code} (${ctype})\n$clipped")
+        }
+    } catch (e: Exception) {
+        ToolExecResult(false, "请求失败：${e.javaClass.simpleName}: ${e.message?.take(200)}")
+    }
+}
+
+/** open_app：Shizuku 执行 monkey -p <package> 1 拉起应用（复用 runShell 通道） */
+internal fun openApp(packageName: String): ToolExecResult {
+    val pkg = packageName.trim()
+    if (pkg.isEmpty() || !pkg.matches(Regex("[A-Za-z0-9_.]+"))) {
+        return ToolExecResult(false, "参数错误：package_name 应为应用包名，例如 com.tencent.mm")
+    }
+    val r = runShell("monkey -p $pkg -c android.intent.category.LAUNCHER 1")
+    return if (r.ok) {
+        ToolExecResult(true, "已尝试拉起应用：$pkg。如果手机上没有安装这个应用，不会有任何反应。")
+    } else r
+}
 /** 工作区未设置时的截屏兜底目录（与 MainActivity DEFAULT_WORKSPACE 一致） */
 internal const val FALLBACK_SCREENSHOT_DIR = "/storage/emulated/0/Documents/CoolStream_Workspace"
 
@@ -1874,6 +1952,15 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
 
             // ★ v1.4 战役二：工作区全文检索。
             "search_workspace" -> searchWorkspace(argOf(argsJson, "query"))
+
+            // ★ v1.2.0 战役四：calculate / http_request / open_app。
+            "calculate" -> calculate(argOf(argsJson, "expression"))
+            "http_request" -> httpRequest(
+                url = argOf(argsJson, "url"),
+                method = argOf(argsJson, "method"),
+                body = argOf(argsJson, "body")
+            )
+            "open_app" -> openApp(argOf(argsJson, "package_name"))
 
             // ★ v1.1 联网搜索。
             //   query 绝不能过 cleanPath —— 它会削掉首尾的引号和标点，

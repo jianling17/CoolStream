@@ -293,6 +293,9 @@ val SYSTEM_PROMPT = """
 - take_screenshot()：截取当前手机屏幕，保存到工作区 .cache_screenshot.png，返回文件路径。
 - search_workspace(query)：在整个工作区的文本文件里搜索包含 query 的行，返回「文件路径:行号: 内容」。
 - 如果需要找文件、找代码或找某段内容，先调 search_workspace 搜索，然后再针对性地用 read_file 读取。
+- calculate(expression)：精确计算数学表达式。任何需要算数的场合都必须用它，绝不心算。
+- http_request(url, method, body)：发送 HTTP 请求，返回前 5000 字。可对接无需鉴权的公共 API。
+- open_app(package_name)：按包名拉起手机上的应用，需要 Shizuku 授权。
 - web_search(query)：联网搜索最新的网页信息，返回前 3 条结果的标题、摘要和链接。
 
 ★ 关于 web_search 的三条硬规则：
@@ -1401,6 +1404,65 @@ private const val TOOL_DEFINITIONS = """
   {
     "type": "function",
     "function": {
+      "name": "calculate",
+      "description": "精确计算数学表达式（四则运算、括号、幂、三角函数、对数等）。需要算数时必须用它，绝对不要心算 —— 心算容易错。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string",
+            "description": "JavaScript 语法的数学表达式，例如 (1+2)*Math.pow(3,4)、Math.sqrt(144)、(98*76)/12"
+          }
+        },
+        "required": ["expression"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "http_request",
+      "description": "发送 HTTP 请求并返回响应文本（前 5000 字）。用于对接无需鉴权的公共 API（天气、汇率、公开数据接口等）。GET 时 body 留空；POST/PUT 时 body 为请求体（默认按 JSON 发送）。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "完整的请求 URL，含 https:// 或 http://"
+          },
+          "method": {
+            "type": "string",
+            "description": "HTTP 方法：GET / POST / PUT / DELETE / HEAD，默认 GET"
+          },
+          "body": {
+            "type": "string",
+            "description": "请求体（POST/PUT 时使用），例如 {\"city\":\"beijing\"}；GET 时留空"
+          }
+        },
+        "required": ["url"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "open_app",
+      "description": "通过包名拉起手机上的一个应用。用户说「帮我打开微信」「启动计算器」时使用。需要知道目标应用的包名；不确定时先问用户或用 run_shell 的 pm list packages 查。需要 Shizuku 授权。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "package_name": {
+            "type": "string",
+            "description": "应用包名，例如 com.tencent.mm（微信）、com.android.calculator2（计算器）"
+          }
+        },
+        "required": ["package_name"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "web_search",
       "description": "联网搜索网页，返回最相关的 3 条结果（标题 + 摘要 + 链接）。用于获取你的训练数据里没有的实时信息：今天的新闻、当前股价、最新版本号、政策变化、天气、某个人最近在做什么。凡是答案可能已经过时的问题，先搜再答。",
       "parameters": {
@@ -1724,6 +1786,8 @@ internal val ALL_TOOL_NAMES = listOf(
     "get_clipboard", "send_notification", "take_screenshot",
     // ★ v1.4 战役二：工作区全文检索（本地轻量 RAG）。
     "search_workspace",
+    // ★ v1.2.0 战役四：calculate / http_request / open_app。
+    "calculate", "http_request", "open_app",
     // ★ v1.1 新增。放在最后不是随便排的：前面都是「动手机上的东西」，
     //   只有它一个是要花钱联网的，单独排在末尾，设置页里一眼就能看出区别。
     "web_search",
@@ -1744,6 +1808,9 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "send_notification" to "发一条系统通知到通知栏",
     "take_screenshot" to "截屏保存到工作区并返回路径",
     "search_workspace" to "在工作区所有文本文件里搜关键字（全文检索）",
+    "calculate" to "精确计算数学表达式（沙箱引擎）",
+    "http_request" to "发 HTTP 请求对接公共 API",
+    "open_app" to "按包名拉起一个应用（Shizuku）",
     // ★ 说明里要写清「要花钱」，否则用户会以为和别的工具一样是免费的本地操作。
     //   官方单价：每 1000 次成功请求 5 元（失败和空结果不计费）。
     "web_search" to "联网搜索网页（走 DeepSeek 官方搜索接口，每次约 ¥0.005）",
