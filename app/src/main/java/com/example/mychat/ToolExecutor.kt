@@ -1569,6 +1569,23 @@ internal fun parseSearchResults(raw: String, query: String): ToolExecResult {
 internal fun executeTool(name: String, argsJson: String): ToolExecResult {
     Log.d(TOOL_LOG_TAG, "开始执行工具: name=$name, args=$argsJson")
 
+    // ★ v1.3 MCP 拦截分发：
+    //   模型回的调用有两种形态——带 mcp_ 前缀（与内置工具重名时），或原名（无冲突时）。
+    //   前缀形态直接剥前缀转外部；原名形态必须在本周期 MCP 工具集合里才转外部，
+    //   否则会把「模型幻觉出来的未知工具」也发给服务器。
+    //   本函数由 runAgentLoop 在 IO 协程里调用，mcpCallTool 的阻塞网络请求不会碰主线程。
+    if (name.startsWith("mcp_") || name in mcpActiveToolNames) {
+        val realName = if (name.startsWith("mcp_")) name.removePrefix("mcp_") else name
+        Log.d(TOOL_LOG_TAG, "MCP 分发: $name -> $realName")
+        return try {
+            mcpCallTool(realName, argsJson)
+        } catch (e: Exception) {
+            // mcpCallTool 内部已兜底，这里是最后一道保险
+            Log.e(TOOL_LOG_TAG, "MCP 工具执行异常: " + e.message, e)
+            ToolExecResult(false, "外部 MCP 工具调用失败：" + e.javaClass.simpleName + ": " + e.message)
+        }
+    }
+
     val result = try {
         when (name) {
             "read_file" -> {
@@ -1784,6 +1801,12 @@ private var mcpSessionId: String? = null
 
 /** App 设置页里的 MCP 地址（内存镜像，重启由 loadAppSettings 灌回） */
 internal var mcpServerUrl: String = ""
+
+/**
+ * 本请求周期可用的外部工具「原名」集合（runAgentLoop 探测成功后灌入）。
+ * 分发依据：模型调用的工具带 mcp_ 前缀，或原名在此集合里（无冲突时外部工具不加前缀）。
+ */
+internal var mcpActiveToolNames: Set<String> = emptySet()
 
 /** MCP 专用 OkHttp —— 超时和主链路分开，互不影响 */
 internal val mcpClient: OkHttpClient by lazy {

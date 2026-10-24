@@ -1924,7 +1924,12 @@ internal fun setToolEnabled(context: Context, name: String, enabled: Boolean) {
  *   TOOL_DEFINITIONS 是一整段静态 JSON，过滤的代价是解析一次（几十微秒），
  *   而工具开关随时可能在设置页里被改。每次现算最不容易出错。
  */
-internal fun buildToolsArray(): JSONArray {
+/**
+ * v1.3：external 传 MCP 外部工具（runAgentLoop 在 IO 上下文拉好再传进来）。
+ * ★ 这个函数保持纯同步、零网络 —— 它会被主线程的日志行调用；
+ *   MCP 的阻塞探测只发生在 runAgentLoop 的 IO 协程里。
+ */
+internal fun buildToolsArray(external: List<McpTool> = emptyList()): JSONArray {
     // ★ 预设优先于单个工具开关：
     //   极简模式下一个工具都不发（连 run_code 也不发），
     //   PTC 模式只发 run_code —— 那七个工具变成沙箱里的函数，不再出现在 tools 里。
@@ -1941,6 +1946,11 @@ internal fun buildToolsArray(): JSONArray {
         val item = all.optJSONObject(i) ?: continue
         val name = item.optJSONObject("function")?.optString("name").orEmpty()
         if (name.isNotEmpty() && name in enabled) out.put(item)
+    }
+    // ★ v1.3 MCP 外部工具合并：失败/为空静默退回内置工具，绝不阻塞对话
+    if (external.isNotEmpty()) {
+        val (merged, _) = mergeMcpTools(out, external)
+        return merged
     }
     return out
 }
@@ -2489,10 +2499,30 @@ fun runAgentLoop(
                 })
             }
 
+            // ★ v1.3 MCP 外部工具：在本 IO 协程里探测一次，整个请求周期复用。
+            //   铁律：连接失败/超时/为空一律静默退回内置工具，绝不阻塞对话。
+            //   同时把「本周期可用的外部工具名」灌进 executeTool 的分发集合。
+            var mcpTools: List<McpTool> = emptyList()
+            var mcpRenamed: Map<String, String> = emptyMap()
+            if (mcpServerUrl.isNotBlank()) {
+                val (fetched, err) = mcpListTools()
+                if (err == null && fetched.isNotEmpty()) {
+                    mcpTools = fetched
+                    mcpRenamed = mergeMcpTools(buildToolsArray(), fetched).second
+                    mcpActiveToolNames = fetched.map { it.name }.toSet()
+                    Log.d(TAG, "MCP 外部工具 ${fetched.size} 个: ${fetched.map { it.name }}")
+                } else {
+                    mcpActiveToolNames = emptySet()
+                    if (err != null) Log.w(TAG, "MCP 工具拉取失败，本轮退回内置工具: $err")
+                }
+            } else {
+                mcpActiveToolNames = emptySet()
+            }
+
             // ★ 只把用户开着的那几个工具发给模型（设置 → 插件 里的开关）。
             //   v1.2.0：真正放进请求体的数组改为【每轮现算】（见 bodyJson 处），
             //   以支持「模型不支持 tools」时降级重发；这里只保留初始日志。
-            Log.d(TAG, "本次启用工具 ${buildToolsArray().length()} 个: ${AppSettings.enabledTools}")
+            Log.d(TAG, "本次启用工具 ${buildToolsArray(mcpTools).length()} 个: ${AppSettings.enabledTools}")
             // 请求周期内的 tools 开关（true → 若模型报「不支持 tools」则翻 false 重试）
             var toolsEnabledForRequest = true
             var totalChars = 0
@@ -2514,7 +2544,7 @@ fun runAgentLoop(
                     // 工具全被关掉时不要发空数组 —— 有些实现会因此报 400
                     // v1.2.0：toolsEnabledForRequest 会被「模型不支持 tools」的
                     // 容错降级翻成 false，之后各轮都发纯对话请求
-                    val toolsArray = if (toolsEnabledForRequest) buildToolsArray() else JSONArray()
+                    val toolsArray = if (toolsEnabledForRequest) buildToolsArray(mcpTools) else JSONArray()
                     if (toolsArray.length() > 0) {
                         put("tools", toolsArray)
                     }
@@ -2529,7 +2559,7 @@ fun runAgentLoop(
                 // 【诊断】把完整请求体打出来 —— 亲眼看 tools 数组在不在
                 Log.d(
                     TAG,
-                    "发送请求 round=$round, tools=${if (toolsEnabledForRequest) buildToolsArray().length() else 0} 个, 请求体: $bodyJson"
+                    "发送请求 round=$round, tools=${if (toolsEnabledForRequest) buildToolsArray(mcpTools).length() else 0} 个, 请求体: $bodyJson"
                 )
 
                 val request = Request.Builder()
