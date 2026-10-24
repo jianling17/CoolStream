@@ -107,6 +107,9 @@
     <string name="thinking">正在思考…</string>
     <string name="error_title">出错了</string>
     <string name="menu_copy_all">复制全文</string>
+    <string name="menu_speak">朗读</string>
+    <string name="menu_speak_stop">停止朗读</string>
+    <string name="input_mic">语音输入</string>
     <string name="menu_copy_code">复制代码</string>
     <string name="menu_copy_code_multi">复制代码（%1$d 段）</string>
     <string name="tool_running">正在调用工具：%1$s</string>

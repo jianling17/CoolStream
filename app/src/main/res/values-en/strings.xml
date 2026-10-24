@@ -107,6 +107,9 @@
     <string name="thinking">Thinking…</string>
     <string name="error_title">Something went wrong</string>
     <string name="menu_copy_all">Copy all</string>
+    <string name="menu_speak">Speak</string>
+    <string name="menu_speak_stop">Stop speaking</string>
+    <string name="input_mic">Voice input</string>
     <string name="menu_copy_code">Copy code</string>
     <string name="menu_copy_code_multi">Copy code (%1$d blocks)</string>
     <string name="tool_running">Calling: %1$s</string>

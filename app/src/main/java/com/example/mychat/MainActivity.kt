@@ -199,6 +199,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.PathNode
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import java.util.UUID
@@ -254,6 +255,8 @@ import androidx.compose.ui.graphics.SolidColor
 import java.util.Calendar
 import javax.net.ssl.SSLException
 import java.util.Locale
+import android.speech.tts.TextToSpeech
+import android.speech.RecognizerIntent
 // 时间感知（把「现在是几点」告诉模型）要用。注意必须配 Locale.US，见 timeContextLine()
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -3895,6 +3898,31 @@ fun ChatScreen() {
                 val ctx = LocalContext.current
                 var attachments by remember { mutableStateOf<List<Attachment>>(emptyList()) }
                 var showAttachSheet by remember { mutableStateOf(false) }
+
+                // ★ v1.2.0 战役五：STT 语音输入。RecognizerIntent 弹系统语音对话框，结果回填输入框。
+                val sttLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.StartActivityForResult()
+                ) { result ->
+                    val spoken = result.data
+                        ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                        ?.firstOrNull()
+                    if (!spoken.isNullOrBlank()) {
+                        inputText = if (inputText.isBlank()) spoken else inputText + spoken
+                    }
+                }
+                val sttIntent = remember {
+                    Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                        putExtra(
+                            RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                            RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                        )
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.SIMPLIFIED_CHINESE)
+                        putExtra(
+                            RecognizerIntent.EXTRA_PROMPT,
+                            "请说出你想发送的内容"
+                        )
+                    }
+                }
                 // Office 解析不通过时弹出的提示文案（null = 不弹）
                 var officeTip by remember { mutableStateOf<String?>(null) }
 
@@ -4070,6 +4098,7 @@ fun ChatScreen() {
                     attachments = attachments,
                     onTextChange = { inputText = it },
                     onAttachClick = { showAttachSheet = true },
+                    onMicClick = { sttLauncher.launch(sttIntent) },
                     onRemoveAttachment = { index ->
                         attachments = attachments.filterIndexed { i, _ -> i != index }
                     },
@@ -6845,6 +6874,12 @@ fun MessageBubble(
                     CopyMenu(
                         fullText = shownContent,
                         codeBlocks = codeBlocks,
+                        showSpeak = !isUser && !isErr,
+                        isSpeaking = TtsPlayer.isSpeakingSafe,
+                        onSpeakToggle = {
+                            TtsPlayer.toggle(context, shownContent)
+                            menuOpen = false
+                        },
                         onCopy = { text ->
                             copyToClipboard(context, text)
                             menuOpen = false
@@ -6853,6 +6888,99 @@ fun MessageBubble(
                 }
             }
         }
+    }
+}
+
+// ==================== v1.2.0 战役五：原生 TTS 语音播报 ====================
+/** 内置麦克风图标（material-icons-core 没带 Mic，又不许加依赖，自绘一份 path data） */
+internal val MicIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "MicFilled",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        // 标准 material mic path
+        addPath(pathData = listOf(
+            PathNode.MoveTo(12f, 14f),
+            PathNode.CurveTo(13.1f, 14f, 14f, 13.1f, 14f, 12f),
+            PathNode.VerticalTo(6f),
+            PathNode.CurveTo(14f, 4.9f, 13.1f, 4f, 12f, 4f),
+            PathNode.CurveTo(12f, 4f, 10f, 4.9f, 10f, 6f),
+            PathNode.VerticalTo(12f),
+            PathNode.CurveTo(10f, 13.1f, 10.9f, 14f, 12f, 14f),
+            PathNode.MoveTo(17f, 12f),
+            PathNode.CurveTo(17f, 14.76f, 14.76f, 17f, 12f, 17f),
+            PathNode.CurveTo(12f, 17f, 7f, 14.76f, 7f, 12f),
+            PathNode.HorizontalTo(5f),
+            PathNode.CurveTo(5f, 15.87f, 7.72f, 18.69f, 11f, 18.97f),
+            PathNode.VerticalTo(22f),
+            PathNode.HorizontalTo(13f),
+            PathNode.VerticalTo(18.97f),
+            PathNode.CurveTo(16.28f, 18.69f, 19f, 15.87f, 19f, 12f),
+            PathNode.HorizontalTo(17f)
+        ), fill = SolidColor(Color.Black), fillAlpha = 1f, stroke = null)
+    }.build()
+}
+/**
+ * 应用级 TTS 播放器：整个 App 共享一个 TextToSpeech 实例（反复创建会泄漏）。
+ * init/deinit 由调用方（朗读菜单）惰性驱动；speak 前自动停止上一次播报。
+ */
+internal object TtsPlayer {
+    private var tts: TextToSpeech? = null
+    private var ready = false
+    private var pendingText: String? = null
+
+    /** 菜单文案用：是否正在播报（近似值，不加监听器） */
+    val isSpeakingSafe: Boolean
+        get() = try { tts?.isSpeaking == true } catch (_: Exception) { false }
+
+    fun speak(context: Context, text: String) {
+        val plain = text
+            .replace(Regex("```[\\s\\S]*?```"), "（代码块，已跳过朗读）")
+            .replace(Regex("[#*_>`|]"), "")
+            .trim()
+        if (plain.isEmpty()) return
+        if (tts == null) {
+            pendingText = plain
+            tts = TextToSpeech(context.applicationContext) { status ->
+                if (status == TextToSpeech.SUCCESS) {
+                    // 中文优先，失败用系统默认
+                    tts?.language = Locale.SIMPLIFIED_CHINESE
+                    ready = true
+                    pendingText?.let { doSpeak(it) }
+                    pendingText = null
+                }
+            }
+        } else if (ready) {
+            doSpeak(plain)
+        } else {
+            pendingText = plain
+        }
+    }
+
+    private fun doSpeak(text: String) {
+        tts?.apply {
+            stop()
+            speak(text, TextToSpeech.QUEUE_FLUSH, null, "coolstream-tts")
+        }
+    }
+
+    fun toggle(context: Context, text: String) {
+        if (tts != null && tts!!.isSpeaking) {
+            tts?.stop()
+        } else {
+            speak(context, text)
+        }
+    }
+
+    fun shutdown() {
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
+        ready = false
+        pendingText = null
     }
 }
 
@@ -6919,6 +7047,9 @@ private fun BlinkingCursor(color: Color, modifier: Modifier = Modifier) {
 private fun CopyMenu(
     fullText: String,
     codeBlocks: List<String>,
+    showSpeak: Boolean,
+    isSpeaking: Boolean,
+    onSpeakToggle: () -> Unit,
     onCopy: (String) -> Unit
 ) {
     Surface(
@@ -6930,6 +7061,16 @@ private fun CopyMenu(
     ) {
         Column(Modifier.padding(6.dp)) {
             GlassMenuItem(stringResource(R.string.menu_copy_all)) { onCopy(fullText) }
+
+            // ★ v1.2.0 战役五：AI 回复朗读（isUser=false 才显示）
+            if (showSpeak) {
+                GlassMenuItem(
+                    if (isSpeaking) stringResource(R.string.menu_speak_stop)
+                    else stringResource(R.string.menu_speak)
+                ) {
+                    onSpeakToggle()
+                }
+            }
 
             if (codeBlocks.isNotEmpty()) {
                 val label = if (codeBlocks.size > 1) {
@@ -8683,6 +8824,7 @@ fun InputBar(
     onTextChange: (String) -> Unit,
     onAttachClick: () -> Unit,
     onRemoveAttachment: (Int) -> Unit,
+    onMicClick: () -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier
@@ -8738,6 +8880,20 @@ fun InputBar(
                         contentDescription = stringResource(R.string.input_attach),
                         tint = if (enabled) cs.onSurfaceVariant else cs.outline,
                         modifier = Modifier.size(22.dp)
+                    )
+                }
+
+                // ★ v1.2.0 战役五：语音输入（STT）
+                IconButton(
+                    onClick = onMicClick,
+                    enabled = enabled,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Icon(
+                        imageVector = MicIcon,
+                        contentDescription = stringResource(R.string.input_mic),
+                        tint = if (enabled) cs.onSurfaceVariant else cs.outline,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
