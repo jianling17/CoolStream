@@ -2519,10 +2519,29 @@ fun runAgentLoop(
                 mcpActiveToolNames = emptySet()
             }
 
+            // ★ v1.3：MCP 外部工具说明拼进 system prompt（messages[0]）。
+            //   实测：只把工具塞进 tools 数组、prompt 不提，模型一个 tool_call 都不会发。
+            //   拼在 timeContextLine 之前，保持时间行仍在 system 消息末尾。
+            if (mcpTools.isNotEmpty()) {
+                val sys = messages.optJSONObject(0)
+                if (sys != null && sys.optString("role") == "system") {
+                    val mcpSection = mcpPromptSection(mcpTools)
+                    if (mcpSection.isNotEmpty()) {
+                        val old = sys.optString("content")
+                        val at = old.lastIndexOf(timeContextLine())
+                        sys.put(
+                            "content",
+                            if (at > 0) old.substring(0, at).trimEnd() + mcpSection + "\n\n" + old.substring(at)
+                            else old + mcpSection
+                        )
+                    }
+                }
+            }
+
             // ★ 只把用户开着的那几个工具发给模型（设置 → 插件 里的开关）。
             //   v1.2.0：真正放进请求体的数组改为【每轮现算】（见 bodyJson 处），
             //   以支持「模型不支持 tools」时降级重发；这里只保留初始日志。
-            Log.d(TAG, "本次启用工具 ${buildToolsArray(mcpTools).length()} 个: ${AppSettings.enabledTools}")
+            Log.d(TAG, "本次启用工具 ${buildToolsArray(mcpTools).length()} 个: ${AppSettings.enabledTools}" + if (mcpTools.isNotEmpty()) " + MCP: ${mcpTools.map { it.name }}" else "")
             // 请求周期内的 tools 开关（true → 若模型报「不支持 tools」则翻 false 重试）
             var toolsEnabledForRequest = true
             var totalChars = 0

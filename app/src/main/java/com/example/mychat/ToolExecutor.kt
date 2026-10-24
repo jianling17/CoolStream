@@ -1996,3 +1996,23 @@ internal fun mergeMcpTools(builtin: JSONArray, external: List<McpTool>): Pair<JS
     return out to renamed
 }
 
+/**
+ * v1.3：把 MCP 外部工具拼成 system prompt 追加段。
+ * 实测（同内置工具的教训）：tools 数组里带了工具，但 system prompt 不提一句，
+ * 模型就不知道自己能调它们 —— toolCalls 永远是 0。
+ * mcpTools 为空时返回空串（调用方按空串跳过追加）。
+ */
+internal fun mcpPromptSection(mcpTools: List<McpTool>): String {
+    if (mcpTools.isEmpty()) return ""
+    val lines = mcpTools.joinToString("\n") { t ->
+        "- " + t.name + "：" + t.description.ifBlank { "（外部 MCP 工具，无描述）" }
+    }
+    return buildString {
+        append("\n\n16. 以下是用户配置的 MCP 服务器提供的外部工具，本轮可以直接调用（调用方式与内置工具相同）：")
+        append("\n")
+        append(lines)
+        append("\n调用成功后基于返回结果回答；调用失败就把失败原因如实告诉用户。")
+        append("这些工具来自外部服务器，不要编造它们不存在的能力。")
+    }
+}
+
