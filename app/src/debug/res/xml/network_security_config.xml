@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- 仅 debug 构建生效：允许明文 HTTP（联机本机 MCP server / 代理 10.0.2.2 用）。release 不受影响。 -->
-<network-security-config>
-    <base-config cleartextTrafficPermitted="true" />
-</network-security-config>

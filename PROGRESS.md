@@ -582,3 +582,35 @@ compileDebugKotlin 0 error 0 warning；testDebugUnitTest **320 条 0 失败**；
 1. 真机装 release 包（按「装包约定」），人工走一遍：自定义假地址报错兜底、
    切回官方联网搜索回归；
 2. 有第三方 Key 时实测智谱 / Ollama 流式输出。
+
+### v1.3 轻量 MCP 客户端 ✅（commit 59991ea + a399594，端到端闭环联调通过）
+1. 协议层（ToolExecutor.kt，纯 OkHttp+JSONObject 手搓 JSON-RPC 2.0，零 SDK）：
+   mcpRpcCall / mcpInitialize / mcpListTools / mcpCallTool / mergeMcpTools / mcpPromptSection；
+   兼容 Streamable HTTP（JSON 直连）与 legacy SSE（data: 行解析）双形态。
+2. UI + 存储：PluginsTab 尾部 McpServerCard（地址输入 + 保存并测试连接），
+   KEY_MCP_SERVER_URL 普通 prefs 双写（内存镜像 + 落盘），重启自动回填。
+3. runAgentLoop 每请求周期探测一次 MCP 服务器；外部工具经 mergeMcpTools 合入
+   tools 数组（冲突加 mcp_ 前缀）；executeTool 入口按 mcp_ 前缀 / mcpActiveToolNames
+   拦截分发；连接失败静默退回内置工具，绝不阻塞对话。
+4. 动态 Prompt 注入（a399594）：MCP 工具非空时把工具名+描述拼进 system prompt
+   第 16 条（时间上下文行之前，保护 DeepSeek 前缀缓存）。实测：不注入时模型
+   toolCalls=0（仅凭 tools schema 不主动调用），注入后正常触发 tool_call。
+
+### v1.3 联调验证记录（mini-mcp-server.js @ 10.0.2.2:3001，echo_test + list_directory）
+- 设置页「测试连接」→ server 收到 initialize / notifications/initialized / tools/list 三连 ✓
+- 发消息触发：logcat "MCP 外部工具 2 个" → toolCalls=1 → 工具卡片落库 →
+  tool=echo_test ok=true → round 2 模型基于工具结果回复 ✓
+- 界面渲染「已执行：echo_test」+「返回：ECHO<- ... ->OK (mini-mcp)」✓
+- 320 条单测 0 失败；FLUSH_INTERVAL_MS=50L 未动 ✓
+- 联调基建（工作区，不入库）：mini-mcp-server.js（legacy SSE transport，/sse POST 归一化）、
+  mcp-selftest.py（宿主协议三连自测）、mcp-final-proof.png（界面证据截图）
+
+### 联调踩坑记录（后续真机联调必读）
+1. 软键盘 IME 触摸区陷阱：InputMethod 窗口即使视觉收起，触摸区仍覆盖屏幕下部，
+   adb input tap 会被吞成键盘字符。解法：操作前先 keyevent 4 收键盘，确认
+   dumpsys window mInputShown=false 再点按钮。
+2. Android cleartext 策略：debug 构建需 app/src/debug/AndroidManifest.xml +
+   network_security_config.xml（cleartextTrafficPermitted=true）才能连 http://10.0.2.2。
+   release 未开，保持安全默认。
+3. MCP 端点 URL：App 把 RPC POST 到用户填的原样 URL，自建测试 server 需在 /sse
+   同路径接受 POST（或使用支持 Streamable HTTP 的 server）。
