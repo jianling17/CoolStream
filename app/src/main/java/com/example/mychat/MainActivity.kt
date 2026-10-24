@@ -47,6 +47,13 @@ import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
@@ -3809,7 +3816,10 @@ fun ChatScreen() {
 
                             MessageBubble(
                                 message = message,
-                                markdown = !streamingTail
+                                markdown = !streamingTail,
+                                // ★ v1.2.0：流式光标只在「正在生成的最后一条」上画，
+                                //   定稿气泡永远不带光标。
+                                showCursor = streamingTail
                             )
                         }
                     }
@@ -6592,7 +6602,9 @@ fun MessageBubble(
     message: ChatMessage,
     modifier: Modifier = Modifier,
     // true = 走 Markdown 渲染；false = 纯文本（流式输出中的那一条）
-    markdown: Boolean = true
+    markdown: Boolean = true,
+    // ★ v1.2.0 流式光标：只在正在生成的最后一条 AI 气泡上为 true
+    showCursor: Boolean = false
 ) {
     // ★ 工具调用不走普通气泡，走专门的卡片
     if (message.type == MessageType.TOOL_CALL) {
@@ -6720,14 +6732,25 @@ fun MessageBubble(
                         }
                     )
                 } else {
-                    Text(
-                        text = if (placeholder) stringResource(R.string.thinking) else shownContent,
-                        color = textColor,
-                        // 等宽字体：极客风的关键
-                        fontFamily = FontFamily.Monospace,
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-                    )
+                    // ★ v1.2.0 流式打字机光标：正文 Text + 末尾一个呼吸闪烁的小方块。
+                    //   InfiniteTransition 只驱动光标自己的 alpha —— 每帧只重组这个
+                    //   8x18dp 的 Box，正文 Text 不参与，50ms 防抖管线零改动。
+                    Row {
+                        Text(
+                            text = if (placeholder) stringResource(R.string.thinking) else shownContent,
+                            color = textColor,
+                            // 等宽字体：极客风的关键
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                        )
+                        if (showCursor) {
+                            BlinkingCursor(
+                                color = textColor,
+                                modifier = Modifier.padding(top = 10.dp, end = 14.dp)
+                            )
+                        }
+                    }
                 }
                 // ★ 长文阅读器入口：正文里出现本地文本文件路径就给一张可点卡片。
                 //   用 remember(message.content) 缓存解析结果 —— 流式输出时 content 每帧都变，
@@ -6801,6 +6824,30 @@ private fun copyToClipboard(context: Context, text: String) {
  * 只放「复制」这一类动作：复制不改变任何状态，做错了也没有代价，
  * 所以不需要二次确认，弹出来点了就走。
  */
+/**
+ * ★ v1.2.0 流式打字机光标：8x18dp 竖条，alpha 0.15↔1.0 呼吸闪烁。
+ * rememberInfiniteTransition 局部重绘 —— 只有这个 Box 每帧重组，
+ * 气泡正文和 50ms 流式批处理完全不受影响。
+ */
+@Composable
+private fun BlinkingCursor(color: Color, modifier: Modifier = Modifier) {
+    val alpha by rememberInfiniteTransition(label = "streamCursor").animateFloat(
+        initialValue = 1f,
+        targetValue = 0.15f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 500, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "streamCursorAlpha"
+    )
+    Box(
+        modifier = modifier
+            .size(width = 8.dp, height = 18.dp)
+            .graphicsLayer { this.alpha = alpha }
+            .background(color, RoundedCornerShape(2.dp))
+    )
+}
+
 @Composable
 private fun CopyMenu(
     fullText: String,
@@ -7135,7 +7182,9 @@ private fun CodeBlock(code: String, onLongPress: (() -> Unit)? = null) {
         modifier = Modifier.fillMaxWidth()
     ) {
         Text(
-            text = code,
+            // ★ v1.2.0 轻量语法高亮：正则 + AnnotatedString，零第三方依赖。
+            //   remember(code) 缓存 —— 代码块只在定稿后渲染一次，重复重组不重复扫描。
+            text = remember(code) { highlightCode(code) },
             color = CodeBlockText,
             // ★ 强制等宽，不受主题 Typography 影响
             fontFamily = FontFamily.Monospace,
@@ -7157,6 +7206,75 @@ private fun CodeBlock(code: String, onLongPress: (() -> Unit)? = null) {
 }
 
 
+// ============================================================
+// ★ v1.2.0 轻量代码高亮：正则 + AnnotatedString，零依赖。
+//   覆盖 Kotlin / Java / Python 三种最常见语言的基础着色：
+//   注释（灰）→ 字符串（绿）→ 关键字（蓝紫）。区间互斥不叠染。
+// ============================================================
+
+private val HL_COMMENT_RE =
+    Regex("//[^\\n]*|/\\*[\\s\\S]*?\\*/")
+private val HL_STRING_RE = Regex("\"(?:[^\"\\n\\\\]|\\\\.)*\"|'(?:[^'\\n\\\\]|\\\\.)*'")
+private val HL_KEYWORDS = setOf(
+    "fun", "val", "var", "if", "else", "when", "for", "while", "return", "class",
+    "object", "interface", "import", "package", "try", "catch", "finally", "throw",
+    "is", "in", "as", "null", "true", "false", "this", "super", "private", "public",
+    "internal", "protected", "override", "open", "data", "sealed", "enum", "companion",
+    "const", "lateinit", "suspend", "break", "continue", "do", "new", "extends",
+    "implements", "static", "final", "void", "abstract", "switch", "case", "default",
+    // Python
+    "def", "lambda", "elif", "pass", "with", "yield", "global", "nonlocal",
+    "assert", "raise", "from", "and", "or", "not", "None", "self", "async", "await"
+)
+
+private val HL_KEYWORD_COLOR = Color(0xFF7C9EFF)   // 蓝紫
+private val HL_STRING_COLOR = Color(0xFF7EC97E)    // 绿
+private val HL_COMMENT_COLOR = Color(0xFF8B949E)   // 灰
+
+/** 逐段扫描：每个位置取最早命中的规则染色，规则区间互斥不会叠染 */
+internal fun highlightCode(code: String): AnnotatedString = buildAnnotatedString {
+    var i = 0
+    while (i < code.length) {
+        val rest = code.substring(i)
+        val comment = HL_COMMENT_RE.find(rest)
+        val str = HL_STRING_RE.find(rest)
+        val next = listOfNotNull(
+            comment?.let { "C" to it },
+            str?.let { "S" to it }
+        ).minByOrNull { it.second.range.first }
+
+        when {
+            next != null && next.first == "C" -> {
+                val m = next.second
+                if (m.range.first > 0) append(rest.substring(0, m.range.first))
+                withStyle(SpanStyle(color = HL_COMMENT_COLOR)) { append(m.value) }
+                i += m.range.last + 1
+            }
+            next != null && next.first == "S" -> {
+                val m = next.second
+                if (m.range.first > 0) append(rest.substring(0, m.range.first))
+                withStyle(SpanStyle(color = HL_STRING_COLOR)) { append(m.value) }
+                i += m.range.last + 1
+            }
+            else -> {
+                // 关键字匹配：标识符级 token，命中词表才染色
+                val m = Regex("[A-Za-z_][A-Za-z0-9_]*").find(rest)
+                if (m == null) {
+                    append(rest)
+                    i = code.length
+                } else {
+                    if (m.range.first > 0) append(rest.substring(0, m.range.first))
+                    if (m.value in HL_KEYWORDS) {
+                        withStyle(SpanStyle(color = HL_KEYWORD_COLOR)) { append(m.value) }
+                    } else {
+                        append(m.value)
+                    }
+                    i += m.range.last + 1
+                }
+            }
+        }
+    }
+}
 /**
  * Markdown 表格：极简网格 —— 深色半透明底 + 细白边，风格跟代码块保持一致。
  *
