@@ -327,7 +327,15 @@ val SYSTEM_PROMPT = """
 - 遇到包含 3 个或以上步骤的复杂任务时，你必须先调用 todo 工具列出计划清单，
   然后再开始执行。每完成一步，更新 todo 状态。
 - 只有一步就能干完的简单任务不要用 todo —— 那只是噪音，不是计划。
-- 更新状态时把整份清单重新发一遍（工具是全量覆盖，不是增量追加）。
+- ★ 更新状态时必须重发【完整清单】：每一次调用 todo（不管是首次创建还是后面更新进度），
+  tasks 数组都要包含全部步骤和它们的最新状态。只发一句话、或只发变化的那几步，都算失败 ——
+  客户端只保留同一轮对话里最后一张 todo 卡片并原地刷新，发一半会让整张卡片少掉步骤。
+- 用户说「把前两步标记完成」时，你要做的不是回一句「已更新」，而是立刻再调用一次 todo，
+  把五步连同新的状态（前两步 completed、第三步 in_progress、其余 pending）整份发出来。
+- ★ 死命令：需要制定计划、列出任务、汇报进度时，严禁用 Markdown 表格、有序列表、
+  无序列表直接输出计划。必须且只能调用 todo 工具，客户端会把它渲染成带勾选状态的原生卡片。
+  用 Markdown 画计划 = 任务没完成，会被打回重做。
+- 调完 todo 之后不要在正文里再复述一遍清单，卡片已经展示给用户了，正文只写一句结论。
 
 严格遵守以下规则：
 1. 用户要求查看、读取、打开某个文件时，必须先调用 read_file，
@@ -395,8 +403,25 @@ private const val REALTIME_SEARCH_RULE =
  * 先把清单写下来（todo），再按清单执行，是唯一稳定的做法。
  */
 internal const val TODO_RULE =
-    "遇到包含 3 个或以上步骤的复杂任务时，你必须先调用 todo 工具列出计划清单，" +
-        "然后再开始执行。每完成一步，更新 todo 状态。"
+    "当你需要制定计划、列出任务、或汇报进度时，严禁使用 Markdown 表格或列表直接输出，" +
+        "必须且只能调用 todo 工具，由客户端渲染专属 UI。" +
+        "遇到包含 3 个或以上步骤的复杂任务时，你必须先调用 todo 工具列出计划清单，" +
+        "然后再开始执行。每完成一步，更新 todo 状态。" +
+        "★ 每次调用 todo 都必须重发完整清单（全部步骤 + 最新状态），工具是全量覆盖：" +
+        "只发变化的那几步，会让卡片里的其余步骤整批丢失。"
+
+/**
+ * 收尾死命令：放在系统提示词的最后一条。
+ *
+ * 为什么单列：规则写在中间时，模型读到后面几百行工具说明就忘了；
+ * 放在最后一条，是距离「开始生成」最近的位置，实测遵从率明显更高。
+ * 同时把「纯文本罗列计划」明确写成失败，堵掉 Markdown 表格这条退路。
+ */
+internal const val FORCE_TODO_REMINDER =
+    "需要给出计划、任务清单或进度时，唯一允许的方式是调用 todo 工具。" +
+        "严禁用 Markdown 表格、有序列表、无序列表，或用「第 1 步」这类纯文本罗列计划 —— " +
+        "客户端会把 todo 渲染成原生卡片，纯文本罗列等于这个任务没有完成。" +
+        "★ 进度发生变化时，必须再调用一次 todo 并重发【完整清单】，不能只在正文里说「已更新」。"
 
 /**
  * 实际发给模型的系统提示词 = 预设基础提示词 + 当前运行时的约束。
@@ -426,6 +451,7 @@ private fun systemPromptWithWorkspace(): String {
             append("\n3. ").append(LONG_TEXT_OUTPUT_RULE)
             append("\n4. ").append(REALTIME_SEARCH_RULE)
             append("\n5. ").append(TODO_RULE)
+            append("\n6. ").append(FORCE_TODO_REMINDER)
         }
 
         // ---------- 标准：原样保留，一个字符都不改 ----------
@@ -451,6 +477,7 @@ private fun systemPromptWithWorkspace(): String {
                 append("\n14. ").append(LONG_TEXT_OUTPUT_RULE)
                 append("\n15. ").append(REALTIME_SEARCH_RULE)
                 append("\n16. ").append(TODO_RULE)
+                append("\n17. ").append(FORCE_TODO_REMINDER)
             }
         }
     }
@@ -1590,7 +1617,7 @@ private const val TOOL_DEFINITIONS = """
     "type": "function",
     "function": {
       "name": "todo",
-      "description": "列出或更新任务计划清单。遇到 3 个及以上步骤的复杂任务时，必须先调用它列出计划再动手。tasks 是全量覆盖：每次调用都要把整份清单发一遍，已完成的步骤标记为 completed。",
+      "description": "列出或更新任务计划清单。★ 只要回答里要出现计划、任务清单或进度，就必须调用本工具，严禁改用 Markdown 表格、列表或「第 1 步」这类纯文本罗列。遇到 3 个及以上步骤的复杂任务时，必须先调用它列出计划再动手。★ tasks 是全量覆盖：每次调用（包括更新进度）都必须把整份清单连同最新状态完整发一遍，绝不能只发变化的那几步，更不能只在正文里回一句「已更新」——客户端只保留最后一张卡片并原地刷新，发一半会让卡片少掉步骤。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1949,7 +1976,7 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "web_search" to "联网搜索网页（走 内置默认服务搜索接口，每次约 ¥0.005）",
     "sqlite_query" to "查询工作区 SQLite 数据库（只读，仅支持 SELECT）",
     "regex_extract" to "用正则表达式从文本中提取匹配内容",
-    "todo" to "列出/更新任务计划清单（复杂任务先做计划）",
+    "todo" to "列出/更新任务计划清单。要输出计划/任务清单/进度时必须用它，禁止用 Markdown 表格或列表罗列。每次调用都要重发完整清单（全量覆盖），只发变化的部分会让卡片丢步骤",
     "semantic_search" to "按语义搜索工作区文件（TF-IDF 相似度，按意思搜而非关键字）",
     "ask_user" to "向用户提出问题并等待回答（不花钱，会暂停对话）"
 )
@@ -4018,6 +4045,16 @@ fun ChatScreen() {
                         }
                     }
 
+                    // ★ v1.4.0：todo 卡片原地合并 —— 只渲染最后一张，
+                    //   否则每更新一次进度就在聊天记录里多堆一张历史卡片。
+                    //   过滤结果按 currentMessages 缓存；判断只做字符串前缀比较，
+                    //   不解析 JSON，流式期间 50ms 一次也不会拖慢主线程。
+                    //   注意：必须在 LazyColumn 外面算 —— 里面的 LazyListScope
+                    //   不是 Composable 作用域，调不了 remember。
+                    val visibleMessages = remember(currentMessages) {
+                        mergeTodoCards(currentMessages)
+                    }
+
                     LazyColumn(
                         state = listState,
                         modifier = Modifier
@@ -4026,7 +4063,7 @@ fun ChatScreen() {
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        itemsIndexed(currentMessages) { index, message ->
+                        itemsIndexed(visibleMessages) { index, message ->
                             // ★★★ 渲染时机（防发热的核心）★★★
                             //
                             //   「正在流式输出的最后一条 AI 消息」→ 纯文本
@@ -4038,7 +4075,7 @@ fun ChatScreen() {
                             //   它才第一次被解析——只解析一次。
                             val streamingTail =
                                 isStreaming &&
-                                    index == currentMessages.lastIndex &&
+                                    index == visibleMessages.lastIndex &&
                                     !message.isUser
 
                             MessageBubble(
@@ -7156,6 +7193,19 @@ fun MessageBubble(
                 //   正文里那一万字不显示（displayContent 已整段剥掉），
                 //   所以这张卡片是「模型到底看到了什么」的唯一可见线索。
                 val docCards = remember(message.content) { docCardsOf(message.content) }
+                // ★ v1.4.0 兜底：模型偶尔不听劝，把计划写成 Markdown 表格或「第 1 步 · xxx」
+                //   纯文本，todo 工具根本没被调用，卡片就不会出现。这里把那段文字反解成
+                //   TodoPlan，用同一张 TodoCard 渲染，并把计划段从正文里剥掉，避免重复两遍。
+                //   解析结果按 shownContent 缓存，流式期间每 50ms 才变一次，正则开销可忽略。
+                val planFallback = remember(shownContent) {
+                    if (isUser || isErr || shownContent.isBlank()) null
+                    else extractPlanFromText(shownContent)
+                }
+                val bodyText = if (planFallback != null && planFallback.remaining.isNotBlank()) {
+                    planFallback.remaining
+                } else {
+                    shownContent
+                }
                 Column {
                     docCards.forEach { card ->
                         DocCardRow(
@@ -7164,6 +7214,12 @@ fun MessageBubble(
                             modifier = Modifier.padding(
                                 start = 14.dp, end = 14.dp, top = 10.dp
                             )
+                        )
+                    }                    // 兜底解析出的计划也走同一张卡片
+                    if (planFallback != null) {
+                        TodoCardBody(
+                            plan = planFallback.plan,
+                            modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 10.dp)
                         )
                     }
                     if (isErr) {
@@ -7197,7 +7253,7 @@ fun MessageBubble(
                     }
                 } else if (useMarkdown) {
                     MarkdownText(
-                        content = shownContent,
+                        content = bodyText,
                         textColor = textColor,
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                         onCodeLongPress = {
@@ -7211,7 +7267,7 @@ fun MessageBubble(
                     //   8x18dp 的 Box，正文 Text 不参与，50ms 防抖管线零改动。
                     Row {
                         Text(
-                            text = if (placeholder) stringResource(R.string.thinking) else shownContent,
+                            text = if (placeholder) stringResource(R.string.thinking) else bodyText,
                             color = textColor,
                             // 等宽字体：极客风的关键
                             fontFamily = FontFamily.Monospace,
@@ -8086,6 +8142,36 @@ private fun parseToolCall(content: String): ToolCallView {
     }
 }
 
+/**
+ * 便宜的工具消息预筛：工具卡片的 content 是我们自己拼的 JSON，
+ * tool 字段用 JSONObject 写入，顺序稳定地排在最前面。
+ * 这里只做前缀比较，绝不为了判断类型去 JSONObject(content) —— 工具结果动辄几十 KB，
+ * 流式期间每 50ms 解析一遍会把主线程拖垮。
+ */
+internal fun isTodoToolPayload(content: String): Boolean =
+    content.startsWith("{\"tool\":\"todo\"")
+
+/**
+ * ★ v1.4.0 原地合并：todo 卡片只留最后一张。
+ *
+ * 模型每更新一次进度就会再调一次 todo，而每调用一次就追加一条 TOOL_CALL 消息。
+ * 全留着的话，用户会看到一长串 0/5、1/5、2/5 的历史卡片在聊天记录里堆着。
+ * 这里把「最后一张 todo 卡片之前的所有 todo 卡片」从渲染列表里摘掉，
+ * 进度条就在同一个位置从 0/5 顺畅走到 2/5。
+ *
+ * 只改渲染，不动数据库：历史卡片仍然在库里，将来想做「计划演进历史」还能翻出来。
+ */
+internal fun mergeTodoCards(messages: List<ChatMessage>): List<ChatMessage> {
+    var lastTodo = -1
+    for (i in messages.indices) {
+        val m = messages[i]
+        if (m.type == MessageType.TOOL_CALL && isTodoToolPayload(m.content)) lastTodo = i
+    }
+    if (lastTodo <= 0) return messages
+    return messages.filterIndexed { i, m ->
+        !(i < lastTodo && m.type == MessageType.TOOL_CALL && isTodoToolPayload(m.content))
+    }
+}
 /** 展开时最多显示多少字符的结果（完整内容已经发给模型了，这里只是别再压垮界面） */
 private const val MAX_TOOL_OUTPUT_PREVIEW = 4000
 
@@ -8295,8 +8381,23 @@ private val TodoDoingColor = Color(0xFFD29922)
 
 @Composable
 private fun TodoCard(view: ToolCallView, modifier: Modifier = Modifier) {
-    val cs = MaterialTheme.colorScheme
     val plan = remember(view.argsText) { parseTodoArgs(view.argsText) }
+    TodoCardBody(plan = plan, output = view.output, ok = view.ok, modifier = modifier)
+}
+
+/**
+ * 同一张卡片的第二个入口：计划不是来自工具调用，而是从 AI 正文里兜底解析出来的。
+ * 两处共用一套视觉，避免「工具调用有卡片、纯文本只有一坨字」的割裂感。
+ */
+@Composable
+private fun TodoCardBody(
+    plan: TodoPlan,
+    // output / ok 只对「工具调用」入口有意义：兜底入口没有工具返回值，传空与 null。
+    output: String = "",
+    ok: Boolean? = null,
+    modifier: Modifier = Modifier
+) {
+    val cs = MaterialTheme.colorScheme
     val done = plan.completedCount
     val total = plan.totalCount
     val allDone = total > 0 && done == total
@@ -8347,7 +8448,7 @@ private fun TodoCard(view: ToolCallView, modifier: Modifier = Modifier) {
             if (plan.tasks.isEmpty()) {
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = view.output.ifEmpty { "\uFF08\u6E05\u5355\u4E3A\u7A7A\uFF09" },
+                    text = output.ifEmpty { "\uFF08\u6E05\u5355\u4E3A\u7A7A\uFF09" },
                     style = MaterialTheme.typography.labelSmall,
                     color = cs.onSurfaceVariant,
                     maxLines = 3,
@@ -8361,10 +8462,10 @@ private fun TodoCard(view: ToolCallView, modifier: Modifier = Modifier) {
             }
 
             // ---------- 失败时补一句原因（成功不显示，保持干净） ----------
-            if (view.ok == false && view.output.isNotEmpty()) {
+            if (ok == false && output.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = view.output,
+                    text = output,
                     style = MaterialTheme.typography.labelSmall,
                     color = cs.error,
                     maxLines = 3,

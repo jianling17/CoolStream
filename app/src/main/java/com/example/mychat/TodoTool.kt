@@ -58,9 +58,18 @@ internal fun parseTodoArgs(argsJson: String): TodoPlan {
         if (arr != null) {
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                val content = o.optString("content", "").trim()
+                val raw = o.optString("content", "").trim()
+                if (raw.isEmpty()) continue
+                // ★ v1.4.0：模型常把状态标记直接写进正文（「✅ 确定目的地」），
+                //   卡片上就会同时出现图标和 emoji，看起来像重复了两遍。
+                //   这里把正文里的标记剥掉，只用图标表达状态；标记本身则当作
+                //   状态线索 —— 模型漏写 status 时全靠它。
+                val content = planCleanContent(raw)
                 if (content.isEmpty()) continue
-                tasks.add(TodoItem(content, TodoStatus.of(o.optString("status", "pending"))))
+                val declared = TodoStatus.of(o.optString("status", "pending"))
+                val fromMark = planStatusOf(raw)
+                val status = if (declared == TodoStatus.PENDING) fromMark else declared
+                tasks.add(TodoItem(content, status))
             }
         }
     } catch (t: Throwable) {
@@ -80,7 +89,7 @@ internal fun renderTodoChecklist(p: TodoPlan): String {
     if (p.plan.isNotEmpty()) sb.append("计划：").append(p.plan).append((10).toChar())
     for (t in p.tasks) {
         val mark = when (t.status) {
-            TodoStatus.COMPLETED -> "☑"
+            TodoStatus.COMPLETED -> "✅"
             TodoStatus.IN_PROGRESS -> "⏳"
             TodoStatus.PENDING -> "☐"
         }
@@ -105,4 +114,147 @@ internal fun todoTool(argsJson: String): ToolExecResult {
         )
     }
     return ToolExecResult(true, renderTodoChecklist(p))
+}
+
+// ============================================================
+// v1.4.0 兜底：把 AI 正文里的计划反解成 TodoPlan
+//
+// 为什么需要：模型偶尔不听劝，把计划写成 Markdown 表格或「第 1 步 · xxx」纯文本。
+// 这时 todo 工具根本没被调用，卡片不会出现，用户看到的只是一坨文字。
+// 这里把那段文字反解成 TodoPlan，交给同一张 TodoCard 渲染，观感统一。
+// ============================================================
+
+/** 兜底解析的结果：计划本身 + 剥掉计划段之后剩下的正文 */
+internal data class PlanExtraction(val plan: TodoPlan, val remaining: String)
+
+private val PLAN_TABLE_ROW = Regex("""^\s*\|.*\|\s*$""")
+private val PLAN_TABLE_SEP = Regex("""^:?-{2,}:?$""")
+private val PLAN_ITEM_LINE = Regex(
+    """^\s*(?:\d{1,2}[.、)．]|第\s*\d{1,2}\s*步\s*[·:：.、\-]?)\s*\S"""
+)
+private val PLAN_ITEM_LEAD = Regex(
+    """^\s*(?:\d{1,2}[.、)．]|第\s*\d{1,2}\s*步\s*[·:：.、\-]?)\s*"""
+)
+private const val PLAN_MIN_TASKS = 3
+
+/** 计划条目上可能出现的状态标记，既是状态线索，也要从正文里剥掉 */
+private val PLAN_STATUS_MARKS = listOf("✅", "☑", "✔", "✓", "☐", "⬜", "🔄", "⏳", "🚧")
+
+private fun planStatusOf(text: String): TodoStatus {
+    // 用 contains 而不是 startsWith：Markdown 表格里状态标记常常落在单独一列，
+    // 拼接后的整行并不以标记开头。
+    val t = text.trim()
+    val done = t.contains("✅") || t.contains("☑") || t.contains("✔") ||
+        t.contains("✓") || t.contains("已完成")
+    val doing = t.contains("🔄") || t.contains("⏳") || t.contains("🚧") || t.contains("进行中")
+    return when {
+        done -> TodoStatus.COMPLETED
+        doing -> TodoStatus.IN_PROGRESS
+        else -> TodoStatus.PENDING
+    }
+}
+
+private fun planCleanContent(raw: String): String {
+    var s = PLAN_ITEM_LEAD.replace(raw, "").trim()
+    for (m in PLAN_STATUS_MARKS) {
+        if (s.startsWith(m)) s = s.removePrefix(m).trim()
+    }
+    return s.trim()
+}
+
+/** 计划段上方最近的一行非空文字当作标题；剥掉 Markdown 记号与状态标记 */
+private fun planTitleBefore(lines: List<String>, index: Int): String {
+    for (k in index - 1 downTo 0) {
+        val t = lines[k].trim()
+        if (t.isEmpty()) continue
+        var s = t.trimStart('#', '*', '-', '>', ' ', '\t').trim()
+        for (m in PLAN_STATUS_MARKS) s = s.removePrefix(m).trim()
+        s = s.trimEnd('：', ':', '。', '.', ' ')
+        if (s.isEmpty()) continue
+        return if (s.length > 40) s.substring(0, 40) else s
+    }
+    return ""
+}
+
+private fun planRemaining(lines: List<String>, block: List<Int>): String {
+    val drop = block.toHashSet()
+    val kept = lines.filterIndexed { idx, _ -> idx !in drop }
+    return kept.joinToString("\n").replace(Regex("""\n{3,}"""), "\n\n").trim()
+}
+
+private fun planTableCells(line: String): List<String> =
+    line.trim().trim('|').split('|').map { it.trim() }
+
+/**
+ * 从一段 AI 正文里找出「计划段」并反解成 TodoPlan。
+ *
+ * 认两种形态：
+ *   ① Markdown 表格（表头 + 分隔行 + 至少 3 行数据）；
+ *   ② 编号列表 /「第 N 步 · xxx」连续至少 3 条。
+ * 认不出、或者条目不够 3 条就返回 null —— 宁可不动，也不要把普通正文错认成计划。
+ */
+internal fun extractPlanFromText(raw: String): PlanExtraction? {
+    if (raw.isBlank()) return null
+    val lines = raw.split("\n")
+
+    // ---------- ① Markdown 表格 ----------
+    var i = 0
+    while (i < lines.size) {
+        if (!PLAN_TABLE_ROW.matches(lines[i])) { i++; continue }
+        var j = i
+        while (j < lines.size && PLAN_TABLE_ROW.matches(lines[j])) j++
+        val block = (i until j).toList()
+        if (block.size >= PLAN_MIN_TASKS + 2) {
+            val rows = block.map { planTableCells(lines[it]) }
+            val tasks = rows.drop(2).mapNotNull { cells ->
+                val content = cells.firstOrNull {
+                    it.isNotBlank() && it.toIntOrNull() == null &&
+                        !PLAN_TABLE_SEP.matches(it) && it !in PLAN_STATUS_MARKS
+                } ?: return@mapNotNull null
+                TodoItem(content = content, status = planStatusOf(cells.joinToString(" ")))
+            }
+            if (tasks.size >= PLAN_MIN_TASKS) {
+                return PlanExtraction(
+                    plan = TodoPlan(plan = planTitleBefore(lines, i), tasks = tasks),
+                    remaining = planRemaining(lines, block)
+                )
+            }
+        }
+        i = j
+    }
+
+    // ---------- ② 编号列表 / 第 N 步 ----------
+    i = 0
+    while (i < lines.size) {
+        if (!PLAN_ITEM_LINE.containsMatchIn(lines[i])) { i++; continue }
+        var j = i
+        val block = mutableListOf<Int>()
+        val tasks = mutableListOf<TodoItem>()
+        while (j < lines.size) {
+            val line = lines[j]
+            if (PLAN_ITEM_LINE.containsMatchIn(line)) {
+                block.add(j)
+                tasks.add(TodoItem(content = planCleanContent(line), status = planStatusOf(line)))
+                j++
+            } else if (line.isNotBlank() && j + 1 < lines.size &&
+                PLAN_ITEM_LINE.containsMatchIn(lines[j + 1]) && tasks.isNotEmpty()
+            ) {
+                // 紧跟在条目下面的说明行并进上一条，别让它变成散落正文
+                block.add(j)
+                val last = tasks.removeAt(tasks.size - 1)
+                tasks.add(last.copy(content = (last.content + " " + line.trim()).trim()))
+                j++
+            } else {
+                break
+            }
+        }
+        if (tasks.size >= PLAN_MIN_TASKS) {
+            return PlanExtraction(
+                plan = TodoPlan(plan = planTitleBefore(lines, i), tasks = tasks.toList()),
+                remaining = planRemaining(lines, block)
+            )
+        }
+        i = if (j > i) j else i + 1
+    }
+    return null
 }
