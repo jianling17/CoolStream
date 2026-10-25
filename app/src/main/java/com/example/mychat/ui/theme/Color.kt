@@ -44,6 +44,10 @@ val CodeBlockBackground = Color(0xFF161B22)   // 深灰底
 val CodeBlockBorder     = Color(0xFF30363D)   // 描边
 val CodeBlockText       = Color(0xFFC9D1D9)   // 代码文字
 
+// ★ v1.4.0 战役二：公式强调色。浅紫蓝，在 #161B22 深底上对比度够，
+//   又不像纯红那样看着像报错。
+val FormulaAccent       = Color(0xFFA78BFA)
+
 // ---------------- 毛玻璃（Glassmorphism）----------------
 // 不用 Modifier.blur()（性能极差），而是「半透明底 + 高光边框」的拟态做法。
 // 深色 / 亮色各一套：亮色主题下用深色玻璃会让文字完全看不见。

@@ -201,6 +201,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.graphics.vector.PathNode
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -222,6 +223,7 @@ import com.example.mychat.ui.theme.CodeInlineBackground
 import com.example.mychat.ui.theme.CodeBlockBackground
 import com.example.mychat.ui.theme.CodeBlockBorder
 import com.example.mychat.ui.theme.CodeBlockText
+import com.example.mychat.ui.theme.FormulaAccent
 import com.example.mychat.ui.theme.GlassDrawerDark
 import com.example.mychat.ui.theme.GlassDrawerLight
 import com.example.mychat.ui.theme.GlassEdgeDark
@@ -7255,6 +7257,7 @@ fun MessageBubble(
                     MarkdownText(
                         content = bodyText,
                         textColor = textColor,
+                        streaming = showCursor,
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                         onCodeLongPress = {
                             Log.d(TAG, "长按代码块，抽到 ${codeBlocks.size} 段")
@@ -7553,6 +7556,8 @@ internal sealed interface MdBlock {
     data class Paragraph(val text: String) : MdBlock
     data class Code(val code: String) : MdBlock
     data class Table(val header: List<String>, val rows: List<List<String>>) : MdBlock
+    /** ★ v1.4.0 战役二：$$ ... $$ 包裹的块级公式 */
+    data class Formula(val text: String) : MdBlock
 }
 
 /**
@@ -7611,7 +7616,9 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
     val lines = src.replace("\r\n", "\n").split('\n')
     val para = StringBuilder()
     val code = StringBuilder()
+    val formula = StringBuilder()
     var inCode = false
+    var inFormula = false
 
     fun flushParagraph() {
         if (para.isNotEmpty()) {
@@ -7641,6 +7648,38 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
         }
         if (inCode) {
             code.append(line).append('\n')
+            continue
+        }
+
+        // ---------- 块级公式 $$ ... $$ ----------
+        // 只认行首的 $$：正文里散落的单个美元符号（价格 $5）不参与判定，
+        // 否则「$5 到 $10」会被当成一段公式吃掉。
+        val formulaLine = noTrail.trim()
+        if (inFormula) {
+            val endAt = formulaLine.indexOf("$$")
+            if (endAt >= 0) {
+                formula.append(formulaLine.substring(0, endAt))
+                out.add(MdBlock.Formula(formula.toString().trim()))
+                formula.setLength(0)
+                inFormula = false
+            } else {
+                formula.append(formulaLine).append('\n')
+            }
+            continue
+        }
+        if (formulaLine.startsWith("$$")) {
+            flushParagraph()
+            val body = formulaLine.removePrefix("$$")
+            if (body.endsWith("$$")) {
+                // 单行写法：$$E = mc^2$$
+                val one = body.dropLast(2).trim()
+                if (one.isNotEmpty()) out.add(MdBlock.Formula(one))
+            } else {
+                // 多行写法：$$ 后面还有内容（或什么都没有），继续往下吃到收尾的 $$
+                formula.setLength(0)
+                if (body.isNotBlank()) formula.append(body).append('\n')
+                inFormula = true
+            }
             continue
         }
 
@@ -7692,6 +7731,10 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
     // 流被截断时可能停在代码块中间，也要把它显示出来
     if (inCode && code.isNotEmpty()) {
         out.add(MdBlock.Code(code.toString().trimEnd('\n')))
+    }
+    // 流被截断时可能停在公式中间，已收到的部分也要显示
+    if (inFormula && formula.isNotBlank()) {
+        out.add(MdBlock.Formula(formula.toString().trim()))
     }
     flushParagraph()
     return out
@@ -7772,6 +7815,8 @@ private fun MarkdownText(
     content: String,
     textColor: Color,
     modifier: Modifier = Modifier,
+    // ★ v1.4.0 战役二：流式期间不挂代码块的复制按钮
+    streaming: Boolean = false,
     // 长按代码块时回调（气泡层用它弹菜单）
     onCodeLongPress: (() -> Unit)? = null
 ) {
@@ -7800,7 +7845,13 @@ private fun MarkdownText(
                     style = MaterialTheme.typography.bodyMedium
                 )
 
-                is MdBlock.Code -> CodeBlock(block.code, onLongPress = onCodeLongPress)
+                is MdBlock.Code -> CodeBlock(
+                    code = block.code,
+                    streaming = streaming,
+                    onLongPress = onCodeLongPress
+                )
+
+                is MdBlock.Formula -> FormulaBlock(block.text)
 
                 is MdBlock.Table -> MarkdownTable(block.header, block.rows)
             }
@@ -7816,7 +7867,84 @@ private fun MarkdownText(
  */
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
-private fun CodeBlock(code: String, onLongPress: (() -> Unit)? = null) {
+private fun CodeBlock(
+    code: String,
+    // ★ v1.4.0 战役二：流式期间不挂复制按钮。
+    //   流式那一条本来就走纯 Text 分支、压根不进这里；这个开关是安全阀：
+    //   将来若把 Markdown 提前到流式管线里，按钮也不会每帧重组。
+    streaming: Boolean = false,
+    onLongPress: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    Surface(
+        color = CodeBlockBackground,
+        shape = RoundedCornerShape(6.dp),
+        border = BorderStroke(1.dp, CodeBlockBorder),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        // Box 而不是 Column：复制按钮要浮在右上角，不能挤占代码的排版。
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                // ★ v1.2.0 轻量语法高亮：正则 + AnnotatedString，零第三方依赖。
+                //   remember(code) 缓存 —— 代码块只在定稿后渲染一次，重复重组不重复扫描。
+                text = remember(code) { highlightCode(code) },
+                color = CodeBlockText,
+                // ★ 强制等宽，不受主题 Typography 影响
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+                // softWrap = false：代码不折行，改成横向滚动，保住缩进
+                softWrap = false,
+                modifier = Modifier
+                    .padding(10.dp)
+                    .horizontalScroll(rememberScrollState())
+                    // ★ combinedClickable 必须放在 horizontalScroll **之后**（也就是内层）。
+                    //   放外层的话手势会先被滚动容器吃掉 —— 这就是「长按代码块没反应」的原因：
+                    //   气泡自己那层 combinedClickable 根本收不到事件。
+                    .combinedClickable(
+                        onClick = { /* 单击不做事 */ },
+                        onLongClick = { onLongPress?.invoke() }
+                    )
+            )
+            if (!streaming) {
+                // 按钮自己带一层和代码块同色的底：代码很长时它压在字符上也能看清。
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(6.dp)
+                        .size(26.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(CodeBlockBackground.copy(alpha = 0.90f))
+                        .clickable {
+                            copyToClipboard(context, code)
+                            Toast.makeText(
+                                context,
+                                context.getString(R.string.code_copied),
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = ContentCopyIcon,
+                        contentDescription = stringResource(R.string.menu_copy_code),
+                        tint = CodeBlockText.copy(alpha = 0.70f),
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * ★ v1.4.0 战役二：块级公式。
+ *
+ * 刻意不接 LaTeX 引擎 —— 那要几十 MB 的依赖，和「<2MB 包体」的卖点直接冲突。
+ * 这里只负责「认出这是公式」并把排版交给眼睛：等宽 + 强调色 + 居中。
+ * ^ _ 原样保留，比塞进正文当普通文字读起来清楚得多。
+ */
+@Composable
+private fun FormulaBlock(formula: String) {
     Surface(
         color = CodeBlockBackground,
         shape = RoundedCornerShape(6.dp),
@@ -7824,27 +7952,43 @@ private fun CodeBlock(code: String, onLongPress: (() -> Unit)? = null) {
         modifier = Modifier.fillMaxWidth()
     ) {
         Text(
-            // ★ v1.2.0 轻量语法高亮：正则 + AnnotatedString，零第三方依赖。
-            //   remember(code) 缓存 —— 代码块只在定稿后渲染一次，重复重组不重复扫描。
-            text = remember(code) { highlightCode(code) },
-            color = CodeBlockText,
-            // ★ 强制等宽，不受主题 Typography 影响
+            text = formula,
+            color = FormulaAccent,
             fontFamily = FontFamily.Monospace,
-            style = MaterialTheme.typography.bodySmall,
-            // softWrap = false：代码不折行，改成横向滚动，保住缩进
-            softWrap = false,
+            style = MaterialTheme.typography.bodyMedium,
+            textAlign = TextAlign.Center,
             modifier = Modifier
-                .padding(10.dp)
-                .horizontalScroll(rememberScrollState())
-                // ★ combinedClickable 必须放在 horizontalScroll **之后**（也就是内层）。
-                //   放外层的话手势会先被滚动容器吃掉 —— 这就是「长按代码块没反应」的原因：
-                //   气泡自己那层 combinedClickable 根本收不到事件。
-                .combinedClickable(
-                    onClick = { /* 单击不做事 */ },
-                    onLongClick = { onLongPress?.invoke() }
-                )
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 12.dp)
         )
     }
+}
+
+/**
+ * ★ v1.4.0 战役二：复制图标。
+ *
+ * 没有用 Icons.Default.ContentCopy —— 那个在 material-icons-extended 里，
+ * 整个包几十 MB，为了一个图标引进来和「<2MB 包体」的卖点直接冲突。
+ * 这里直接把 Material 官方 ContentCopy 的 path 数据内联成 ImageVector，
+ * 图形一模一样，体积只有这一条字符串。
+ */
+private val ContentCopyIcon: ImageVector by lazy {
+    val pathData =
+        "M16,1L4,1c-1.1,0 -2,0.9 -2,2v14h2L4,3h12L16,1z" +
+            "M19,5L8,5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h11c1.1,0 2,-0.9 2,-2L21,7c0,-1.1 -0.9,-2 -2,-2z" +
+            "M19,21L8,21L8,7h11v14z"
+    ImageVector.Builder(
+        name = "ContentCopy",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        addPath(
+            pathData = PathParser().parsePathString(pathData).toNodes(),
+            fill = SolidColor(Color.Black)
+        )
+    }.build()
 }
 
 

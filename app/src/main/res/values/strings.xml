@@ -112,6 +112,7 @@
     <string name="input_mic">语音输入</string>
     <string name="menu_copy_code">复制代码</string>
     <string name="menu_copy_code_multi">复制代码（%1$d 段）</string>
+    <string name="code_copied">已复制</string>
     <string name="tool_running">正在调用工具：%1$s</string>
     <string name="tool_done">已执行：%1$s</string>
     <string name="tool_failed">执行失败：%1$s</string>

@@ -112,6 +112,7 @@
     <string name="input_mic">Voice input</string>
     <string name="menu_copy_code">Copy code</string>
     <string name="menu_copy_code_multi">Copy code (%1$d blocks)</string>
+    <string name="code_copied">Copied</string>
     <string name="tool_running">Calling: %1$s</string>
     <string name="tool_done">Done: %1$s</string>
     <string name="tool_failed">Failed: %1$s</string>
