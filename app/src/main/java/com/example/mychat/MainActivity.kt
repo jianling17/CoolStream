@@ -224,6 +224,11 @@ import com.example.mychat.ui.theme.CodeBlockBackground
 import com.example.mychat.ui.theme.CodeBlockBorder
 import com.example.mychat.ui.theme.CodeBlockText
 import com.example.mychat.ui.theme.FormulaAccent
+import com.example.mychat.ui.theme.CodeLineNumber
+import com.example.mychat.ui.theme.DiffAddedBackground
+import com.example.mychat.ui.theme.DiffAddedText
+import com.example.mychat.ui.theme.DiffRemovedBackground
+import com.example.mychat.ui.theme.DiffRemovedText
 import com.example.mychat.ui.theme.GlassDrawerDark
 import com.example.mychat.ui.theme.GlassDrawerLight
 import com.example.mychat.ui.theme.GlassEdgeDark
@@ -7554,7 +7559,8 @@ private fun GlassMenuItem(text: String, onClick: () -> Unit) {
 internal sealed interface MdBlock {
     data class Heading(val level: Int, val text: String) : MdBlock
     data class Paragraph(val text: String) : MdBlock
-    data class Code(val code: String) : MdBlock
+    /** ★ v1.4.0 战役三：lang 是围栏上的语言标识（```kotlin → "kotlin"），空串表示没写 */
+    data class Code(val code: String, val lang: String = "") : MdBlock
     data class Table(val header: List<String>, val rows: List<List<String>>) : MdBlock
     /** ★ v1.4.0 战役二：$$ ... $$ 包裹的块级公式 */
     data class Formula(val text: String) : MdBlock
@@ -7619,6 +7625,8 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
     val formula = StringBuilder()
     var inCode = false
     var inFormula = false
+    // ★ v1.4.0 战役三：围栏上写的语言名（```kotlin 里的 kotlin），渲染成右上角标签
+    var codeLang = ""
 
     fun flushParagraph() {
         if (para.isNotEmpty()) {
@@ -7637,11 +7645,13 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
         // ---------- 代码块围栏 ----------
         if (noTrail.trimStart().startsWith("```")) {
             if (inCode) {
-                out.add(MdBlock.Code(code.toString().trimEnd('\n')))
+                out.add(MdBlock.Code(code.toString().trimEnd('\n'), codeLang))
                 code.setLength(0)
+                codeLang = ""
                 inCode = false
             } else {
                 flushParagraph()
+                codeLang = fenceLanguage(noTrail)
                 inCode = true
             }
             continue
@@ -7730,7 +7740,7 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
 
     // 流被截断时可能停在代码块中间，也要把它显示出来
     if (inCode && code.isNotEmpty()) {
-        out.add(MdBlock.Code(code.toString().trimEnd('\n')))
+        out.add(MdBlock.Code(code.toString().trimEnd('\n'), codeLang))
     }
     // 流被截断时可能停在公式中间，已收到的部分也要显示
     if (inFormula && formula.isNotBlank()) {
@@ -7847,6 +7857,7 @@ private fun MarkdownText(
 
                 is MdBlock.Code -> CodeBlock(
                     code = block.code,
+                    lang = block.lang,
                     streaming = streaming,
                     onLongPress = onCodeLongPress
                 )
@@ -7869,6 +7880,8 @@ private fun MarkdownText(
 @OptIn(ExperimentalFoundationApi::class)
 private fun CodeBlock(
     code: String,
+    // ★ v1.4.0 战役三：围栏上的语言名，空串表示没写 → 不显示标签
+    lang: String = "",
     // ★ v1.4.0 战役二：流式期间不挂复制按钮。
     //   流式那一条本来就走纯 Text 分支、压根不进这里；这个开关是安全阀：
     //   将来若把 Markdown 提前到流式管线里，按钮也不会每帧重组。
@@ -7884,10 +7897,32 @@ private fun CodeBlock(
     ) {
         // Box 而不是 Column：复制按钮要浮在右上角，不能挤占代码的排版。
         Box(modifier = Modifier.fillMaxWidth()) {
+            // ★ v1.4.0 战役三：行号栏 + 代码栏。
+            //   行号刻意放在 horizontalScroll **外面** —— 代码横滑时行号钉在原地，
+            //   否则长行一拖，左边就剩一片空白。
+            Row(modifier = Modifier.fillMaxWidth().padding(10.dp)) {
+                // 行号用「单个 Text + 换行」而不是「一列 Text」：
+                // 同一套字体度量才能保证和右侧代码栏逐行严格对齐（半像素差会逐行累积）。
+                Text(
+                    text = remember(code) { lineNumberText(codeLineCount(code)) },
+                    color = CodeLineNumber,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.End,
+                    softWrap = false,
+                    modifier = Modifier.padding(end = 10.dp)
+                )
             Text(
                 // ★ v1.2.0 轻量语法高亮：正则 + AnnotatedString，零第三方依赖。
                 //   remember(code) 缓存 —— 代码块只在定稿后渲染一次，重复重组不重复扫描。
-                text = remember(code) { highlightCode(code) },
+                // ★ v1.4.0 战役三：diff 红绿以 SpanStyle 区间叠在高亮结果之上
+                //   （追加到 spanStyles 末尾 → 后应用者胜，能盖掉行内关键字色）。
+                text = remember(code) {
+                    val base = highlightCode(code)
+                    val diff = diffSpanStyles(code)
+                    if (diff.isEmpty()) base
+                    else AnnotatedString(base.text, base.spanStyles + diff, base.paragraphStyles)
+                },
                 color = CodeBlockText,
                 // ★ 强制等宽，不受主题 Typography 影响
                 fontFamily = FontFamily.Monospace,
@@ -7895,7 +7930,6 @@ private fun CodeBlock(
                 // softWrap = false：代码不折行，改成横向滚动，保住缩进
                 softWrap = false,
                 modifier = Modifier
-                    .padding(10.dp)
                     .horizontalScroll(rememberScrollState())
                     // ★ combinedClickable 必须放在 horizontalScroll **之后**（也就是内层）。
                     //   放外层的话手势会先被滚动容器吃掉 —— 这就是「长按代码块没反应」的原因：
@@ -7905,12 +7939,27 @@ private fun CodeBlock(
                         onLongClick = { onLongPress?.invoke() }
                     )
             )
+            }
+            // ★ v1.4.0 战役三：语言标签和复制按钮共用右上角这一行
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (lang.isNotBlank()) {
+                    Text(
+                        text = lang.uppercase(),
+                        color = CodeBlockText.copy(alpha = 0.45f),
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(end = 6.dp)
+                    )
+                }
             if (!streaming) {
                 // 按钮自己带一层和代码块同色的底：代码很长时它压在字符上也能看清。
                 Box(
                     modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(6.dp)
                         .size(26.dp)
                         .clip(RoundedCornerShape(5.dp))
                         .background(CodeBlockBackground.copy(alpha = 0.90f))
@@ -7931,6 +7980,7 @@ private fun CodeBlock(
                         modifier = Modifier.size(14.dp)
                     )
                 }
+            }
             }
         }
     }
@@ -8060,6 +8110,75 @@ internal fun highlightCode(code: String): AnnotatedString = buildAnnotatedString
             }
         }
     }
+}
+
+// ============================================================
+// ★ v1.4.0 战役三：代码块行号 / 语言标签 / Diff 红绿高亮
+//   三个都是纯函数 —— 不碰 Compose，可被 JVM 单测直接调用。
+// ============================================================
+
+/** 围栏行 "```kotlin" → "kotlin"；"```" → ""。只取第一个词并转小写。 */
+internal fun fenceLanguage(fenceLine: String): String {
+    val body = fenceLine.trim().trimStart('`').trim()
+    if (body.isEmpty()) return ""
+    return body.substringBefore(' ').substringBefore('\t').trim().lowercase().take(16)
+}
+
+/** 代码行数：空串也算 1 行 —— 否则行号栏会塌成 0 高，和右侧代码对不上 */
+internal fun codeLineCount(code: String): Int =
+    if (code.isEmpty()) 1 else code.count { it == '\n' } + 1
+
+/** 行号栏文本："1\\n2\\n3" —— 用单个 Text 渲染，和代码栏共享同一套字体度量才能严格对齐 */
+internal fun lineNumberText(count: Int): String {
+    if (count <= 1) return "1"
+    val sb = StringBuilder(count * 3)
+    for (i in 1..count) {
+        if (i > 1) sb.append('\n')
+        sb.append(i)
+    }
+    return sb.toString()
+}
+
+/**
+ * 单行是不是 diff 行：1 = 新增，-1 = 删除，0 = 普通。
+ *
+ * 刻意排除 +++ / --- ：那是 diff 的文件头，不是增删内容。
+ */
+internal fun diffLineKind(line: String): Int = when {
+    line.startsWith("+++") -> 0
+    line.startsWith("---") -> 0
+    line.startsWith("+") -> 1
+    line.startsWith("-") -> -1
+    else -> 0
+}
+
+/**
+ * 把 diff 行算成 SpanStyle 区间，叠到 highlightCode 的结果上。
+ *
+ * 为什么不「逐行 Text + 背景 Box」：那会把整块代码拆成 N 个 Text 节点，
+ * 行号栏和代码栏各自排版，字体度量一旦有半像素差就会逐行错位。
+ * 这里保持「整块一个 Text」，只往 AnnotatedString 追加区间 —— 零额外布局节点。
+ */
+internal fun diffSpanStyles(code: String): List<AnnotatedString.Range<SpanStyle>> {
+    if (code.isEmpty()) return emptyList()
+    val out = ArrayList<AnnotatedString.Range<SpanStyle>>()
+    var start = 0
+    while (start <= code.length) {
+        val nl = code.indexOf('\n', start)
+        val end = if (nl < 0) code.length else nl
+        val kind = diffLineKind(code.substring(start, end))
+        if (kind != 0 && end > start) {
+            val style = if (kind > 0) {
+                SpanStyle(color = DiffAddedText, background = DiffAddedBackground)
+            } else {
+                SpanStyle(color = DiffRemovedText, background = DiffRemovedBackground)
+            }
+            out.add(AnnotatedString.Range(style, start, end))
+        }
+        if (nl < 0) break
+        start = nl + 1
+    }
+    return out
 }
 /**
  * Markdown 表格：极简网格 —— 深色半透明底 + 细白边，风格跟代码块保持一致。

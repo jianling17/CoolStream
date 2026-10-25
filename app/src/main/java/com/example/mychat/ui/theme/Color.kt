@@ -48,6 +48,15 @@ val CodeBlockText       = Color(0xFFC9D1D9)   // 代码文字
 //   又不像纯红那样看着像报错。
 val FormulaAccent       = Color(0xFFA78BFA)
 
+// ★ v1.4.0 战役三：Diff 红绿高亮 + 行号灰。
+//   底色刻意压到极淡（#1B3524 / #3B1D1D）—— 代码块本身已经是 #161B22 深底，
+//   再亮一档就会盖过语法高亮的蓝紫/绿，变成一坨色块。
+val DiffAddedBackground   = Color(0xFF1B3524)   // 新增行底：极淡暗绿
+val DiffAddedText         = Color(0xFF7EE787)   // 新增行字：亮绿
+val DiffRemovedBackground = Color(0xFF3B1D1D)   // 删除行底：极淡暗红
+val DiffRemovedText       = Color(0xFFFF7B72)   // 删除行字：亮红
+val CodeLineNumber        = Color(0xFF6E7681)   // 行号：暗灰，比正文低一档存在感
+
 // ---------------- 毛玻璃（Glassmorphism）----------------
 // 不用 Modifier.blur()（性能极差），而是「半透明底 + 高光边框」的拟态做法。
 // 深色 / 亮色各一套：亮色主题下用深色玻璃会让文字完全看不见。
