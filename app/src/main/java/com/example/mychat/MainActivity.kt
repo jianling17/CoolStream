@@ -204,6 +204,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.PathNode
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextDecoration
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -236,6 +237,7 @@ import com.example.mychat.ui.theme.GlassTintLight
 // ---- 像素级 UI 重构新增的 import ----
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -246,6 +248,8 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -302,6 +306,7 @@ val SYSTEM_PROMPT = """
 - http_request(url, method, body)：发送 HTTP 请求，返回前 5000 字。可对接无需鉴权的公共 API。
 - open_app(package_name)：按包名拉起手机上的应用，需要 Shizuku 授权。
 - web_search(query)：联网搜索最新的网页信息，返回前 3 条结果的标题、摘要和链接。
+- todo(plan, tasks)：列出或更新任务计划清单。tasks 是任务数组，每条含 content（要做什么）和 status（pending / in_progress / completed）。
 
 ★ 关于 web_search 的三条硬规则：
 - 凡是答案「会变」的问题（新闻、股价、价格、版本号、政策、天气、人物近况、今天几号），
@@ -317,6 +322,12 @@ val SYSTEM_PROMPT = """
 - 用户取消弹窗时会返回「用户取消了操作」，此时不要再追问同一个问题，
   改用合理默认值继续，或如实说明你缺哪条信息、为什么给不出结果。
 - 不要用它汇报进度、不要自问自答、不要在能从上下文推断出答案时还去问用户。
+
+★ 关于 todo：
+- 遇到包含 3 个或以上步骤的复杂任务时，你必须先调用 todo 工具列出计划清单，
+  然后再开始执行。每完成一步，更新 todo 状态。
+- 只有一步就能干完的简单任务不要用 todo —— 那只是噪音，不是计划。
+- 更新状态时把整份清单重新发一遍（工具是全量覆盖，不是增量追加）。
 
 严格遵守以下规则：
 1. 用户要求查看、读取、打开某个文件时，必须先调用 read_file，
@@ -377,6 +388,17 @@ private const val REALTIME_SEARCH_RULE =
         "严禁用 run_code 或 run_shell 抓网页来代替，也严禁凭训练记忆编造。"
 
 /**
+ * v1.4.0 战役一：任务规划硬约束。
+ *
+ * 为什么值得单列一条：模型面对多步任务时天生爱「边想边做」，
+ * 前三步还记得，到第五步就忘了原本要干什么，中途被打断更是一片混乱。
+ * 先把清单写下来（todo），再按清单执行，是唯一稳定的做法。
+ */
+internal const val TODO_RULE =
+    "遇到包含 3 个或以上步骤的复杂任务时，你必须先调用 todo 工具列出计划清单，" +
+        "然后再开始执行。每完成一步，更新 todo 状态。"
+
+/**
  * 实际发给模型的系统提示词 = 预设基础提示词 + 当前运行时的约束。
  *
  * 工作区和工具开关都是**运行时**才确定的（用户在设置页里选的），
@@ -403,6 +425,7 @@ private fun systemPromptWithWorkspace(): String {
             }
             append("\n3. ").append(LONG_TEXT_OUTPUT_RULE)
             append("\n4. ").append(REALTIME_SEARCH_RULE)
+            append("\n5. ").append(TODO_RULE)
         }
 
         // ---------- 标准：原样保留，一个字符都不改 ----------
@@ -427,6 +450,7 @@ private fun systemPromptWithWorkspace(): String {
                 append("\n13. ").append(wsLine)
                 append("\n14. ").append(LONG_TEXT_OUTPUT_RULE)
                 append("\n15. ").append(REALTIME_SEARCH_RULE)
+                append("\n16. ").append(TODO_RULE)
             }
         }
     }
@@ -1561,6 +1585,41 @@ private const val TOOL_DEFINITIONS = """
         "required": ["query"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "todo",
+      "description": "列出或更新任务计划清单。遇到 3 个及以上步骤的复杂任务时，必须先调用它列出计划再动手。tasks 是全量覆盖：每次调用都要把整份清单发一遍，已完成的步骤标记为 completed。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "plan": {
+            "type": "string",
+            "description": "一句话概括整体目标（可选）"
+          },
+          "tasks": {
+            "type": "array",
+            "description": "任务清单，按执行顺序排列",
+            "items": {
+              "type": "object",
+              "properties": {
+                "content": {
+                  "type": "string",
+                  "description": "这一步要做什么，一句话"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": ["pending", "in_progress", "completed"],
+                  "description": "pending 待办 / in_progress 进行中 / completed 已完成"
+                }
+              },
+              "required": ["content", "status"]
+            }
+          }
+        }
+      }
+    }
   }
 ]
 """
@@ -1863,6 +1922,8 @@ internal val ALL_TOOL_NAMES = listOf(
     "sqlite_query", "regex_extract",
     // ★ v1.2.0 本地语义检索（TF-IDF，按"意思"搜，区别于 search_workspace 的关键字匹配）。
     "semantic_search",
+    // ★ v1.4.0 战役一：任务规划清单。纯内存运算，不碰文件/网络/系统。
+    "todo",
     // ★ v1.1 阶段三新增。排 web_search 后面：它不碰手机、也不花钱，
     //   但要「暂停等用户输入」，性质和前七个都不同，放在最后单独一组。
     "ask_user"
@@ -1888,6 +1949,7 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "web_search" to "联网搜索网页（走 内置默认服务搜索接口，每次约 ¥0.005）",
     "sqlite_query" to "查询工作区 SQLite 数据库（只读，仅支持 SELECT）",
     "regex_extract" to "用正则表达式从文本中提取匹配内容",
+    "todo" to "列出/更新任务计划清单（复杂任务先做计划）",
     "semantic_search" to "按语义搜索工作区文件（TF-IDF 相似度，按意思搜而非关键字）",
     "ask_user" to "向用户提出问题并等待回答（不花钱，会暂停对话）"
 )
@@ -7012,7 +7074,15 @@ fun MessageBubble(
 ) {
     // ★ 工具调用不走普通气泡，走专门的卡片
     if (message.type == MessageType.TOOL_CALL) {
-        ToolCallCard(message = message, modifier = modifier)
+        // ★ v1.4.0 战役一：todo 走专属 Checklist 卡片，不走通用折叠文本。
+        //   工具名在一条消息的生命周期里不会变（只有 ok / output 会从「执行中」补成「已完成」），
+        //   所以这里的分支是稳定的，不会让 Compose 的调用顺序在两次重组间错位。
+        val todoView = remember(message.content) { parseToolCall(message.content) }
+        if (todoView.name == "todo") {
+            TodoCard(view = todoView, modifier = modifier)
+        } else {
+            ToolCallCard(message = message, modifier = modifier)
+        }
         return
     }
 
@@ -8204,6 +8274,203 @@ private fun ToolCallCard(
             }
         }
     }
+}
+
+// ============================================================
+// v1.4.0 战役一：todo 工具的 Checklist 专属卡片
+//
+// 为什么不复用 ToolCallCard 的折叠文本：
+//   计划清单的价值在「一眼看清进度」。JSON 或纯文本清单都要用户自己去数，
+//   而三态行 + 顶部进度条扫一眼就知道还剩几步、卡在哪一步。
+//
+// ★ 数据来源是 arguments 而不是 output：
+//   模型每次调用 todo 都会【全量重发】整份清单，所以 arguments 里永远是最新状态；
+//   output 是回给模型的文本回执，结构信息不如 arguments 完整。
+// ★ 纯内存渲染：不碰网络、不碰磁盘、不碰 50ms 流式防抖。
+// ============================================================
+
+/** 已完成 / 进行中 / 待办 三态的配色，与工具卡片的状态点同源 */
+private val TodoDoneColor = Color(0xFF3FB950)
+private val TodoDoingColor = Color(0xFFD29922)
+
+@Composable
+private fun TodoCard(view: ToolCallView, modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    val plan = remember(view.argsText) { parseTodoArgs(view.argsText) }
+    val done = plan.completedCount
+    val total = plan.totalCount
+    val allDone = total > 0 && done == total
+
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = glassFill(),
+        border = BorderStroke(1.dp, glassEdge()),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp)
+        ) {
+            // ---------- 标题行：计划名 + 完成计数 ----------
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "\uD83D\uDCCB",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = plan.plan.ifEmpty { "\u4EFB\u52A1\u8BA1\u5212" },
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = cs.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "${done} / ${total}",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (allDone) TodoDoneColor else cs.onSurfaceVariant
+                )
+            }
+
+            // ---------- 极简线性进度条 ----------
+            Spacer(Modifier.height(8.dp))
+            TodoProgressBar(done = done, total = total)
+
+            // ---------- 清单 ----------
+            if (plan.tasks.isEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = view.output.ifEmpty { "\uFF08\u6E05\u5355\u4E3A\u7A7A\uFF09" },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            } else {
+                Spacer(Modifier.height(6.dp))
+                plan.tasks.forEach { task ->
+                    TodoRow(task = task)
+                }
+            }
+
+            // ---------- 失败时补一句原因（成功不显示，保持干净） ----------
+            if (view.ok == false && view.output.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = view.output,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = cs.error,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+/** 极简线性进度条：底槽 + 绿色已完成段，没有任何动画（避免和流式渲染抢帧） */
+@Composable
+private fun TodoProgressBar(done: Int, total: Int) {
+    val cs = MaterialTheme.colorScheme
+    val fraction = if (total <= 0) 0f else (done.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(3.dp)
+            .clip(CircleShape)
+            .background(cs.onSurface.copy(alpha = 0.12f))
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(fraction)
+                .height(3.dp)
+                .clip(CircleShape)
+                .background(TodoDoneColor)
+        )
+    }
+}
+
+/** 清单里的一行：三态图标 + 对应文字样式 */
+@Composable
+private fun TodoRow(task: TodoItem) {
+    val cs = MaterialTheme.colorScheme
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp),
+        verticalAlignment = Alignment.Top
+    ) {
+        when (task.status) {
+            TodoStatus.COMPLETED -> Icon(
+                imageVector = Icons.Default.CheckCircle,
+                contentDescription = null,
+                tint = TodoDoneColor,
+                modifier = Modifier.size(16.dp)
+            )
+
+            TodoStatus.IN_PROGRESS -> SpinningTodoIcon(tint = TodoDoingColor)
+
+            TodoStatus.PENDING -> Box(
+                modifier = Modifier
+                    .padding(top = 3.dp)
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .border(1.5.dp, cs.onSurfaceVariant.copy(alpha = 0.6f), CircleShape)
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = task.content,
+            style = MaterialTheme.typography.bodySmall,
+            color = when (task.status) {
+                TodoStatus.COMPLETED -> cs.onSurfaceVariant.copy(alpha = 0.55f)
+                TodoStatus.IN_PROGRESS -> cs.onSurface
+                TodoStatus.PENDING -> cs.onSurfaceVariant
+            },
+            textDecoration = if (task.status == TodoStatus.COMPLETED) {
+                TextDecoration.LineThrough
+            } else {
+                null
+            },
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+/**
+ * 进行中的旋转图标。
+ *
+ * ★ 关键：角度只在 graphicsLayer 的 lambda 里读（延迟读取），
+ *   所以每帧只重绘、不重组 —— 不会给流式输出那条气泡添任何重组压力。
+ *   用 graphicsLayer 的旋转而不是 animateDpAsState 挪位置，也是同一个考虑。
+ */
+@Composable
+private fun SpinningTodoIcon(tint: Color) {
+    val transition = rememberInfiniteTransition(label = "todo-spin")
+    val angle = transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "todo-spin-angle"
+    )
+    Icon(
+        imageVector = Icons.Default.Refresh,
+        contentDescription = null,
+        tint = tint,
+        modifier = Modifier
+            .size(16.dp)
+            .graphicsLayer { rotationZ = angle.value }
+    )
 }
 
 /** 卡片里的小代码块（深色底 + 等宽 + 横向滚动） */

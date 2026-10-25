@@ -2016,6 +2016,9 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                 }
             }
 
+            // ★ v1.4.0 战役一：任务规划清单。纯内存，不碰 IO，无需切协程。
+            "todo" -> todoTool(argsJson)
+
             "run_shell" -> {
                 val command = argOf(argsJson, "command").trim()
                 if (command.isBlank()) {
