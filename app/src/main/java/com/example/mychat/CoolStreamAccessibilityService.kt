@@ -6,6 +6,7 @@ import android.accessibilityservice.GestureDescription
 import android.content.Context
 import android.content.Intent
 import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
@@ -13,6 +14,8 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
+import android.view.Gravity
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
@@ -73,6 +76,15 @@ class CoolStreamAccessibilityService : AccessibilityService() {
 
     private val clickGuard = ClickGuard()
 
+    /** 赛博视界悬浮层。只在主线程读写（show/hide 全部走 mainHandler）。 */
+    private var focusView: AiFocusView? = null
+
+    /** 悬浮层被点亮的时间戳，用来保证「至少亮够 MIN_OVERLAY_MS」，避免一闪而过。 */
+    private var focusShownAt: Long = 0L
+
+    /** 延迟摘除的兜底任务。重新 show 时要 removeCallbacks，否则会被提前掐灭。 */
+    private val focusHideRunnable = Runnable { removeFocusOverlayNow() }
+
     // ------------------------------------------------------------------
     // 生命周期
     // ------------------------------------------------------------------
@@ -107,12 +119,107 @@ class CoolStreamAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         if (instance === this) instance = null
+        // 服务被杀掉时悬浮层必须一起走，否则窗口会留在屏幕上没人管。
+        mainHandler.removeCallbacks(focusHideRunnable)
+        removeFocusOverlayNow()
         serviceScope.cancel()
         super.onDestroy()
     }
 
     override fun onInterrupt() {
         // 系统要求实现。这里不做强制中断，正在跑的协程由 refreshSnapshot 的调用方管理。
+    }
+
+    // ------------------------------------------------------------------
+    // 赛博视界：AI 屏幕感知悬浮层
+    //
+    // 为什么是 TYPE_ACCESSIBILITY_OVERLAY 而不是 TYPE_APPLICATION_OVERLAY：
+    //   前者是无障碍服务自带的窗口类型，不需要 SYSTEM_ALERT_WINDOW 权限，
+    //   层级也高于普通应用悬浮窗 —— 盖在别的 App 上不会被压下去。
+    //   全程不申请任何运行时权限，是这套特效唯一可行的挂载方式。
+    // ------------------------------------------------------------------
+
+    /**
+     * 点亮屏幕边缘的 AI 焦点光效。
+     *
+     * 幂等：已经在显示时只重置计时，不重复 addView（重复 add 会抛异常）。
+     * 所有窗口操作都 post 到主线程 —— WindowManager 是线程敏感的，
+     * 而调用方（ToolExecutor）跑在 IO 协程里。
+     */
+    fun showAiFocusOverlay() {
+        mainHandler.post {
+            if (focusView != null) {
+                focusShownAt = SystemClock.uptimeMillis()
+                mainHandler.removeCallbacks(focusHideRunnable)
+                return@post
+            }
+            val wm = getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return@post
+            val view = AiFocusView(this)
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                // 不吃触摸、不吃焦点：用户点哪儿都正常穿透到下面的 App。
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT,
+            )
+            params.gravity = Gravity.TOP or Gravity.START
+            // API 30 起窗口默认避让系统栏 inset，这里显式关掉避让。
+            // ⚠️ 实测（REDMI K80 / 澎湃 OS）：这一条【不足以】让无障碍悬浮窗盖住状态栏 ——
+            //    窗口依然被放在内容区，光效边框的上沿落在状态栏下面。
+            //    这是 TYPE_ACCESSIBILITY_OVERLAY 的窗口布局规则，不是我们漏了标志位。
+            //    保留这段是因为它在部分 ROM 上确实生效，且语义正确（本窗口不需要避让）。
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                params.fitInsetsTypes = 0
+            }
+            try {
+                wm.addView(view, params)
+                focusView = view
+                focusShownAt = SystemClock.uptimeMillis()
+                mainHandler.removeCallbacks(focusHideRunnable)
+            } catch (e: Throwable) {
+                // 悬浮层只是装饰，加不上就静默放弃 —— 绝不能因为它让工具调用失败。
+                Log.w(TAG, "添加 AI 焦点悬浮层失败", e)
+                view.stopAnimation()
+            }
+        }
+    }
+
+    /**
+     * 熄灭悬浮层。
+     *
+     * 保证至少亮够 [MIN_OVERLAY_MS]：screen_see 读一次快照可能只要 80ms，
+     * 直接 hide 就是一闪而过的白闪，看起来像花屏。所以短于下限时改成延迟摘除。
+     */
+    fun hideAiFocusOverlay() {
+        mainHandler.post {
+            if (focusView == null) return@post
+            val shownFor = SystemClock.uptimeMillis() - focusShownAt
+            val remain = MIN_OVERLAY_MS - shownFor
+            mainHandler.removeCallbacks(focusHideRunnable)
+            if (remain > 0L) {
+                mainHandler.postDelayed(focusHideRunnable, remain)
+            } else {
+                removeFocusOverlayNow()
+            }
+        }
+    }
+
+    /** 真正摘窗口。只在主线程调用。 */
+    private fun removeFocusOverlayNow() {
+        val view = focusView ?: return
+        focusView = null
+        focusShownAt = 0L
+        view.stopAnimation()
+        try {
+            (getSystemService(Context.WINDOW_SERVICE) as? WindowManager)?.removeView(view)
+        } catch (e: Throwable) {
+            // 窗口可能已经被系统收走了，removeView 抛 IllegalArgument 是正常的。
+            Log.w(TAG, "移除 AI 焦点悬浮层失败", e)
+        }
     }
 
     // ------------------------------------------------------------------
@@ -543,6 +650,9 @@ class CoolStreamAccessibilityService : AccessibilityService() {
         const val DEFAULT_GESTURE_TIMEOUT_MS = 500L
         const val DEFAULT_CHANGE_TIMEOUT_MS = 1_200L
         const val DEFAULT_CHANGE_POLL_MS = 80L
+
+        /** 悬浮层最短可见时长。太短会像白闪。 */
+        const val MIN_OVERLAY_MS = 900L
 
         @Volatile
         private var instance: CoolStreamAccessibilityService? = null

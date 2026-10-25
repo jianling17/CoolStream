@@ -31,6 +31,7 @@ import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -1231,6 +1232,123 @@ internal fun takeScreenshot(workspace: String): ToolExecResult {
     )
 }
 
+
+// ============================================================
+// 3.26 无障碍屏幕操作：screen_see / screen_tap
+//
+// 为什么单独一节：这是本 App 里唯二「AI 直接动手点你的手机」的能力，风险比读文件高一档。
+// 三重护栏全部沉在底层服务里，这一层只负责「翻译成模型能懂的话」：
+//   · 快照是纯数据 POJO（UiNode），节点用完即还，不长期持有系统对象；
+//   · 点击走 ClickGuard（同目标限流 + 任务预算），反复点同一个按钮会被拒绝；
+//   · 遍历是跨进程 binder 调用，必须离开主线程 —— 见下面的 runBlocking(Dispatchers.IO)。
+// ============================================================
+
+/** screen_see 返回给模型的字数上限。够看清一层界面，又不至于把上下文撑爆。 */
+internal const val SCREEN_SEE_MAX_CHARS = 2000
+
+/** 读一次快照的最长等待。服务真卡住时宁可报失败，也不把 IO 线程钉死。 */
+internal const val SCREEN_SEE_TIMEOUT_MS = 2_000L
+
+/**
+ * 赛博视界：工具执行期间点亮屏幕边缘的 AI 焦点光效，结束（或至少亮够 900ms）后熄灭。
+ *
+ * 为什么包一层而不是在两头各写一行：screenSee / screenTap 都有多条提前返回的路径，
+ * 手工配对 show/hide 迟早漏掉一条，漏掉就是悬浮层永远留在屏幕上。
+ * 用 inline + try/finally 把「一定熄灭」变成编译期保证，调用点也不用缩进。
+ *
+ * 光效只是装饰：show/hide 内部全部吞异常，绝不会让工具本身失败。
+ */
+private inline fun <T> withAiFocus(service: CoolStreamAccessibilityService, block: () -> T): T {
+    service.showAiFocusOverlay()
+    return try {
+        block()
+    } finally {
+        service.hideAiFocusOverlay()
+    }
+}
+
+/**
+ * screen_see：把当前屏幕的无障碍节点树压成文字返回给模型。
+ *
+ * 为什么是 runBlocking(Dispatchers.IO)：executeTool 是同步函数，而底层 refreshSnapshot()
+ * 是挂起函数。这里显式切到 IO 再阻塞等待 —— 调用方本来就是 IO 协程
+ * （runAgentLoop / run_code），主线程一次都不会被碰到。
+ */
+internal fun screenSee(): ToolExecResult {
+    val service = CoolStreamAccessibilityService.peek()
+        ?: return ToolExecResult(
+            false,
+            "无障碍服务当前没有连接，读不到屏幕内容。可能的原因有两个：" +
+                "①用户在系统设置里关掉了「CoolStream 屏幕助手」；" +
+                "②服务刚被系统重启，还没重新连上。" +
+                "请让用户到 App 的「设置 → 通用 → 无障碍自动化」确认开关是打开的，然后再试。"
+        )
+
+    return withAiFocus(service) {
+        val snapshot = runBlocking(Dispatchers.IO) {
+            withTimeoutOrNull(SCREEN_SEE_TIMEOUT_MS) { service.refreshSnapshot() }
+        } ?: return ToolExecResult(
+            false,
+            "服务已连接，但这次没能读到屏幕结构（超时，或当前窗口没有可读节点）。" +
+                "可能是界面正在动画中，或前台应用屏蔽了无障碍访问。可以让用户先停在这一屏再试一次。"
+        )
+
+        val tree = snapshot.describe(SCREEN_SEE_MAX_CHARS)
+        if (tree.isBlank()) {
+            return ToolExecResult(
+                false,
+                "屏幕结构读到了，但里面没有任何可描述的节点。当前界面可能是空白页或纯图片。"
+            )
+        }
+
+        ToolExecResult(
+            true,
+            "当前屏幕的界面结构如下（'#' 后是节点编号，[click] 可点击，[edit] 可输入，" +
+                "括号里是 left,top,right,bottom 坐标）：" + "\n\n" +
+                tree +
+                "\n要操作哪个控件，就用 screen_tap 传它的文字。"
+        )
+    }
+}
+
+/**
+ * screen_tap：按文字找到控件并点击。
+ *
+ * text 刻意不走 cleanPath —— 按钮文字本身可能带标点（「下一步，继续」「确定！」），
+ * cleanPath 会把首尾标点削掉，削完就匹配不上了。
+ */
+internal fun screenTap(text: String): ToolExecResult {
+    val target = text.trim()
+    if (target.isEmpty()) {
+        return ToolExecResult(false, "参数错误：缺少 text（要点击的控件上显示的文字）。")
+    }
+    val service = CoolStreamAccessibilityService.peek()
+        ?: return ToolExecResult(
+            false,
+            "无障碍服务当前没有连接，点不了屏幕。" +
+                "请让用户到 App 的「设置 → 通用 → 无障碍自动化」确认开关是打开的。"
+        )
+
+    val clicked = withAiFocus(service) {
+        runBlocking(Dispatchers.IO) { service.clickNodeByText(target) }
+    }
+
+    return if (clicked) {
+        ToolExecResult(
+            true,
+            "已点击「" + target + "」。如果还要继续操作，先调用 screen_see 确认界面真的变了，" +
+                "不要凭想象接着点。"
+        )
+    } else {
+        ToolExecResult(
+            false,
+            "没能在当前屏幕上点到「" + target + "」。可能的原因：" +
+                "①屏幕上没有这段文字（先用 screen_see 看看实际有哪些文字）；" +
+                "②这个控件不可点击；" +
+                "③刚刚已经连续点过它两次，被防死循环护栏拒绝了（换个目标，或停下来问用户）。"
+        )
+    }
+}
 // ============================================================
 // 3.27 PTC 沙箱：run_code 的 JavaScript 运行时
 //
@@ -1572,6 +1690,16 @@ internal fun runCode(code: String): ToolExecResult {
         //   所以「沙箱无网络」这条安全边界没有破：脚本依然摸不到任何 Java 类。
         ScriptableObject.putProperty(tools, "webSearch", jsHostFunction { _, _, a ->
             invoke("web_search", JSONObject().put("query", jsArgStr(a, 0)))
+        })
+        // ★ v1.4 无障碍：操作手机屏幕。
+        //   同样走宿主函数 —— 真正的点击发生在 Java 层（AccessibilityService），
+        //   脚本拿到的只是一个 {ok, output} 字符串结果。
+        //   不暴露这两个方法的话，PTC 模式下模型根本调不到 screen_see / screen_tap。
+        ScriptableObject.putProperty(tools, "screenSee", jsHostFunction { _, _, _ ->
+            invoke("screen_see", JSONObject())
+        })
+        ScriptableObject.putProperty(tools, "screenTap", jsHostFunction { _, _, a ->
+            invoke("screen_tap", JSONObject().put("text", jsArgStr(a, 0)))
         })
         ScriptableObject.putProperty(scope, "tools", tools)
 
@@ -2042,6 +2170,11 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
             }
 
             "take_screenshot" -> takeScreenshot(currentWorkspace)
+
+            // ★ v1.4.0 战役四：无障碍屏幕操作（看屏幕 / 点屏幕）。
+            //   text 不过 cleanPath：按钮文字里的标点是有意义的。
+            "screen_see" -> screenSee()
+            "screen_tap" -> screenTap(argOf(argsJson, "text"))
 
             // ★ v1.4 战役二：工作区全文检索。
             "search_workspace" -> searchWorkspace(argOf(argsJson, "query"))

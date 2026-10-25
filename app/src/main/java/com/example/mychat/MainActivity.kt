@@ -307,6 +307,8 @@ val SYSTEM_PROMPT = """
 - get_clipboard()：读取当前手机的系统剪贴板文本内容。
 - send_notification(title, content)：在手机通知栏发一条系统通知。
 - take_screenshot()：截取当前手机屏幕，保存到工作区 .cache_screenshot.png，返回文件路径。
+- screen_see()：读取当前手机屏幕上真实的界面结构（有哪些控件、文字是什么、哪些可点击），返回文字化的 UI 树。
+- screen_tap(text)：在当前屏幕上按文字找到控件并点击，text 用 screen_see 结果里真实出现的文字。
 - search_workspace(query)：在整个工作区的文本文件里搜索包含 query 的行，返回「文件路径:行号: 内容」。
 - 如果需要找文件、找代码或找某段内容，先调 search_workspace 搜索，然后再针对性地用 read_file 读取。
 - calculate(expression)：精确计算数学表达式。任何需要算数的场合都必须用它，绝不心算。
@@ -343,6 +345,20 @@ val SYSTEM_PROMPT = """
   无序列表直接输出计划。必须且只能调用 todo 工具，客户端会把它渲染成带勾选状态的原生卡片。
   用 Markdown 画计划 = 任务没完成，会被打回重做。
 - 调完 todo 之后不要在正文里再复述一遍清单，卡片已经展示给用户了，正文只写一句结论。
+
+★ 关于 screen_see / screen_tap（操作手机屏幕）：
+- 当用户让你操作手机屏幕（如打开某个应用、点击某个按钮、进入某个设置项）时，
+  必须先调用 screen_see 查看屏幕内容，看清有哪些可点的控件，然后调用 screen_tap 点击。
+  绝对不要凭猜测直接点，也不要声称"我无法操作你的手机屏幕"。
+- screen_tap 的 text 必须从 screen_see 的结果里抄，是屏幕上真实存在的文字；
+  自己编一个按钮名一定点不中。
+- 每次 screen_tap 之后，如果还要继续操作，重新调用 screen_see 确认界面真的变了，
+  不要凭想象连着点 —— 界面可能没变，也可能跳到了别的页面。
+- 同一个控件连续点两次都没反应就停下，把 screen_see 的结果和失败原因如实告诉用户，
+  不要死循环重试。
+- 这两个工具依赖用户在系统设置里开启「CoolStream 屏幕助手」无障碍服务。
+  如果工具返回"无障碍服务当前没有连接"，就引导用户到 App 的「设置 → 通用 → 无障碍自动化」检查开关，
+  不要反复重试同一个工具。
 
 严格遵守以下规则：
 1. 用户要求查看、读取、打开某个文件时，必须先调用 read_file，
@@ -1450,6 +1466,35 @@ private const val TOOL_DEFINITIONS = """
   {
     "type": "function",
     "function": {
+      "name": "screen_see",
+      "description": "读取当前手机屏幕上真实的界面结构：把整棵无障碍节点树压成文字（控件类型、文字、是否可点击、坐标），最多 2000 字。当用户让你操作手机屏幕（打开某个应用、点某个按钮、进某个设置页）时，必须先调用它看清屏幕上有什么，再决定点哪里。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "screen_tap",
+      "description": "在当前屏幕上按文字查找控件并点击（无障碍 ACTION_CLICK，失败时回退手势点击）。text 必须是 screen_see 结果里真实出现过的文字，不要自己编按钮名。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "要点击的控件上显示的文字，可以是完整文字，也可以是其中一段"
+          }
+        },
+        "required": ["text"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "search_workspace",
       "description": "在整个工作区里搜索文件内容包含关键字的文本行，返回「文件路径:行号: 内容」列表。当你需要查找某个具体变量、关键字、配置项，或者不知道目标代码/内容在哪个文件里时，优先使用此工具搜索工作区，再针对性地用 read_file 读取。只搜文本文件，自动跳过二进制和超过 2MB 的大文件与隐藏目录。",
       "parameters": {
@@ -1945,6 +1990,8 @@ internal val ALL_TOOL_NAMES = listOf(
     "list_dir", "search_files", "read_file", "write_file", "replace_in_file", "run_shell",
     // ★ v1.4 新增：Shizuku 系统级三件套（剪贴板 / 通知 / 截屏），都是「动手机系统」的工具。
     "get_clipboard", "send_notification", "take_screenshot",
+    // ★ v1.4.0 战役四：无障碍屏幕操作（看屏幕 / 点屏幕），走的是无障碍服务，不是 Shizuku。
+    "screen_see", "screen_tap",
     // ★ v1.4 战役二：工作区全文检索（本地轻量 RAG）。
     "search_workspace",
     // ★ v1.2.0 战役四：calculate / http_request / open_app。
@@ -1974,6 +2021,8 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "get_clipboard" to "读取系统剪贴板文本",
     "send_notification" to "发一条系统通知到通知栏",
     "take_screenshot" to "截屏保存到工作区并返回路径",
+    "screen_see" to "读取当前屏幕的界面结构（无障碍服务，需在系统设置里开启）",
+    "screen_tap" to "按文字点击屏幕上的控件（无障碍服务，需在系统设置里开启）",
     "search_workspace" to "在工作区所有文本文件里搜关键字（全文检索）",
     "calculate" to "精确计算数学表达式（沙箱引擎）",
     "http_request" to "发 HTTP 请求对接公共 API",
@@ -2041,7 +2090,7 @@ private val PTC_TOOL_DEFINITION = """
       "properties": {
         "code": {
           "type": "string",
-          "description": "要执行的 JavaScript 源码。\n★ 这个引擎是老式 JS，以下写法【不要用】，否则报错或结果错误：\n  - 模板字符串插值（`a${'$'}{x}` 不会替换，会原样保留）→ 用 'a' + x\n  - for (const x of arr) 里的 const → 用 let 或 var\n  - 展开运算符 ...、可选链 ?.、空值合并 ??\n可放心使用：let / const 声明、箭头函数、解构、for (let ... of ...)、Map / Set、includes、padStart、以及所有数组方法。\nAPI：\n  tools.listDir(path)                          -> {ok, output}\n  tools.searchFiles(keyword, path)             -> {ok, output}\n  tools.readFile(path)                         -> {ok, output}\n  tools.writeFile(path, content)               -> {ok, output}\n  tools.replaceInFile(path, search, replace, replaceAll) -> {ok, output}\n  tools.runShell(command)                      -> {ok, output}\n  tools.webSearch(query)                       -> {ok, output}（联网搜索，前 3 条结果）\n另有 print(...)。示例：\nconst r = tools.readFile('/sdcard/Documents/a.txt');\nif (!r.ok) { print('读失败: ' + r.output); }\nelse { print('长度 ' + r.output.length); }\nr.ok"
+          "description": "要执行的 JavaScript 源码。\n★ 这个引擎是老式 JS，以下写法【不要用】，否则报错或结果错误：\n  - 模板字符串插值（`a${'$'}{x}` 不会替换，会原样保留）→ 用 'a' + x\n  - for (const x of arr) 里的 const → 用 let 或 var\n  - 展开运算符 ...、可选链 ?.、空值合并 ??\n可放心使用：let / const 声明、箭头函数、解构、for (let ... of ...)、Map / Set、includes、padStart、以及所有数组方法。\nAPI：\n  tools.listDir(path)                          -> {ok, output}\n  tools.searchFiles(keyword, path)             -> {ok, output}\n  tools.readFile(path)                         -> {ok, output}\n  tools.writeFile(path, content)               -> {ok, output}\n  tools.replaceInFile(path, search, replace, replaceAll) -> {ok, output}\n  tools.runShell(command)                      -> {ok, output}\n  tools.webSearch(query)                       -> {ok, output}（联网搜索，前 3 条结果）\n  tools.screenSee()                            -> {ok, output}（看当前屏幕的 UI 树，操作手机前必用）\n  tools.screenTap(text)                        -> {ok, output}（按界面上可见的文字点击控件）\n另有 print(...)。示例：\nconst r = tools.readFile('/sdcard/Documents/a.txt');\nif (!r.ok) { print('读失败: ' + r.output); }\nelse { print('长度 ' + r.output.length); }\nr.ok"
         }
       },
       "required": ["code"]
@@ -2069,6 +2118,8 @@ private val PTC_SYSTEM_PROMPT = """
   tools.replaceInFile(path, search, replace, replaceAll)
   tools.runShell(command)
   tools.webSearch(query)        // 联网搜索，返回前 3 条结果的标题+摘要+链接
+  tools.screenSee()             // 看当前屏幕的 UI 树（操作手机屏幕前必须先调它）
+  tools.screenTap(text)         // 按界面上可见的文字点击控件
   print(...)                    // 打印到执行输出，方便你看中间结果
 
 写法要求：
@@ -2101,6 +2152,11 @@ private val PTC_SYSTEM_PROMPT = """
    内容重要就先问用户一句。
 9. 改已有文件的某一段用 tools.replaceInFile，search 必须从刚才读到的内容里
    【逐字复制】。凭印象手打的一定匹配不上。
+10. 用户让你操作手机屏幕（打开某个应用、点某个按钮）时：先 tools.screenSee() 看清界面，
+    再 tools.screenTap(文字) 点。文字必须【逐字抄自】screenSee 的结果，不许自己编。
+    点完再 screenSee 一次确认结果。同一处连点两次没变化就停下，如实告诉用户。
+    返回「无障碍服务当前没有连接」时，引导用户去 App 的「设置 → 通用 → 无障碍自动化」
+    打开开关，不要反复重试。
 """.trim()
 
 /**
