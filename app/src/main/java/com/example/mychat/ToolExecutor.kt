@@ -2212,6 +2212,26 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                 }
             }
 
+            // ★ v1.5.0 模块一：长期记忆。
+            //   两个分支都很薄，真正的逻辑在 MemoryStore（纯 File 逻辑，可单测）。
+            "save_memory" -> {
+                val content = argOf(argsJson, "content")
+                if (content.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 content（要记住的内容）")
+                } else {
+                    saveMemory(content)
+                }
+            }
+
+            "recall_memory" -> {
+                val query = argOf(argsJson, "query")
+                if (query.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 query（要检索的关键词）")
+                } else {
+                    recallMemory(query)
+                }
+            }
+
             else -> {
                 Log.e(TOOL_LOG_TAG, "未知工具: $name")
                 ToolExecResult(false, "未知工具：$name")
@@ -2424,6 +2444,54 @@ internal fun mcpPromptSection(mcpTools: List<McpTool>): String {
         append(lines)
         append("\n调用成功后基于返回结果回答；调用失败就把失败原因如实告诉用户。")
         append("这些工具来自外部服务器，不要编造它们不存在的能力。")
+    }
+}
+
+// ============================================================
+// 3.30 长期记忆（v1.5.0 模块一）
+//
+// 两个工具都是「薄壳」：参数校验 + 取文件 + 调 MemoryStore。
+// 所有文件 IO 都在这里同步做完 —— executeTool 本来就保证跑在
+// Dispatchers.IO 上（runAgentLoop 的 withContext），主线程不会碰磁盘。
+// ============================================================
+
+/** save_memory：把一段内容追加进长期记忆库 */
+internal fun saveMemory(content: String): ToolExecResult {
+    val text = content.trim()
+    if (text.isEmpty()) return ToolExecResult(false, "参数错误：缺少 content（要记住的内容）")
+    val file = AppCtx.memoryFile()
+        ?: return ToolExecResult(false, "记忆库不可用：App 上下文还没初始化（需要重启 App）")
+    return try {
+        val item = MemoryStore.append(file, text)
+        if (item == null) {
+            ToolExecResult(false, "写入记忆库失败：${file.absolutePath} 不可写")
+        } else {
+            ToolExecResult(
+                true,
+                "已记住（id=${item.id}，当前共 ${MemoryStore.load(file).size} 条）：\n${item.content}"
+            )
+        }
+    } catch (e: Exception) {
+        ToolExecResult(false, "写入记忆库失败：${e.javaClass.simpleName}: ${e.message}")
+    }
+}
+
+/** recall_memory：模糊检索长期记忆库 */
+internal fun recallMemory(query: String): ToolExecResult {
+    val q = query.trim()
+    if (q.isEmpty()) return ToolExecResult(false, "参数错误：缺少 query（要检索的关键词）")
+    val file = AppCtx.memoryFile()
+        ?: return ToolExecResult(false, "记忆库不可用：App 上下文还没初始化（需要重启 App）")
+    return try {
+        val all = MemoryStore.load(file)
+        if (all.isEmpty()) {
+            ToolExecResult(true, "记忆库还是空的，没有可用的长期记忆。")
+        } else {
+            val hits = MemoryStore.rank(all, q, MEMORY_RECALL_LIMIT)
+            ToolExecResult(true, MemoryStore.formatRecall(hits, q))
+        }
+    } catch (e: Exception) {
+        ToolExecResult(false, "检索记忆库失败：${e.javaClass.simpleName}: ${e.message}")
     }
 }
 

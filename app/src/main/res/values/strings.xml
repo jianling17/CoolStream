@@ -253,4 +253,19 @@
     <string name="accessibility_service_description">开启后，CoolStream 可读取屏幕上的控件信息并模拟点击、滑动，替你完成发送消息、翻页等自动化操作。不会在后台读取输入密码框内容。</string>
     <string name="accessibility_automation">无障碍自动化服务</string>
     <string name="accessibility_automation_off">未开启，点击跳转系统设置</string>
+    <!-- v1.5.0 模块一：长期记忆库 -->
+    <string name="section_memory">AI 记忆库</string>
+    <string name="label_memory_bank">长期记忆</string>
+    <string name="memory_title">AI 记忆库</string>
+    <string name="memory_count">%1$d 条</string>
+    <string name="memory_loading">正在读取…</string>
+    <string name="memory_empty">还没有任何记忆。
+
+当你在对话里告诉 AI 你的偏好、习惯或项目背景，它会自动记到这里；也可以让它「记住……」。</string>
+    <string name="memory_hint">这些内容会在需要时提供给 AI 作为背景。</string>
+    <string name="memory_deleted">已删除</string>
+    <string name="memory_delete">删除</string>
+    <string name="memory_add_title">手动添加记忆</string>
+    <string name="memory_add_hint">例如：我是小王，住在杭州，习惯用 Kotlin 写 Android</string>
+    <string name="memory_delete_failed">删除失败</string>
 </resources>

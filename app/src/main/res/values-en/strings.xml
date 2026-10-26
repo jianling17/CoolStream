@@ -253,4 +253,19 @@
     <string name="accessibility_service_description">When enabled, CoolStream can read on-screen control information and simulate taps and swipes to automate sending messages, paging, and other actions for you. It does not read password input fields in the background.</string>
     <string name="accessibility_automation">Accessibility Automation</string>
     <string name="accessibility_automation_off">Not enabled, tap to open system settings</string>
+    <!-- v1.5.0 module 1: long-term memory -->
+    <string name="section_memory">AI Memory</string>
+    <string name="label_memory_bank">Long-term memory</string>
+    <string name="memory_title">AI Memory</string>
+    <string name="memory_count">%1$d</string>
+    <string name="memory_loading">Loading…</string>
+    <string name="memory_empty">No memories yet.
+
+Tell the AI your preferences, habits or project background and it will save them here automatically — or just say “remember this”.</string>
+    <string name="memory_hint">These entries are provided to the AI as background when needed.</string>
+    <string name="memory_deleted">Deleted</string>
+    <string name="memory_delete">Delete</string>
+    <string name="memory_add_title">Add a memory</string>
+    <string name="memory_add_hint">e.g. I am Alex, I live in Berlin and write Android in Kotlin</string>
+    <string name="memory_delete_failed">Delete failed</string>
 </resources>

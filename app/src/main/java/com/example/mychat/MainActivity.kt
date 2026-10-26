@@ -447,6 +447,22 @@ internal const val FORCE_TODO_REMINDER =
         "★ 进度发生变化时，必须再调用一次 todo 并重发【完整清单】，不能只在正文里说「已更新」。"
 
 /**
+ * v1.5.0 模块一：长期记忆死命令。
+ *
+ * 为什么要写成死命令而不是建议：模型的默认行为是把用户说的偏好
+ * 「记在心里」——可它没有心里，这一轮对话一结束就全忘了。
+ * 只有逼它真的调 save_memory，记忆才落到磁盘上。
+ *
+ * 为什么还要强调「不要假装记得」：不写这一句，模型会嘴上说
+ * 「我记得你说过……」然后编一段没存过的内容，比忘掉更糟。
+ */
+internal const val MEMORY_RULE =
+    "用户一旦告诉你他的偏好、习惯、身份信息、或某个项目长期有用的背景，你必须立刻调用 save_memory 把它记下来，" +
+        "不能只在回复里说一句「好的我记住了」——对话会被清空，只有记忆库里的内容会留下来。" +
+        "回答涉及用户个人情况、历史约定或既有项目背景的问题前，如果觉得需要背景，先调用 recall_memory 检索一次；" +
+        "记忆库里没有的内容，如实说没有记录或直接问用户，严禁假装记得、严禁编造。"
+
+/**
  * 实际发给模型的系统提示词 = 预设基础提示词 + 当前运行时的约束。
  *
  * 工作区和工具开关都是**运行时**才确定的（用户在设置页里选的），
@@ -475,6 +491,7 @@ private fun systemPromptWithWorkspace(): String {
             append("\n4. ").append(REALTIME_SEARCH_RULE)
             append("\n5. ").append(TODO_RULE)
             append("\n6. ").append(FORCE_TODO_REMINDER)
+            append("\n7. ").append(MEMORY_RULE)
         }
 
         // ---------- 标准：原样保留，一个字符都不改 ----------
@@ -501,6 +518,7 @@ private fun systemPromptWithWorkspace(): String {
                 append("\n15. ").append(REALTIME_SEARCH_RULE)
                 append("\n16. ").append(TODO_RULE)
                 append("\n17. ").append(FORCE_TODO_REMINDER)
+                append("\n18. ").append(MEMORY_RULE)
             }
         }
     }
@@ -1699,6 +1717,40 @@ private const val TOOL_DEFINITIONS = """
         }
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "save_memory",
+      "description": "把一条值得长期记住的信息写入记忆库（用户偏好、习惯、项目背景、约定等）。★ 用户一旦告诉你他的偏好、习惯、或某个项目的长期背景，必须立刻调用本工具记下来，不要只在对话里回一句「好的我记住了」——对话会被清空，记忆库不会。同一条信息不要重复记录。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "要记住的内容，一句话说清，越具体越好，例如「用户叫小王，住在杭州，习惯用 Kotlin 写 Android」"
+          }
+        },
+        "required": ["content"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "recall_memory",
+      "description": "在记忆库里模糊检索以前存下的信息。★ 回答涉及用户个人情况、偏好、历史约定或项目背景的问题前，先调用本工具查一下，不要凭空猜测或反复追问用户已经说过的信息。检索不到就如实说没有记录，不要编造。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "检索关键词，用自然语言描述你要找什么，例如「用户的编程语言偏好」或「项目部署方式」"
+          }
+        },
+        "required": ["query"]
+      }
+    }
   }
 ]
 """
@@ -2005,6 +2057,8 @@ internal val ALL_TOOL_NAMES = listOf(
     "semantic_search",
     // ★ v1.4.0 战役一：任务规划清单。纯内存运算，不碰文件/网络/系统。
     "todo",
+    // ★ v1.5.0 模块一：长期记忆。读写的是 App 私有目录里的 memory.json，不碰网络、不花钱。
+    "save_memory", "recall_memory",
     // ★ v1.1 阶段三新增。排 web_search 后面：它不碰手机、也不花钱，
     //   但要「暂停等用户输入」，性质和前七个都不同，放在最后单独一组。
     "ask_user"
@@ -2034,6 +2088,8 @@ private val TOOL_DESCRIPTIONS = mapOf(
     "regex_extract" to "用正则表达式从文本中提取匹配内容",
     "todo" to "列出/更新任务计划清单。要输出计划/任务清单/进度时必须用它，禁止用 Markdown 表格或列表罗列。每次调用都要重发完整清单（全量覆盖），只发变化的部分会让卡片丢步骤",
     "semantic_search" to "按语义搜索工作区文件（TF-IDF 相似度，按意思搜而非关键字）",
+    "save_memory" to "把用户偏好/习惯/项目背景写进长期记忆库（本地 memory.json）",
+    "recall_memory" to "在长期记忆库里模糊检索以前存下的信息",
     "ask_user" to "向用户提出问题并等待回答（不花钱，会暂停对话）"
 )
 
@@ -3222,6 +3278,9 @@ class MainActivity : ComponentActivity() {
         Log.d(TAG, "App started")
 
         enableEdgeToEdge()
+
+        // 记忆库要写文件，而 executeTool 拿不到 Context，这里注入一次全局持有者
+        AppCtx.install(this)
 
         // 设置要在第一次重组之前读出来，否则会先按默认主题渲染一帧再跳变
         loadAppSettings(this)
@@ -5995,6 +6054,15 @@ fun SettingsScreen(
     val cs = MaterialTheme.colorScheme
     val context = LocalContext.current
 
+    // v1.5.0 模块一：记忆库是设置页下的二级页面。
+    // 用一个布尔状态整页替换，而不是塞进 TabRow ——
+    // 记忆列表可能很长，塞进通用 Tab 会把别的设置项挤到很下面。
+    var showMemory by remember { mutableStateOf(false) }
+    if (showMemory) {
+        MemoryScreen(onBack = { showMemory = false })
+        return
+    }
+
     // 系统返回键 = 关闭设置页
     BackHandler(onBack = onBack)
 
@@ -6083,7 +6151,8 @@ fun SettingsScreen(
                     context = context,
                     workspace = workspace,
                     shizukuGranted = shizukuGranted,
-                    onPickWorkspace = { folderPicker.launch(null) }
+                    onPickWorkspace = { folderPicker.launch(null) },
+                    onOpenMemory = { showMemory = true }
                 )
                 1 -> ModelTab()
                 2 -> PluginsTab()
@@ -6099,7 +6168,8 @@ private fun GeneralTab(
     context: Context,
     workspace: String,
     shizukuGranted: Boolean,
-    onPickWorkspace: () -> Unit
+    onPickWorkspace: () -> Unit,
+    onOpenMemory: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
 
@@ -6238,6 +6308,26 @@ private fun GeneralTab(
                     color = if (workspace.isBlank()) cs.onSurfaceVariant else Color(0xFF3FB950)
                 )
             }
+        }
+
+        // ---------- AI 记忆库（v1.5.0 模块一） ----------
+        item { SectionHeader(stringResource(R.string.section_memory)) }
+        item {
+            // 条数是磁盘上的真实数据，读取必须在 IO 线程；
+            // 用 resumeTick 当 key：从记忆库页返回、或从系统设置切回来都会重新数一遍。
+            var memCount by remember { mutableIntStateOf(0) }
+            LaunchedEffect(resumeTick) {
+                memCount = withContext(Dispatchers.IO) {
+                    val f = AppCtx.memoryFile()
+                    if (f == null) 0 else MemoryStore.load(f).size
+                }
+            }
+            PermissionRow(
+                label = stringResource(R.string.label_memory_bank),
+                status = stringResource(R.string.memory_count, memCount),
+                ok = memCount > 0,
+                onClick = onOpenMemory
+            )
         }
 
         item { SectionHeader(stringResource(R.string.section_permission)) }
@@ -7127,6 +7217,233 @@ private fun InfoRow(label: String, value: String) {
  * 设置页里的「权限」一行：左边名字，右边状态，整行可点。
  * 点一下直达对应的授权页（比让用户自己去系统设置里翻可靠得多）。
  */
+// ============================================================
+// AI 记忆库（v1.5.0 模块一）
+//
+// 只做三件事：把 memory.json 读出来展示、支持单条删除、空库时给一句说明。
+// 所有磁盘 IO 都在 Dispatchers.IO 上 —— 列表可能有几百条，
+// 在主线程 readText 会让进入这一页明显卡一下。
+// ============================================================
+@Composable
+private fun MemoryScreen(onBack: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var list by remember { mutableStateOf<List<MemoryItem>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var tick by remember { mutableIntStateOf(0) }
+    // 手动添加（v1.5.0 模块一要求）：模型没记住的东西，用户自己补一条
+    var showAdd by remember { mutableStateOf(false) }
+    var draft by remember { mutableStateOf("") }
+
+    BackHandler(onBack = onBack)
+
+    // tick 是刷新信号：删除成功 +1 → 重新读一遍文件，界面跟着变。
+    LaunchedEffect(tick) {
+        loading = true
+        list = withContext(Dispatchers.IO) {
+            val f = AppCtx.memoryFile() ?: return@withContext emptyList<MemoryItem>()
+            MemoryStore.load(f).sortedByDescending { it.createdAt }
+        }
+        loading = false
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = cs.background,
+        contentColor = cs.onBackground
+    ) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 6.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = stringResource(R.string.action_back),
+                        tint = cs.onSurface
+                    )
+                }
+                Text(
+                    text = stringResource(R.string.memory_title),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = cs.onSurface,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = stringResource(R.string.memory_count, list.size),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurfaceVariant
+                )
+                IconButton(onClick = { showAdd = true }) {
+                    Icon(
+                        imageVector = Icons.Filled.Add,
+                        contentDescription = stringResource(R.string.memory_add_title),
+                        tint = cs.onSurface,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
+            if (showAdd) {
+                AlertDialog(
+                    onDismissRequest = { showAdd = false },
+                    title = {
+                        Text(
+                            text = stringResource(R.string.memory_add_title),
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                    },
+                    text = {
+                        OutlinedTextField(
+                            value = draft,
+                            onValueChange = { draft = it },
+                            placeholder = {
+                                Text(
+                                    text = stringResource(R.string.memory_add_hint),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            },
+                            textStyle = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(
+                            enabled = draft.isNotBlank(),
+                            onClick = {
+                                val text = draft
+                                showAdd = false
+                                draft = ""
+                                // 写盘在 IO 线程；写完 tick+1 触发列表重读
+                                scope.launch {
+                                    withContext(Dispatchers.IO) {
+                                        AppCtx.memoryFile()?.let { MemoryStore.append(it, text) }
+                                    }
+                                    tick++
+                                }
+                            }
+                        ) { Text(stringResource(R.string.action_save)) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showAdd = false; draft = "" }) {
+                            Text(stringResource(R.string.action_cancel))
+                        }
+                    }
+                )
+            }
+
+            when {
+                loading -> MemoryCenterHint(stringResource(R.string.memory_loading))
+                list.isEmpty() -> MemoryCenterHint(stringResource(R.string.memory_empty))
+                else -> LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp)
+                ) {
+                    item {
+                        Text(
+                            text = stringResource(R.string.memory_hint),
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = cs.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                    }
+                    items(list, key = { it.id }) { item ->
+                        MemoryRow(
+                            item = item,
+                            onDelete = {
+                                scope.launch {
+                                    val ok = withContext(Dispatchers.IO) {
+                                        val f = AppCtx.memoryFile()
+                                        f != null && MemoryStore.delete(f, item.id)
+                                    }
+                                    Toast.makeText(
+                                        context,
+                                        if (ok) context.getString(R.string.memory_deleted)
+                                        else context.getString(R.string.memory_delete_failed),
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    if (ok) tick++
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MemoryCenterHint(text: String) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(
+            text = text,
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(32.dp)
+        )
+    }
+}
+
+@Composable
+private fun MemoryRow(item: MemoryItem, onDelete: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 8.dp),
+        color = cs.surfaceVariant.copy(alpha = 0.35f),
+        shape = RoundedCornerShape(10.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 12.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = item.content,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = cs.onSurface
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = MemoryStore.formatTime(item.createdAt),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = cs.onSurfaceVariant
+                )
+            }
+            IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = stringResource(R.string.memory_delete),
+                    tint = Color(0xFFF85149),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun PermissionRow(
     label: String,
