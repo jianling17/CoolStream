@@ -614,3 +614,9 @@ compileDebugKotlin 0 error 0 warning；testDebugUnitTest **320 条 0 失败**；
    release 未开，保持安全默认。
 3. MCP 端点 URL：App 把 RPC POST 到用户填的原样 URL，自建测试 server 需在 /sse
    同路径接受 POST（或使用支持 Streamable HTTP 的 server）。
+
+## 死命令
+
+1. 所有 Release 发版包，必须自动或手动重命名为 CoolStream_v{版本号}.apk
+   （如 CoolStream_v1.5.0.apk）。build.gradle.kts 的 applicationVariants.all
+   已做自动重命名；若手动打非标准包，发版前必须重命名后再交接。

@@ -207,6 +207,18 @@ android {
         // Shizuku 的提权执行要走 UserService，必须用 AIDL 定义跨进程接口
         aidl = true
     }
+
+    // 发版包自动重命名：CoolStream_v{版本号}.apk（如 CoolStream_v1.5.0.apk）。
+    // 版本号取 appBaseVersion（versionName 是 "1.5.0+build.xxx"，+ 之后是时间戳，不带进文件名）。
+    applicationVariants.all {
+        val base = versionName.substringBefore('+')
+        outputs.all {
+            val out = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
+            if (outputFileName.endsWith(".apk")) {
+                outputFileName = "CoolStream_v" + base + ".apk"
+            }
+        }
+    }
 }
 
 dependencies {
