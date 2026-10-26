@@ -690,6 +690,35 @@ private fun hasAllFilesAccess(context: Context): Boolean {
     }
 }
 
+/**
+ * 安全打开外部链接（更新弹窗 / 关于页的 GitHub、蓝奏云跳转）。
+ *
+ * 三个坑一起防：
+ *  ① 界面层的 context 是 withAppLocale() 包装过的 createConfigurationContext()，
+ *     没有 Activity 任务栈，直接 startActivity 会抛 AndroidRuntimeException ——
+ *     必须 FLAG_ACTIVITY_NEW_TASK（同 openAllFilesAccessSettings 的注释）。
+ *  ② URL 为空/缺 scheme（http:// https://）时 Uri.parse 照样成功，
+ *     但 startActivity 会抛 ActivityNotFoundException —— 先校验。
+ *  ③ ROM 裁剪了浏览器时同样 ActivityNotFoundException —— try-catch 兜底，弹 Toast 而不是闪退。
+ */
+internal fun openUrlSafely(context: Context, rawUrl: String) {
+    val url = rawUrl.trim()
+    val usable = url.startsWith("http://") || url.startsWith("https://")
+    if (!usable) {
+        Log.w(TAG, "openUrlSafely: 非法链接，拒绝跳转: " + url.take(80))
+        Toast.makeText(context, "链接无效，无法跳转", Toast.LENGTH_SHORT).show()
+        return
+    }
+    try {
+        val intent = Intent(Intent.ACTION_VIEW, url.toUri())
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        Log.e(TAG, "openUrlSafely: 跳转失败", e)
+        Toast.makeText(context, "未找到可用的浏览器，无法打开链接", Toast.LENGTH_SHORT).show()
+    }
+}
+
 private fun openAllFilesAccessSettings(context: Context) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
 
@@ -4234,16 +4263,14 @@ fun ChatScreen() {
                         },
                         confirmButton = {
                             TextButton(onClick = {
-                                val intent = Intent(Intent.ACTION_VIEW, info.githubUrl.toUri())
-                                context.startActivity(intent)
+                                openUrlSafely(context, info.githubUrl)
                             }) {
                                 Text(stringResource(R.string.update_download_github))
                             }
                         },
                         dismissButton = {
                             TextButton(onClick = {
-                                val intent = Intent(Intent.ACTION_VIEW, info.lanzouUrl.toUri())
-                                context.startActivity(intent)
+                                openUrlSafely(context, info.lanzouUrl)
                             }) {
                                 Text(stringResource(R.string.update_download_lanzou))
                             }
@@ -6803,12 +6830,12 @@ private fun AboutTab() {
                 ) {
                     OutlinedButton(
                         onClick = {
-                            ctx.startActivity(Intent(Intent.ACTION_VIEW, info.githubUrl.toUri()))
+                            openUrlSafely(ctx, info.githubUrl)
                         }
                     ) { Text(strGithub, style = MaterialTheme.typography.labelSmall) }
                     OutlinedButton(
                         onClick = {
-                            ctx.startActivity(Intent(Intent.ACTION_VIEW, info.lanzouUrl.toUri()))
+                            openUrlSafely(ctx, info.lanzouUrl)
                         }
                     ) { Text(strLanzou, style = MaterialTheme.typography.labelSmall) }
                 }
