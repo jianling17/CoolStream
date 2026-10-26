@@ -3444,7 +3444,6 @@ private const val DRAWER_WIDTH_FRACTION = 0.78f      // 侧边栏宽度 = 屏宽
 private const val DRAWER_SLIDE_EXTRA = 1.35f         // 抽屉行程放大系数（制造视差）
 private const val DRAWER_CONTENT_MIN_SCALE = 0.92f   // 主内容最小缩放
 private const val DRAWER_SCRIM_MAX_ALPHA = 0.30f     // 遮罩最大不透明度
-private const val DRAWER_EDGE_FRACTION = 0.16f       // 关闭态下可从左边缘起手的宽度占比
 
 private val DRAWER_CORNER = 22.dp                    // 主内容最大圆角
 private val DRAWER_SHADOW = 24.dp                    // 主内容最大阴影
@@ -3514,24 +3513,26 @@ internal fun ParallaxNavigationDrawer(
     ) {
         val drawerWidth = maxWidth * drawerWidthFraction
         val drawerWidthPx = with(LocalDensity.current) { drawerWidth.toPx() }
-        val edgePx = with(LocalDensity.current) { (maxWidth * DRAWER_EDGE_FRACTION).toPx() }
-
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 // Initial pass：在手势到达任何子组件之前先看一遍。
                 // 只有判定为横向拖动时才 consume，纵向滚动照旧交给聊天列表。
-                .pointerInput(drawerWidthPx, edgePx) {
+                .pointerInput(drawerWidthPx) {
                     awaitEachGesture {
                         val down = awaitFirstDown(
                             requireUnconsumed = false,
                             pass = PointerEventPass.Initial,
                         )
                         val startProgress = drawerState.progress
-                        val fromEdge = down.position.x <= edgePx
-                        // 关着的时候只有从左边缘起手才算拉抽屉，
-                        // 否则聊天区里的横向滑动会被误判成手势。
-                        if (startProgress <= 0.001f && !fromEdge) return@awaitEachGesture
+                        // v1.5.0 补丁：取消左边缘起手限制，全屏任意位置右滑都能拉出侧边栏。
+                        // 防误触完全交给下面的方向锁（Axis Lock）：横向拖动才拦截，
+                        // 纵向立刻撒手把事件还给聊天列表，代码块横向滚动同理。
+                        // 右缘起手时系统返回手势也监听同一片区域，横向拖动本身不冲突；
+                        // 真正的返回（快速短滑）速度方向相反，settle 会把它关回去。
+                        // 右缘起手加非线性阻尼：像弹簧拉扯，越靠右越「重」。
+                        val screenWpx = size.width.toFloat()
+                        val damped = down.position.x > screenWpx * 0.7f
 
                         val tracker = VelocityTracker()
                         tracker.addPosition(down.uptimeMillis, down.position)
@@ -3559,7 +3560,8 @@ internal fun ParallaxNavigationDrawer(
                             }
                             if (locked == true) {
                                 change.consume()
-                                drawerState.dragTo(startProgress + accX / drawerWidthPx)
+                                val effWidth = if (damped) drawerWidthPx * 1.6f else drawerWidthPx
+                                drawerState.dragTo(startProgress + accX / effWidth)
                             }
                         }
 
