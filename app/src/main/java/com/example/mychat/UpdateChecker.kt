@@ -59,7 +59,8 @@ suspend fun checkGitHubRelease(currentVersion: String): UpdateInfo? = withContex
             val title = json.optString("name", latestVer)
             val notes = json.optString("body", "")
             val htmlUrl = json.optString("html_url", "https://github.com/jianling17/CoolStream/releases")
-            val lanzou = "https://wwbbn.lanzouw.com/i5hX94dguj3g"
+            // 蓝奏云提取码：1111（App 内无提取码 UI，发版公告时需随链接公布）
+            val lanzou = "https://wwbbn.lanzouw.com/imKSR4dgxyhi"
 
             Log.d("UpdateChecker", "发现新版本: " + latestVer + " (当前 " + currentVersion + ")")
             UpdateInfo(latestVer, title, notes, htmlUrl, lanzou)
