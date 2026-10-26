@@ -1691,6 +1691,10 @@ internal fun runCode(code: String): ToolExecResult {
         ScriptableObject.putProperty(tools, "webSearch", jsHostFunction { _, _, a ->
             invoke("web_search", JSONObject().put("query", jsArgStr(a, 0)))
         })
+        // ★ v1.5.0 模块二：网页正文提取，同样是宿主函数（请求在 Java 层发出）。
+        ScriptableObject.putProperty(tools, "webFetch", jsHostFunction { _, _, a ->
+            invoke("web_fetch", JSONObject().put("url", jsArgStr(a, 0)))
+        })
         // ★ v1.4 无障碍：操作手机屏幕。
         //   同样走宿主函数 —— 真正的点击发生在 Java 层（AccessibilityService），
         //   脚本拿到的只是一个 {ok, output} 字符串结果。
@@ -2198,6 +2202,18 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                     ToolExecResult(false, "参数错误：缺少 query（要搜索的关键词）")
                 } else {
                     webSearch(query)
+                }
+            }
+
+            // ★ v1.5.0 模块二：网页正文深度提取。
+            //   url 绝不能过 cleanPath —— 它会削掉首尾的引号/斜杠，
+            //   而网址末尾的斜杠、带引号的链接都是合法的。
+            "web_fetch" -> {
+                val url = argOf(argsJson, "url")
+                if (url.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 url（要读取的网址）")
+                } else {
+                    webFetch(url)
                 }
             }
 

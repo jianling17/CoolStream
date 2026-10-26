@@ -463,6 +463,21 @@ internal const val MEMORY_RULE =
         "记忆库里没有的内容，如实说没有记录或直接问用户，严禁假装记得、严禁编造。"
 
 /**
+ * v1.5.0 模块二：网页正文深读死命令。
+ *
+ * 为什么必须写死：模型看到 web_search 的摘要就当作读过了全文，
+ * 摘要本身是二次加工过的，遇到「原文到底怎么说的」这类问题会直接答错。
+ * 反过来，也要堵住「抓取失败就反复重试同一个链接」这条死路 ——
+ * 需要登录或被反爬拦住的页面，重试一百次也不会成功。
+ */
+internal const val WEB_FETCH_RULE =
+    "当用户发给你一个网址，或者你需要读懂 web_search 结果里的某篇文章时，必须调用 web_fetch 读全文再回答；" +
+        "只凭搜索摘要就下结论，遇到「原文怎么说的」这类问题一定出错。" +
+        "web_fetch 返回的是已过滤脚本和样式的正文（最多 5000 字）；" +
+        "如果它说页面为空、超时或抓取失败，不要反复重试同一个链接，" +
+        "换一个来源，或者直接用摘要回答并明确告诉用户「只看到了摘要」。"
+
+/**
  * 实际发给模型的系统提示词 = 预设基础提示词 + 当前运行时的约束。
  *
  * 工作区和工具开关都是**运行时**才确定的（用户在设置页里选的），
@@ -492,6 +507,7 @@ private fun systemPromptWithWorkspace(): String {
             append("\n5. ").append(TODO_RULE)
             append("\n6. ").append(FORCE_TODO_REMINDER)
             append("\n7. ").append(MEMORY_RULE)
+            append("\n8. ").append(WEB_FETCH_RULE)
         }
 
         // ---------- 标准：原样保留，一个字符都不改 ----------
@@ -519,6 +535,7 @@ private fun systemPromptWithWorkspace(): String {
                 append("\n16. ").append(TODO_RULE)
                 append("\n17. ").append(FORCE_TODO_REMINDER)
                 append("\n18. ").append(MEMORY_RULE)
+                append("\n19. ").append(WEB_FETCH_RULE)
             }
         }
     }
@@ -1606,6 +1623,23 @@ private const val TOOL_DEFINITIONS = """
   {
     "type": "function",
     "function": {
+      "name": "web_fetch",
+      "description": "抓取一个网页并返回它的正文纯文本（已过滤脚本/样式，最多 5000 字）。当用户发给你一个网址、或者 web_search 的结果里有看起来值得细读的链接时，用它读懂全文再回答；只拿到搜索摘要就下结论容易断章取义。抓取失败（需要登录、要靠 JavaScript 渲染、被反爬拦住）时不要重试同一个链接，换来源或直接用摘要回答。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "要读取的完整网址，必须以 http:// 或 https:// 开头"
+          }
+        },
+        "required": ["url"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "ask_user",
       "description": "向用户提出一个问题并等待回答。当你缺少关键信息（目标路径、格式偏好、确认意图等）而无法继续时调用它；question 写一句话、说清需要用户提供什么。用户回答后你会收到答案并继续；用户取消则返回「用户取消了操作」。不要用它汇报进度或自问自答。",
       "parameters": {
@@ -2051,6 +2085,8 @@ internal val ALL_TOOL_NAMES = listOf(
     // ★ v1.1 新增。放在最后不是随便排的：前面都是「动手机上的东西」，
     //   只有它一个是要花钱联网的，单独排在末尾，设置页里一眼就能看出区别。
     "web_search",
+    // ★ v1.5.0 模块二：网页正文提取。和 web_search 一样要联网，但不需要 API Key、不花钱。
+    "web_fetch",
     // ★ v1.2.0 战役六：本地极客工具（不花钱、不碰网络）。
     "sqlite_query", "regex_extract",
     // ★ v1.2.0 本地语义检索（TF-IDF，按"意思"搜，区别于 search_workspace 的关键字匹配）。
@@ -2084,6 +2120,7 @@ private val TOOL_DESCRIPTIONS = mapOf(
     // ★ 说明里要写清「要花钱」，否则用户会以为和别的工具一样是免费的本地操作。
     //   官方单价：每 1000 次成功请求 5 元（失败和空结果不计费）。
     "web_search" to "联网搜索网页（走 内置默认服务搜索接口，每次约 ¥0.005）",
+    "web_fetch" to "抓取网页正文纯文本（过滤脚本样式，最多 5000 字，不花钱）",
     "sqlite_query" to "查询工作区 SQLite 数据库（只读，仅支持 SELECT）",
     "regex_extract" to "用正则表达式从文本中提取匹配内容",
     "todo" to "列出/更新任务计划清单。要输出计划/任务清单/进度时必须用它，禁止用 Markdown 表格或列表罗列。每次调用都要重发完整清单（全量覆盖），只发变化的部分会让卡片丢步骤",
