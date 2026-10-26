@@ -250,6 +250,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
@@ -7974,6 +7975,10 @@ internal sealed interface MdBlock {
     data class Table(val header: List<String>, val rows: List<List<String>>) : MdBlock
     /** ★ v1.4.0 战役二：$$ ... $$ 包裹的块级公式 */
     data class Formula(val text: String) : MdBlock
+    /** ★ v1.5.0 模块三：无序/有序列表（连续行合并成一个块，items 是剥掉标记后的内容） */
+    data class ListItem(val ordered: Boolean, val items: List<String>) : MdBlock
+    /** ★ v1.5.0 模块三：引用块（连续 > 行合并，每行剥掉 > 前缀） */
+    data class Quote(val text: String) : MdBlock
 }
 
 /**
@@ -8027,6 +8032,40 @@ private fun padCells(cells: List<String>, cols: Int): List<String> =
  *   空行           段落分隔
  *   **粗体**       行内加粗（在渲染阶段处理）
  */
+/** ★ v1.5.0 模块三：识别无序列表行 `- x` / `* x` / `+ x`，返回剥掉标记后的内容；不是列表行返回 null */
+internal fun unorderedItemOf(line: String): String? {
+    val t = line.trimStart()
+    if (t.length < 2) return null
+    val c = t[0]
+    if (c != '-' && c != '*' && c != '+') return null
+    // 标记后必须跟空格，且不能是 --- 分割线 / ** 加粗开头这类
+    if (t[1] != ' ' && t[1] != '\t') return null
+    val body = t.substring(2).trim()
+    return body.ifEmpty { null }
+}
+
+/** ★ v1.5.0 模块三：识别有序列表行 `1. x` / `12) x`，返回 Pair(编号文本, 内容)；不是返回 null */
+internal fun orderedItemOf(line: String): Pair<String, String>? {
+    val t = line.trimStart()
+    var i = 0
+    while (i < t.length && t[i] in '0'..'9') i++
+    if (i == 0 || i >= t.length) return null
+    val sep = t[i]
+    if (sep != '.' && sep != ')') return null
+    if (i + 1 >= t.length || (t[i + 1] != ' ' && t[i + 1] != '\t')) return null
+    val body = t.substring(i + 2).trim()
+    if (body.isEmpty()) return null
+    return Pair(t.substring(0, i), body)
+}
+
+/** ★ v1.5.0 模块三：识别引用行 `> x`（允许 > 后没空格），返回内容；不是返回 null */
+internal fun quoteLineOf(line: String): String? {
+    val t = line.trimStart()
+    if (!t.startsWith(">")) return null
+    val body = t.substring(1).removePrefix(" ").trim()
+    return body
+}
+
 internal fun parseMarkdown(src: String): List<MdBlock> {
     val out = ArrayList<MdBlock>()
     val lines = src.replace("\r\n", "\n").split('\n')
@@ -8140,6 +8179,59 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
         if (hashes in 1..3 && trimmed.length > hashes && trimmed[hashes] == ' ') {
             flushParagraph()
             out.add(MdBlock.Heading(hashes, trimmed.substring(hashes + 1).trim()))
+            continue
+        }
+
+        // ---------- 列表（连续行合并成一个块）----------
+        // 判定顺序：无序在前（`-` 开头），有序在后（数字开头）。
+        // 同一类列表的连续行归一个块；类别切换或遇到非列表行就收块。
+        val uItem = unorderedItemOf(noTrail)
+        if (uItem != null) {
+            flushParagraph()
+            val items = ArrayList<String>()
+            items.add(uItem)
+            var k = idx + 1
+            while (k < lines.size) {
+                val next = unorderedItemOf(lines[k].trimEnd())
+                // 有序行混进来就断开，交给下一轮识别成有序列表
+                if (next == null || orderedItemOf(lines[k].trimEnd()) != null) break
+                items.add(next)
+                k++
+            }
+            skipUntil = k - 1
+            out.add(MdBlock.ListItem(ordered = false, items = items))
+            continue
+        }
+        val oItem = orderedItemOf(noTrail)
+        if (oItem != null) {
+            flushParagraph()
+            val items = ArrayList<String>()
+            items.add(oItem.second)
+            var k = idx + 1
+            while (k < lines.size) {
+                val next = orderedItemOf(lines[k].trimEnd())
+                if (next == null || unorderedItemOf(lines[k].trimEnd()) != null) break
+                items.add(next.second)
+                k++
+            }
+            skipUntil = k - 1
+            out.add(MdBlock.ListItem(ordered = true, items = items))
+            continue
+        }
+
+        // ---------- 引用块（连续 > 行合并）----------
+        val qLine = quoteLineOf(noTrail)
+        if (qLine != null) {
+            flushParagraph()
+            val q = StringBuilder(qLine)
+            var k = idx + 1
+            while (k < lines.size) {
+                val next = quoteLineOf(lines[k].trimEnd()) ?: break
+                q.append('\n').append(next)
+                k++
+            }
+            skipUntil = k - 1
+            out.add(MdBlock.Quote(q.toString()))
             continue
         }
 
@@ -8275,6 +8367,46 @@ private fun MarkdownText(
                 is MdBlock.Formula -> FormulaBlock(block.text)
 
                 is MdBlock.Table -> MarkdownTable(block.header, block.rows)
+
+                is MdBlock.ListItem -> Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    block.items.forEachIndexed { n, item ->
+                        Row {
+                            Text(
+                                // 有序用编号，无序用实心圆点；minWidth 做悬挂缩进，
+                                // 换行时正文对齐到标记之后，不会顶到圆点底下
+                                text = if (block.ordered) (n + 1).toString() + "." else "•",
+                                color = TodoDoneColor.copy(alpha = 0.9f),
+                                fontWeight = if (block.ordered) FontWeight.Bold else FontWeight.Normal,
+                                modifier = Modifier.widthIn(min = if (block.ordered) 22.dp else 14.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = inlineFormat(item),
+                                color = textColor,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+                }
+
+                is MdBlock.Quote -> Row {
+                    // 极客绿竖线 + 文字变暗：引用一眼可辨，但不用重色块。
+                    // IntrinsicSize.Min 让 Row 取最高子项的高度，竖线随文字等高。
+                    Row(modifier = Modifier.height(IntrinsicSize.Min)) {
+                        Box(
+                            Modifier
+                                .width(3.dp)
+                                .fillMaxHeight()
+                                .background(TodoDoneColor.copy(alpha = 0.85f), RoundedCornerShape(1.5.dp))
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            text = inlineFormat(block.text),
+                            color = textColor.copy(alpha = 0.72f),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
             }
         }
     }
