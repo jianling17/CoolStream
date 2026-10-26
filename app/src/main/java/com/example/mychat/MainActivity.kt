@@ -941,6 +941,12 @@ interface ChatDao {
     /** 清空某个会话的全部消息（会话本身保留） */
     @Query("DELETE FROM messages WHERE sessionId = :sessionId")
     suspend fun deleteMessages(sessionId: String)
+
+    /** ★ v1.5.0 模块四：全文搜索 —— 返回消息正文命中关键词的所有会话 id（去重） */
+    @Query(
+        "SELECT DISTINCT sessionId FROM messages " +
+        "WHERE content LIKE '%' || :q || '%' AND type != 'TOOL_CALL'")
+    suspend fun searchSessionIdsByContent(q: String): List<String>
 }
 
 
@@ -3660,7 +3666,9 @@ data class SidebarSession(
 @Immutable
 data class SidebarState(
     val sessions: List<SidebarSession>,
-    val currentSessionId: String
+    val currentSessionId: String,
+    // ★ v1.5.0 模块四：消息正文命中当前搜索词的会话 id（含 snippet），标题命中不用记
+    val contentHits: Map<String, String> = emptyMap()
 )
 
 
@@ -4072,6 +4080,26 @@ fun ChatScreen() {
                             val result = exportSessionToMarkdown(messages, title)
                             Toast.makeText(context, result.output, Toast.LENGTH_LONG).show()
                         }
+                    },
+                    // ★ v1.5.0 模块四：正文全文搜索。Room 查询在调用方的 IO 调度器上跑，
+                    //   LIKE 的通配符与引号手工转义，防用户输入 % _ ' 破坏语义。
+                    searchContent = { q ->
+                        val escaped = q.replace("'", "''").replace("%", "\\%").replace("_", "\\_")
+                        val ids = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                            dao.searchSessionIdsByContent(escaped)
+                        }
+                        val hits = LinkedHashMap<String, String>()
+                        for (id in ids) {
+                            if (hits.size >= 20) break   // 侧边栏展示用，20 条足够
+                            val msgs = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                                dao.getMessages(id)
+                            }
+                            val raw = msgs.firstOrNull {
+                                it.type != MessageType.TOOL_CALL && it.content.contains(q, ignoreCase = true)
+                            }?.content ?: continue
+                            hits[id] = contentSnippet(raw, q)
+                        }
+                        hits
                     }
                 )
                 }
@@ -5039,7 +5067,9 @@ fun Sidebar(
     onRename: (String, String) -> Unit,
     onDelete: (String) -> Unit,
     onSettings: () -> Unit,
-    onExport: (String) -> Unit
+    onExport: (String) -> Unit,
+    // ★ v1.5.0 模块四：正文搜索。传 null（默认）则只搜标题，行为和旧版一致
+    searchContent: (suspend (String) -> Map<String, String>)? = null
 ) {
     val cs = MaterialTheme.colorScheme
 
@@ -5056,12 +5086,28 @@ fun Sidebar(
 
     // ★ 注意 remember 的 key 是 state.sessions（内容比较），
     //   不是整个 ChatSession。流式刷新不会让它重算。
-    val filtered = remember(state.sessions, query) {
+    // ★ v1.5.0 模块四：正文搜索结果（sessionId → snippet）。
+    // 200ms 防抖：等用户停手再查 Room，敲一个词不会触发一串查询。
+    var contentHits by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    LaunchedEffect(query, searchContent) {
+        val fn = searchContent ?: return@LaunchedEffect
+        val q = query.trim()
+        if (q.length < 2) {   // 单字太容易全表误中，至少两个字符才搜正文
+            contentHits = emptyMap()
+            return@LaunchedEffect
+        }
+        kotlinx.coroutines.delay(200)
+        contentHits = fn(q)
+    }
+
+    val filtered = remember(state.sessions, query, contentHits) {
         val q = query.trim()
         if (q.isEmpty()) {
             state.sessions
         } else {
-            state.sessions.filter { it.title.contains(q, ignoreCase = true) }
+            state.sessions.filter {
+                it.title.contains(q, ignoreCase = true) || contentHits.containsKey(it.id)
+            }
         }
     }
 
@@ -5167,6 +5213,8 @@ fun Sidebar(
                         items(groupItems, key = { it.id }) { session ->
                             SessionRow(
                                 title = session.title,
+                                // 正文命中时显示上下文片段（标题命中为空）
+                                snippet = contentHits[session.id] ?: "",
                                 selected = session.id == state.currentSessionId,
                                 onClick = { onSelect(session.id) },
                                 // 重命名要带出当前标题当初始值
@@ -5394,7 +5442,9 @@ private fun SessionRow(
     onClick: () -> Unit,
     onRename: () -> Unit,
     onDelete: () -> Unit,
-    onExport: () -> Unit
+    onExport: () -> Unit,
+    // ★ v1.5.0 模块四：正文搜索命中片段，空串不显示
+    snippet: String = ""
 ) {
     val cs = MaterialTheme.colorScheme
     var menuOpen by remember { mutableStateOf(false) }
@@ -5414,14 +5464,25 @@ private fun SessionRow(
                 .clickable(onClick = onClick)
                 .padding(start = 12.dp, end = 2.dp, top = 2.dp, bottom = 2.dp)
         ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.bodyMedium,
-                color = if (selected) cs.onSurface else cs.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (selected) cs.onSurface else cs.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (snippet.isNotEmpty()) {
+                    Text(
+                        text = snippet,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = cs.onSurfaceVariant.copy(alpha = 0.8f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 1.dp)
+                    )
+                }
+            }
             // 三点按钮只在选中态常亮，未选中时也占位，避免标题左右跳动
             Box {
                 IconButton(
@@ -8032,6 +8093,32 @@ private fun padCells(cells: List<String>, cols: Int): List<String> =
  *   空行           段落分隔
  *   **粗体**       行内加粗（在渲染阶段处理）
  */
+/**
+ * ★ v1.5.0 模块四：从正文里截一段包含关键词的上下文（侧边栏搜索命中预览）。
+ * 找不到关键词返回前 maxLen 个字符；命中位置太靠后时从命中处往前留一点开头，
+ * 并用 … 标记被截掉的部分。忽略大小写。
+ */
+internal fun contentSnippet(content: String, query: String, maxLen: Int = 60): String {
+    // 真实换行（10/13）与字面量反斜杠+n 都压成空格，snippet 永远单行
+    val flat = content
+        .replace(10.toChar(), ' ')
+        .replace(13.toChar(), ' ')
+        .replace(92.toChar() + "n", " ")
+        .replace(9.toChar(), ' ')
+    if (flat.isBlank()) return ""
+    val q = query.trim()
+    if (q.isEmpty()) return flat.take(maxLen).trim() + if (flat.length > maxLen) "…" else ""
+    val at = flat.indexOf(q, ignoreCase = true)
+    if (at < 0) return flat.take(maxLen).trim() + if (flat.length > maxLen) "…" else ""
+    // 命中点尽量居中：往前留 1/3 窗口
+    val back = (maxLen - q.length) / 3
+    val start = (at - back).coerceAtLeast(0)
+    val end = (start + maxLen).coerceAtMost(flat.length)
+    val prefix = if (start > 0) "…" else ""
+    val suffix = if (end < flat.length) "…" else ""
+    return prefix + flat.substring(start, end).trim() + suffix
+}
+
 /** ★ v1.5.0 模块三：识别无序列表行 `- x` / `* x` / `+ x`，返回剥掉标记后的内容；不是列表行返回 null */
 internal fun unorderedItemOf(line: String): String? {
     val t = line.trimStart()
