@@ -194,9 +194,12 @@ class LocalSemanticSearch(
             if (score < minScore) continue
             if (heap.size < k) {
                 heap.add(SearchHit(cachedChunks[i], score))
-            } else if (heap.peek().score < score) {
-                heap.poll()
-                heap.add(SearchHit(cachedChunks[i], score))
+            } else {
+                val top = heap.peek()
+                if (top != null && top.score < score) {
+                    heap.poll()
+                    heap.add(SearchHit(cachedChunks[i], score))
+                }
             }
         }
 

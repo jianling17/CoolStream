@@ -1010,215 +1010,6 @@ abstract class AppDatabase : RoomDatabase() {
 }
 
 
-// ============================================================
-// 2. 网络层：调用云端大模型流式 API
-//
-// ★ 多轮上下文：参数从"一句话"改成"整个对话历史"。
-//   每次请求都把之前的 user / assistant 消息按顺序一起发过去，
-//   模型才知道上一轮聊了什么。
-//
-// ★ 50ms 批处理在这里（IO 线程上）完成：只有真正要刷界面时才切主线程。
-//
-// 参数说明：
-//   history       —— 对话历史（已按时间顺序排好，最后一条是用户刚发的）
-//   onFlush(text) —— 每满 50ms（以及流结束时）回调一次，text 是"到目前为止的全部文本"
-//   onDone(total) —— 流正常结束
-//   onError(msg)  —— 出错
-//
-// ⚠️⚠️ 注意：这个函数现在【不再被界面调用】。
-//   界面已经改用 runAgentLoop（带 tools / tool_calls / 二次请求）。
-//   保留它有两个用处：
-//     ① 想跑"纯聊天、不带工具"的退化路径时可以直接换回来
-//     ② 作为最干净的 50ms 批处理参考实现
-//   所以你要是往这里加日志想看请求体，是看不到的 —— 请看 runAgentLoop。
-// ============================================================
-fun sendToCloudModel(
-    history: List<ChatMessage>,
-    scope: CoroutineScope,
-    onFlush: (String) -> Unit,
-    onDone: (totalChars: Int) -> Unit,
-    onError: (String) -> Unit
-) {
-    scope.launch(Dispatchers.IO) {
-        try {
-            // ---------- 1. 检查 API Key ----------
-            val apiKey = BuildConfig.BUILTIN_API_KEY
-            Log.d(TAG, "stream start: key length=${apiKey.length}, history=${history.size} messages")
-
-            if (apiKey.isBlank()) {
-                withContext(Dispatchers.Main) {
-                    onError("还没有配置 API Key。\n请到「设置 → 模型与 API」里填入，或者点这里重新走一遍引导。")
-                }
-                return@launch
-            }
-
-            // ---------- 2. ★★★ 把整个对话历史转成 API 格式 ★★★ ----------
-            val messagesArray = JSONArray()
-
-            // ① 系统提示词放最前面
-            if (SYSTEM_PROMPT.isNotEmpty()) {
-                messagesArray.put(JSONObject().apply {
-                    put("role", "system")
-                    put("content", SYSTEM_PROMPT)
-                })
-            }
-
-            // ② 历史消息按时间顺序排进去
-            //    isUser = true  → role = "user"      （我说的话）
-            //    isUser = false → role = "assistant" （AI 说的话）
-            var skippedError = 0
-            for (msg in history) {
-
-                // 空消息不发（比如流被中断时留下的空气泡）
-                if (msg.content.isBlank()) continue
-
-                // 错误提示不是 AI 的真实回复，不能当上下文发过去
-                if (msg.isError) {
-                    skippedError++
-                    continue
-                }
-
-                messagesArray.put(JSONObject().apply {
-                    put("role", if (msg.isUser) "user" else "assistant")
-                    // 带附件的消息在这里展开成数组 / 追加 read_file 指令
-                    put("content", contentForApi(msg))
-                })
-            }
-
-            Log.d(TAG, "history packed: ${messagesArray.length()} messages (skipped $skippedError error bubbles)")
-
-            val bodyJson = JSONObject().apply {
-                put("model", ApiConfig.model)
-                put("stream", true)
-                put("messages", messagesArray)
-
-                // ★★★ 关掉思考模式（仅内置服务）★★★
-                // 默认模型 的思考模式【默认开启】。开启后它会先吐一长串
-                // 思维链，而思维链分片里 content 字段是 JSON null
-                //（思维内容在 reasoning_content 字段里）。
-                // 那些 content=null 的分片，正是"满屏 nullnullnull"的源头之一。
-                // 关掉后：响应更快，且不会再有这种空分片。
-                // thinking 是 云端模型专有字段，第三方 provider 发了可能 400。
-                if (ApiConfig.provider == ApiProvider.BUILTIN) {
-                    put("thinking", JSONObject().put("type", "disabled"))
-                }
-            }.toString()
-
-            val request = Request.Builder()
-                .url(chatCompletionsUrl())
-                .addHeader("Authorization", "Bearer $apiKey")
-                .addHeader("Content-Type", "application/json")
-                .addHeader("Accept", "text/event-stream")
-                .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
-                .build()
-
-            // ---------- 3. 发出去，逐行读 ----------
-            val response = httpClient.newCall(request).execute()
-            Log.d(TAG, "response code=${response.code}")
-
-            if (!response.isSuccessful) {
-                val errBody = response.body?.string() ?: ""
-                Log.e(TAG, "HTTP error body: ${errBody.take(300)}")
-                withContext(Dispatchers.Main) { onError(httpErrorMessage(response.code, errBody)) }
-                return@launch
-            }
-
-            val bodyStream = response.body
-            if (bodyStream == null) {
-                withContext(Dispatchers.Main) { onError("服务器返回了空内容") }
-                return@launch
-            }
-
-            val reader = BufferedReader(InputStreamReader(bodyStream.byteStream()))
-
-            // ---------- 4. ★★★ 50ms 批处理的核心 ★★★ ----------
-            // StringBuilder：可变字符串缓冲区。
-            // 不用 String 拼接是因为 Kotlin 的 String 不可变，每次 a + b 都要
-            // 复制全部内容，攒到 1000 字时每个分片都要复制 1000 字，复杂度 O(n²)。
-            val buffer = StringBuilder()
-            var lastFlushAt = 0L      // 上次刷界面的时刻
-            var flushCount = 0        // 实际刷了多少次
-            var deltaCount = 0        // 收到多少个有效分片（= 不批处理时要刷多少次）
-            var nullContentCount = 0  // 被过滤掉的"content 不是字符串"分片数
-            var total = 0
-
-            while (true) {
-                // readLine() 返回 null 表示流结束
-                val line = reader.readLine() ?: break
-
-                // SSE 格式：有意义的行都以 "data:" 开头，其余（空行、注释、心跳）跳过
-                if (!line.startsWith("data:")) continue
-
-                val data = line.substring(5).trim()
-                if (data.isEmpty()) continue
-
-                // 服务端说"说完了"
-                if (data == "[DONE]") break
-
-                // 从这一行 JSON 里抠出文字。抠不出来（content 是 null 等）就跳过
-                val delta = parseDelta(data)
-                if (delta == null) {
-                    // ★ 诊断日志：只打印前 3 条，避免刷屏。
-                    //   如果这里数量很多，说明服务端一直在发 content=null 的分片，
-                    //   把打印出来的原始内容发我，就能确认原因。
-                    nullContentCount++
-                    if (nullContentCount <= 3) {
-                        Log.d(TAG, "skip chunk #$nullContentCount (content is not a String): ${data.take(200)}")
-                    }
-                    continue
-                }
-
-                deltaCount++
-                total += delta.length
-
-                // ① 无条件先把分片攒起来（纯内存操作，几乎零成本）
-                buffer.append(delta)
-
-                // ② 看一眼表，距上次刷新够 50ms 了吗？
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastFlushAt >= FLUSH_INTERVAL_MS) {
-
-                    // 第一次时 lastFlushAt 还是 0，直接相减会得到"开机至今毫秒数"这种假值，
-                    // 所以第一次统一记成 0
-                    val interval = if (flushCount == 0) 0L else now - lastFlushAt
-
-                    val text = buffer.toString()
-
-                    // 【日志】每次批处理刷新
-                    Log.d(TAG, "flush: ${text.length} chars, interval=${interval}ms")
-
-                    lastFlushAt = now
-                    flushCount++
-
-                    // ★ 只在真正要刷界面时才切回主线程
-                    withContext(Dispatchers.Main) { onFlush(text) }
-                }
-                // 不够 50ms → 什么都不做，继续攒。这就是"批处理"。
-            }
-
-            reader.close()
-
-            // ---------- 5. 尾部补偿 ----------
-            // 流结束时，缓冲区里可能还留着不足 50ms 的那几个字。
-            // 不补这一次，最后几个字永远不会出现在屏幕上。
-            val finalText = buffer.toString()
-            withContext(Dispatchers.Main) { onFlush(finalText) }
-
-            // 【日志】流结束
-            Log.d(
-                TAG,
-                "stream done: total=$total chars " +
-                    "(deltas=$deltaCount, flushes=$flushCount, skipped=$nullContentCount)"
-            )
-
-            withContext(Dispatchers.Main) { onDone(total) }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "stream exception: ${e.message}", e)
-            withContext(Dispatchers.Main) { onError(networkErrorMessage(e)) }
-        }
-    }
-}
 
 
 // ============================================================
@@ -1886,42 +1677,6 @@ fun networkErrorText(e: Throwable): ErrorText {
     }
 }
 
-/**
- * ⚠️ 下面这两个是【退化路径 sendToCloudModel】专用的旧实现，故意保留。
- *
- * 铁律 3：sendToCloudModel 一个字不改。它现在没有任何调用点，
- * 但仍保留作参照。它的 onError 收的是 String，所以这里继续返回中文。
- * 真正在跑的 runAgentLoop 已经改用上面的 httpErrorText / networkErrorText。
- */
-private fun httpErrorMessage(code: Int, body: String): String {
-    return when (code) {
-        401 -> "API Key 无效或已欠费（401）。\n请到「设置 → 模型与 API」检查 Key 是否填错、账户是否还有余额。"
-        402 -> "账户余额不足（402）。\n请到 模型开放平台充值后再试。"
-        403 -> "没有访问权限（403）。\n这个 Key 可能被限制访问该模型。"
-        404 -> "接口地址不对（404）。\n检查「设置 → 模型与 API」里的 API 地址。"
-        429 -> "请求太频繁，请休息一下（429）。\n等几十秒再发，或者换到低峰时段。"
-        in 500..599 -> "服务器出问题了（$code）。\n不是你的操作问题，过一会儿再试。"
-        else -> {
-            val hint = body.take(200).trim()
-            if (hint.isEmpty()) "HTTP $code" else "HTTP $code\n$hint"
-        }
-    }
-}
-
-private fun networkErrorMessage(e: Throwable): String {
-    return when (e) {
-        is UnknownHostException ->
-            "连不上网络。\n检查 Wi-Fi 或移动数据是否正常；如果开了代理/VPN，先关掉再试。"
-        is SocketTimeoutException ->
-            "请求超时。\n网络太慢或服务器没响应，换个网络或稍后重试。"
-        is SSLException ->
-            "安全连接失败（SSL）。\n多半是代理或证书在中间拦截，关掉代理再试。"
-        is IOException ->
-            "网络异常：${e.message ?: e.javaClass.simpleName}"
-        else ->
-            "出错了：${e.javaClass.simpleName}: ${e.message ?: "未知原因"}"
-    }
-}
 
 
 internal data class ToolExecResult(val ok: Boolean, val output: String)
@@ -2985,12 +2740,10 @@ fun runAgentLoop(
             //   铁律：连接失败/超时/为空一律静默退回内置工具，绝不阻塞对话。
             //   同时把「本周期可用的外部工具名」灌进 executeTool 的分发集合。
             var mcpTools: List<McpTool> = emptyList()
-            var mcpRenamed: Map<String, String> = emptyMap()
             if (mcpServerUrl.isNotBlank()) {
                 val (fetched, err) = mcpListTools()
                 if (err == null && fetched.isNotEmpty()) {
                     mcpTools = fetched
-                    mcpRenamed = mergeMcpTools(buildToolsArray(), fetched).second
                     mcpActiveToolNames = fetched.map { it.name }.toSet()
                     Log.d(TAG, "MCP 外部工具 ${fetched.size} 个: ${fetched.map { it.name }}")
                 } else {
@@ -4087,13 +3840,13 @@ fun ChatScreen() {
                     //   LIKE 的通配符与引号手工转义，防用户输入 % _ ' 破坏语义。
                     searchContent = { q ->
                         val escaped = q.replace("'", "''").replace("%", "\\%").replace("_", "\\_")
-                        val ids = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                        val ids = withContext(Dispatchers.IO) {
                             dao.searchSessionIdsByContent(escaped)
                         }
                         val hits = LinkedHashMap<String, String>()
                         for (id in ids) {
                             if (hits.size >= 20) break   // 侧边栏展示用，20 条足够
-                            val msgs = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                            val msgs = withContext(Dispatchers.IO) {
                                 dao.getMessages(id)
                             }
                             val raw = msgs.firstOrNull {
@@ -6970,7 +6723,7 @@ internal fun saveMcpServerUrl(context: Context, url: String) {
     prefsOf(context).edit { putString(KEY_MCP_SERVER_URL, v) }
     AppSettings.mcpServerUrl = v
     mcpServerUrl = v
-    Log.d(TAG, "MCP 服务器地址已保存: " + if (v.isBlank()) "(空)" else v)
+    Log.d(TAG, "MCP 服务器地址已保存: " + v.ifBlank { "(空)" })
 }
 
 /** 关于 */
@@ -7344,7 +7097,7 @@ private fun MemoryScreen(onBack: () -> Unit) {
     LaunchedEffect(tick) {
         loading = true
         list = withContext(Dispatchers.IO) {
-            val f = AppCtx.memoryFile() ?: return@withContext emptyList<MemoryItem>()
+            val f = AppCtx.memoryFile() ?: return@withContext emptyList()
             MemoryStore.load(f).sortedByDescending { it.createdAt }
         }
         loading = false
@@ -7771,7 +7524,6 @@ fun MessageBubble(
                 if (fileCards.isNotEmpty()) {
                     FileCardList(
                         cards = fileCards,
-                        textColor = textColor,
                         modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 8.dp)
                     )
                 }
@@ -9286,10 +9038,10 @@ private fun TodoCard(view: ToolCallView, modifier: Modifier = Modifier) {
 @Composable
 private fun TodoCardBody(
     plan: TodoPlan,
+    modifier: Modifier = Modifier,
     // output / ok 只对「工具调用」入口有意义：兜底入口没有工具返回值，传空与 null。
     output: String = "",
-    ok: Boolean? = null,
-    modifier: Modifier = Modifier
+    ok: Boolean? = null
 ) {
     val cs = MaterialTheme.colorScheme
     val done = plan.completedCount
@@ -9327,7 +9079,7 @@ private fun TodoCardBody(
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    text = "${done} / ${total}",
+                    text = "$done / $total",
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelSmall,
                     color = if (allDone) TodoDoneColor else cs.onSurfaceVariant
@@ -10192,7 +9944,7 @@ private fun FileCardRow(
  * 只有真有文件卡片时才创建这个 state。
  */
 @Composable
-private fun FileCardList(cards: List<FileCard>, textColor: Color, modifier: Modifier = Modifier) {
+private fun FileCardList(cards: List<FileCard>, modifier: Modifier = Modifier) {
     var readerPath by remember { mutableStateOf<String?>(null) }
     Column(modifier) {
         cards.forEach { card ->
