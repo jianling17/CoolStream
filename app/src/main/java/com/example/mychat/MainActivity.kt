@@ -13,6 +13,9 @@ import android.util.Base64
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import android.os.Bundle
 import android.os.Environment
 import android.os.SystemClock
@@ -45,11 +48,16 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.StartOffset
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -102,6 +110,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.mychat.ui.theme.MyChatTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -244,6 +253,7 @@ import com.example.mychat.ui.theme.GlassTintLight
 // ---- 像素级 UI 重构新增的 import ----
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.foundation.border
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.combinedClickable
@@ -834,7 +844,10 @@ data class SessionEntity(
     val title: String,
 
     // 创建时间（毫秒），排序用
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+
+    // ★ v1.6.0 模块四：置顶。置顶会话在侧边栏最前面；老数据迁移后默认 false
+    val isPinned: Boolean = false
 )
 
 
@@ -925,9 +938,13 @@ interface ChatDao {
 
     // ==================== 会话 ====================
 
-    /** 读出所有会话，按创建时间倒序（新的在上面，和侧边栏顺序一致） */
-    @Query("SELECT * FROM sessions ORDER BY createdAt DESC")
+    /** ★ v1.6.0 模块四：置顶的最前，其余按创建时间倒序（和侧边栏顺序一致） */
+    @Query("SELECT * FROM sessions ORDER BY isPinned DESC, createdAt DESC")
     suspend fun getAllSessions(): List<SessionEntity>
+
+    /** ★ v1.6.0 模块四：切换置顶状态 */
+    @Query("UPDATE sessions SET isPinned = :pinned WHERE id = :id")
+    suspend fun setSessionPinned(id: String, pinned: Boolean)
 
     /** 插入一个会话。REPLACE：同 id 就覆盖，重复调用不会崩 */
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -999,10 +1016,23 @@ private val MIGRATION_2_3 = object : Migration(2, 3) {
     }
 }
 
+/**
+ * 迁移 3 → 4：sessions 表新增 isPinned 列（★ v1.6.0 模块四：置顶）。
+ *
+ * ALTER TABLE 加一列 + 默认 false：老用户的所有会话置顶状态为未置顶，
+ * 历史数据一条不丢。不在 fallbackToDestructiveMigration 的射程内——
+ * 那是给 1→2 那种「数据本来就没法挂靠」的场景留的。
+ */
+private val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE sessions ADD COLUMN isPinned INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
 
 @Database(
     entities = [SessionEntity::class, ChatMessage::class],
-    version = 3,               // ★ 1→2：加 sessions 表；2→3：加 messages.type 列
+    version = 4,               // ★ 1→2：加 sessions 表；2→3：加 messages.type；3→4：加 sessions.isPinned
     exportSchema = false
 )
 @TypeConverters(MessageTypeConverter::class)
@@ -1029,7 +1059,7 @@ abstract class AppDatabase : RoomDatabase() {
                     // 所以直接丢掉重建最省事。
                     //
                     // 代价：升级后第一次启动，旧聊天记录会消失（只发生这一次）。
-                    .addMigrations(MIGRATION_2_3)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
                     .fallbackToDestructiveMigration()
                     .build()
                     .also { INSTANCE = it }
@@ -3105,6 +3135,15 @@ class MainActivity : ComponentActivity() {
 
         enableEdgeToEdge()
 
+        // ★ v1.6.0 模块六：沉浸式——隐藏状态栏。setDecorFitsSystemWindows(false) 后
+        //   用 WindowInsetsControllerCompat 藏起状态栏，下滑可临时唤出。
+        //   用 androidx 兼容层而非平台 API，minSdk 24 一套代码全覆盖。
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+        insetsController.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        insetsController.hide(WindowInsetsCompat.Type.statusBars())
+
         // 记忆库要写文件，而 executeTool 拿不到 Context，这里注入一次全局持有者
         AppCtx.install(this)
 
@@ -3158,7 +3197,12 @@ class MainActivity : ComponentActivity() {
                 LocalDensity provides Density(baseDensity.density, AppSettings.fontScale)
             ) {
                 MyChatTheme(darkTheme = dark) {
-                    if (onboarded) {
+                    // ★ v1.6.0 模块五：品牌 Splash。黑底 + 极客绿 Logo 浮现，
+                    //   总时长 ≤1.5s，不引入 SplashScreen API（minSdk 24 兼容 + 零依赖）。
+                    var showSplash by remember { mutableStateOf(true) }
+                    if (showSplash) {
+                        CyberSplash(onDone = { showSplash = false })
+                    } else if (onboarded) {
                         ChatScreen()
                     } else {
                         OnboardingScreen(onFinish = { onboarded = true })
@@ -3444,7 +3488,9 @@ private fun ParallaxScrim(
 data class SidebarSession(
     val id: String,
     val title: String,
-    val createdAt: Long
+    val createdAt: Long,
+    // ★ v1.6.0 模块四：置顶
+    val isPinned: Boolean = false
 )
 
 @Immutable
@@ -3462,7 +3508,9 @@ data class ChatSession(
     val messages: List<ChatMessage>,
     // 创建时间（毫秒）。只用于侧边栏分组（今天 / 昨天 / 更早）。
     // 数据来自 SessionEntity.createdAt —— Room 表结构没有任何改动。
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    // ★ v1.6.0 模块四：置顶。DB 侧在 SessionEntity.isPinned，DAO 排序已带 isPinned DESC
+    val isPinned: Boolean = false
 )
 
 
@@ -3714,7 +3762,8 @@ fun ChatScreen() {
                     title = se.title,
                     // 过滤掉正文为空的行：那是流式中断时留下的空壳，显示出来是个空气泡
                     messages = dao.getMessages(se.id).filter { it.content.isNotBlank() },
-                    createdAt = se.createdAt
+                    createdAt = se.createdAt,
+                    isPinned = se.isPinned
                 )
             }
         }
@@ -3777,7 +3826,7 @@ fun ChatScreen() {
     // 流式刷新期间 id / title / createdAt 都没变 → equals 判定相等
     // → Compose 直接跳过整个 Sidebar 的重组。这是消除卡顿的关键。
     val sidebarState = SidebarState(
-        sessions = sessions.map { SidebarSession(it.id, it.title, it.createdAt) },
+        sessions = sessions.map { SidebarSession(it.id, it.title, it.createdAt, it.isPinned) },
         currentSessionId = currentSessionId
     )
 
@@ -3835,6 +3884,15 @@ fun ChatScreen() {
                             dao.updateSessionTitle(id, newTitle)
                         }
                         Log.d(TAG, "重命名会话: $id → $newTitle")
+                    },
+                    // ★ v1.6.0 模块四：置顶/取消置顶。内存先改（排序立即生效），IO 落库
+                    onPinToggle = { id ->
+                        val cur = sessions.firstOrNull { it.id == id } ?: return@Sidebar
+                        updateSession(id) { it.copy(isPinned = !cur.isPinned) }
+                        streamScope.launch(Dispatchers.IO) {
+                            dao.setSessionPinned(id, !cur.isPinned)
+                        }
+                        Log.d(TAG, "置顶切换: $id → ${!cur.isPinned}")
                     },
                     // 删除：Room 级联删消息；删的是当前会话时自动切走，绝不白屏
                     onDelete = { id ->
@@ -3947,6 +4005,9 @@ fun ChatScreen() {
                     .padding(innerPadding)
                     .imePadding()
             ) {
+                // ★ v1.6.0 模块六：列表是否滚离底部（给输入栏毛玻璃加重用）。
+                // 声明在 Column 顶层：InputBar 在 else 块外也要能读到。
+                var listScrolled by remember { mutableStateOf(false) }
                 // ---------- 中间：空会话显示欢迎语，否则显示消息列表 ----------
                 if (currentMessages.isEmpty()) {
                     Box(
@@ -3985,6 +4046,8 @@ fun ChatScreen() {
                             last == null || last.index == info.totalItemsCount - 1
                         }
                     }
+                    // 同步给输入栏的毛玻璃明暗（模块六）
+                    LaunchedEffect(atBottom) { listScrolled = !atBottom }
 
                     LaunchedEffect(itemCount, lastLen) {
                         if (itemCount == 0) {
@@ -4027,11 +4090,13 @@ fun ChatScreen() {
                         mergeTodoCards(currentMessages)
                     }
 
+                    // ★ v1.6.0 模块六：列表顶部 alpha 渐隐蒙版——内容从顶栏下穿过时
+                    //   渐隐消失（用主背景色画渐变，通用且零重组成本）。
+                    Box(Modifier.weight(1f).fillMaxWidth()) {
                     LazyColumn(
                         state = listState,
                         modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth(),
+                            .fillMaxSize(),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
@@ -4050,6 +4115,8 @@ fun ChatScreen() {
                                     index == visibleMessages.lastIndex &&
                                     !message.isUser
 
+                            // ★ v1.6.0 模块一：相邻消息间 16dp 间距，工具卡片与正文视觉解耦
+                            Spacer(Modifier.height(16.dp))
                             MessageBubble(
                                 message = message,
                                 markdown = !streamingTail,
@@ -4058,6 +4125,22 @@ fun ChatScreen() {
                                 showCursor = streamingTail
                             )
                         }
+                    }
+                    // 顶部渐隐蒙版：48dp 高的背景色→透明竖向渐变，压在列表之上
+                    // 颜色要在 Composable 上下文取好，drawBehind 里不能调 MaterialTheme
+                    val fadeColor = MaterialTheme.colorScheme.background
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .drawBehind {
+                                drawRect(
+                                    brush = Brush.verticalGradient(
+                                        colors = listOf(fadeColor, Color.Transparent)
+                                    )
+                                )
+                            }
+                    )
                     }
                 }
 
@@ -4318,6 +4401,8 @@ fun ChatScreen() {
                     text = inputText,
                     enabled = !isStreaming,        // ★ 发送中禁止再发，防止重复请求
                     isStreaming = isStreaming,
+                    // ★ v1.6.0 模块六：滚离底部 → 毛玻璃加重
+                    scrolled = listScrolled,
                     attachments = attachments,
                     onTextChange = { inputText = it },
                     onAttachClick = { showAttachSheet = true },
@@ -4851,7 +4936,9 @@ fun Sidebar(
     onSettings: () -> Unit,
     onExport: (String) -> Unit,
     // ★ v1.5.0 模块四：正文搜索。传 null（默认）则只搜标题，行为和旧版一致
-    searchContent: (suspend (String) -> Map<String, String>)? = null
+    searchContent: (suspend (String) -> Map<String, String>)? = null,
+    // ★ v1.6.0 模块四：置顶切换
+    onPinToggle: (String) -> Unit = {}
 ) {
     val cs = MaterialTheme.colorScheme
 
@@ -5006,7 +5093,9 @@ fun Sidebar(
                                 },
                                 // ★ 删除只负责顶起确认框，真正下手在确认框里
                                 onDelete = { deleteTarget = session },
-                                onExport = { onExport(session.id) }
+                                onExport = { onExport(session.id) },
+                                isPinned = session.isPinned,
+                                onPinToggle = { onPinToggle(session.id) }
                             )
                         }
                     }
@@ -5226,7 +5315,10 @@ private fun SessionRow(
     onDelete: () -> Unit,
     onExport: () -> Unit,
     // ★ v1.5.0 模块四：正文搜索命中片段，空串不显示
-    snippet: String = ""
+    snippet: String = "",
+    // ★ v1.6.0 模块四：置顶
+    isPinned: Boolean = false,
+    onPinToggle: () -> Unit = {}
 ) {
     val cs = MaterialTheme.colorScheme
     var menuOpen by remember { mutableStateOf(false) }
@@ -5248,7 +5340,8 @@ private fun SessionRow(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = title,
+                    // ★ v1.6.0 模块四：置顶会话标题前带图钉
+                    text = if (isPinned) "\uD83D\uDCCC " + title else title,
                     style = MaterialTheme.typography.bodyMedium,
                     color = if (selected) cs.onSurface else cs.onSurfaceVariant,
                     maxLines = 1,
@@ -5283,6 +5376,21 @@ private fun SessionRow(
                     onDismissRequest = { menuOpen = false },
                     containerColor = glassDrawer()
                 ) {
+                    // ★ v1.6.0 模块四：置顶 / 取消置顶
+                    DropdownMenuItem(
+                        text = { Text(if (isPinned) "取消置顶" else "置顶") },
+                        leadingIcon = {
+                            Text(
+                                text = "\uD83D\uDCCC",
+                                fontSize = 14.sp,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        },
+                        onClick = {
+                            menuOpen = false
+                            onPinToggle()
+                        }
+                    )
                     DropdownMenuItem(
                         text = { Text(stringResource(R.string.action_export)) },
                         onClick = {
@@ -7389,15 +7497,37 @@ fun MessageBubble(
     val context = LocalContext.current
 
     // 用户气泡：实心蓝 + 白字
-    // AI 气泡：深/浅灰底 + 1dp 描边 + 正文色
-    // 错误气泡：暗红毛玻璃。和用户气泡、AI 气泡一眼能分开
+    // ★ v1.6.0 模块一：AI 正文不再有气泡——Surface 底色/边框/圆角全部砸掉，
+    //   文本平铺在屏幕背景上，沉浸阅读。
+    // 错误提示保留暗红毛玻璃气泡：报错需要视觉边界，一眼能和正文分开。
     val isErr = message.isError
     val errorAccent = Color(0xFFF85149)
 
+    // ★ v1.6.0 模块六：新 AI 气泡 Spring 弹入。每条消息只播一次（remember(message.id)），
+    //   用户气泡和错误气泡不播（保持稳重）。graphicsLayer 驱动，50ms 流式管线零感知。
+    var sprung by remember(message.id) { mutableStateOf(false) }
+    LaunchedEffect(message.id) {
+        if (!isUser && !isErr) {
+            kotlinx.coroutines.delay(10)   // 让首帧先以 scale 0.96 落地，再弹
+            sprung = true
+        } else {
+            sprung = true
+        }
+    }
+    val springScale by animateFloatAsState(
+        targetValue = if (sprung) 1f else 0.96f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMediumLow
+        ),
+        label = "bubbleSpring"
+    )
+
+    val flatAi = !isUser && !isErr
     val bubbleColor = when {
         isErr -> errorAccent.copy(alpha = 0.14f)
         isUser -> cs.primary
-        else -> cs.surface
+        else -> Color.Transparent
     }
     val textColor = if (isUser && !isErr) cs.onPrimary else cs.onSurface
 
@@ -7420,7 +7550,14 @@ fun MessageBubble(
 
     // 外层 Box 负责"靠左还是靠右"
     Box(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .graphicsLayer {
+                scaleX = springScale
+                scaleY = springScale
+                transformOrigin = if (isUser) androidx.compose.ui.graphics.TransformOrigin(1f, 0.5f)
+                else androidx.compose.ui.graphics.TransformOrigin(0f, 0.5f)
+            },
         contentAlignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
     ) {
         // ★ 再套一层 Box：Popup 的 alignment 是相对「直接父布局」算的。
@@ -7429,18 +7566,22 @@ fun MessageBubble(
             // 内层 Surface 负责"长什么样"
             Surface(
                 color = bubbleColor,
-                // 大圆角 24dp：胶囊感
-                shape = RoundedCornerShape(24.dp),
+                // ★ v1.6.0 模块一：AI 平铺时无圆角无边框；用户/错误气泡保留 24dp 胶囊
+                shape = if (flatAi) RoundedCornerShape(0.dp) else RoundedCornerShape(24.dp),
                 // 无阴影：阴影高度和色调高度都归零
                 shadowElevation = 0.dp,
                 tonalElevation = 0.dp,
-                // 两种气泡都加一条极微弱的半透明高光边框（毛玻璃质感）
-                border = BorderStroke(
+                // ★ v1.6.0 模块一：AI 平铺去掉高光描边；错误/用户气泡保留
+                border = if (flatAi) null else BorderStroke(
                     1.dp,
                     if (isErr) errorAccent.copy(alpha = 0.45f) else glassEdge()
                 ),
-                modifier = Modifier
-                    .widthIn(max = 300.dp)
+                modifier = (
+                    // ★ v1.6.0 模块一：AI 正文平铺占满整行（左右 16dp 由内边距给），
+                    //   用户消息保留靠右气泡 + 300dp 上限。
+                    if (flatAi) Modifier.fillMaxWidth()
+                    else Modifier.widthIn(max = 300.dp)
+                )
                     .onGloballyPositioned { bubbleHeight = it.size.height }
                     .combinedClickable(
                         onClick = { /* 单击暂时不做任何事，留给以后编辑/重发 */ },
@@ -7517,7 +7658,11 @@ fun MessageBubble(
                         content = bodyText,
                         textColor = textColor,
                         streaming = showCursor,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        // ★ v1.6.0 模块一：AI 平铺左右 16dp；气泡内维持 14dp
+                        modifier = Modifier.padding(
+                            horizontal = if (flatAi) 16.dp else 14.dp,
+                            vertical = if (flatAi) 4.dp else 10.dp
+                        ),
                         onCodeLongPress = {
                             Log.d(TAG, "长按代码块，抽到 ${codeBlocks.size} 段")
                             menuOpen = true
@@ -7528,13 +7673,24 @@ fun MessageBubble(
                     //   InfiniteTransition 只驱动光标自己的 alpha —— 每帧只重组这个
                     //   8x18dp 的 Box，正文 Text 不参与，50ms 防抖管线零改动。
                     Row {
+                        // ★ v1.6.0 模块六：思考指示器三跳点（占位气泡专属）
+                        if (placeholder && showCursor) {
+                            ThinkingDots(
+                                modifier = Modifier.padding(start = 16.dp, top = 12.dp, end = 6.dp)
+                            )
+                        }
                         Text(
                             text = if (placeholder) stringResource(R.string.thinking) else bodyText,
-                            color = textColor,
+                            // 占位阶段有跳点了，文字弱化成次级色
+                            color = if (placeholder && showCursor) textColor.copy(alpha = 0.7f) else textColor,
                             // 等宽字体：极客风的关键
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                            // ★ v1.6.0 模块一：AI 平铺左右 16dp
+                            modifier = Modifier.padding(
+                                horizontal = if (flatAi) 16.dp else 14.dp,
+                                vertical = if (flatAi) 4.dp else 10.dp
+                            )
                         )
                         if (showCursor) {
                             BlinkingCursor(
@@ -7551,7 +7707,12 @@ fun MessageBubble(
                 if (fileCards.isNotEmpty()) {
                     FileCardList(
                         cards = fileCards,
-                        modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 8.dp)
+                        // ★ v1.6.0 模块一：平铺时对齐 16dp 边距
+                        modifier = Modifier.padding(
+                            start = if (flatAi) 16.dp else 14.dp,
+                            end = if (flatAi) 16.dp else 14.dp,
+                            top = 8.dp
+                        )
                     )
                 }
                 }
@@ -7714,6 +7875,132 @@ private fun copyToClipboard(context: Context, text: String) {
  * 只放「复制」这一类动作：复制不改变任何状态，做错了也没有代价，
  * 所以不需要二次确认，弹出来点了就走。
  */
+// ============================================================
+// ★ v1.6.0 模块五：品牌 Splash（纯 Compose 手搓，零依赖）
+//
+// 时间轴：黑底起手 → 0~450ms Logo 微光放大浮现（scale 0.85→1.0 + alpha 0→1）
+//        → 停 800ms → 250ms 整体 fadeOut → 回调 onDone 切主界面。
+// 总长 ~1.5s。LaunchedEffect 协程里顺序驱动，不用动画库。
+// ============================================================
+private const val SPLASH_LOGO_TEXT = "COOLSTREAM"
+
+@Composable
+private fun CyberSplash(onDone: () -> Unit) {
+    var appeared by remember { mutableStateOf(false) }   // 浮现阶段
+    var leaving by remember { mutableStateOf(false) }    // 退场阶段
+    val appear: Float by animateFloatAsState(
+        targetValue = if (appeared) 1f else 0f,
+        animationSpec = tween(durationMillis = 450, easing = LinearEasing),
+        label = "splashAppear"
+    )
+    val leave: Float by animateFloatAsState(
+        targetValue = if (leaving) 0f else 1f,
+        animationSpec = tween(durationMillis = 250, easing = LinearEasing),
+        label = "splashLeave"
+    )
+
+    LaunchedEffect(Unit) {
+        appeared = true
+        kotlinx.coroutines.delay(450 + 800)
+        leaving = true
+        kotlinx.coroutines.delay(250)
+        onDone()
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0A0A0A))
+            .graphicsLayer { alpha = leave },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            // Logo：极客绿几何 C，与桌面图标同款语言
+            val scale = 0.85f + 0.15f * appear
+            Box(
+                modifier = Modifier
+                    .size(96.dp)
+                    .graphicsLayer {
+                        this.scaleX = scale
+                        this.scaleY = scale
+                        this.alpha = appear
+                    }
+            ) {
+                // 外弧 C
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(8.dp)
+                        .drawBehind {
+                            drawCircle(
+                                color = TodoDoneColor,
+                                radius = size.minDimension / 2f,
+                                style = Stroke(width = 5.dp.toPx(), cap = StrokeCap.Round),
+                                alpha = appear
+                            )
+                        }
+                )
+                // 中心点
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(TodoDoneColor.copy(alpha = appear))
+                )
+            }
+            Spacer(Modifier.height(20.dp))
+            Text(
+                text = SPLASH_LOGO_TEXT,
+                color = Color.White.copy(alpha = appear),
+                fontSize = 18.sp,
+                letterSpacing = 6.sp,
+                fontFamily = FontFamily.Monospace
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "v1.6.0",
+                color = TodoDoneColor.copy(alpha = appear * 0.8f),
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+    }
+}
+
+// ============================================================
+// ★ v1.6.0 模块六：思考指示器三跳点
+// 三个小圆点依次起伏（相位错开的 infiniteTransition），只有这
+// 十几个像素的 Box 在每帧重绘，不碰 50ms 流式管线。
+// ============================================================
+@Composable
+private fun ThinkingDots(modifier: Modifier = Modifier) {
+    val transition = rememberInfiniteTransition(label = "thinking-dots")
+    val tint = TodoDoneColor
+    Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        repeat(3) { i ->
+            val t by transition.animateFloat(
+                initialValue = 0.35f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = 500, easing = LinearEasing),
+                    repeatMode = RepeatMode.Reverse,
+                    // 相位错开：用 initialStartOffset 错拍
+                    initialStartOffset = StartOffset(i * 160)
+                ),
+                label = "dot$i"
+            )
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .graphicsLayer { alpha = t }
+                    .clip(CircleShape)
+                    .background(tint)
+            )
+        }
+    }
+}
+
 /**
  * ★ v1.2.0 流式打字机光标：8x18dp 竖条，alpha 0.15↔1.0 呼吸闪烁。
  * rememberInfiniteTransition 局部重绘 —— 只有这个 Box 每帧重组，
@@ -7730,12 +8017,24 @@ private fun BlinkingCursor(color: Color, modifier: Modifier = Modifier) {
         ),
         label = "streamCursorAlpha"
     )
-    Box(
-        modifier = modifier
-            .size(width = 8.dp, height = 18.dp)
-            .graphicsLayer { this.alpha = alpha }
-            .background(color, RoundedCornerShape(2.dp))
-    )
+    // ★ v1.6.0 模块六：发光极客绿方块。颜色固定用 TodoDoneColor（调色不随正文色），
+    //   辉光 = 底层一个放大 1.6x、低透明度的同色方块，跟随同一 alpha 呼吸。
+    Box(modifier = modifier) {
+        Box(
+            modifier = Modifier
+                .size(width = 12.dp, height = 26.dp)
+                .align(Alignment.Center)
+                .graphicsLayer { this.alpha = alpha * 0.35f }
+                .background(TodoDoneColor, RoundedCornerShape(3.dp))
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .size(width = 8.dp, height = 18.dp)
+                .graphicsLayer { this.alpha = alpha }
+                .background(TodoDoneColor, RoundedCornerShape(2.dp))
+        )
+    }
 }
 
 @Composable
@@ -7821,6 +8120,8 @@ internal sealed interface MdBlock {
     data class ListItem(val ordered: Boolean, val items: List<String>) : MdBlock
     /** ★ v1.5.0 模块三：引用块（连续 > 行合并，每行剥掉 > 前缀） */
     data class Quote(val text: String) : MdBlock
+    /** ★ v1.6.0 模块三：分割线 --- / *** */
+    data object HorizontalRule : MdBlock
 }
 
 /**
@@ -8043,6 +8344,14 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
 
         // ---------- 标题 ----------
         val trimmed = noTrail.trimStart()
+        // ★ v1.6.0 模块三：分割线 --- / ***（整行只有该符号且至少 3 个）
+        if (trimmed.length >= 3 &&
+            (trimmed.all { it == '-' } || trimmed.all { it == '*' })
+        ) {
+            flushParagraph()
+            out.add(MdBlock.HorizontalRule)
+            continue
+        }
         val hashes = trimmed.takeWhile { it == '#' }.length
         if (hashes in 1..3 && trimmed.length > hashes && trimmed[hashes] == ' ') {
             flushParagraph()
@@ -8136,9 +8445,19 @@ private fun inlineFormat(text: String): AnnotatedString {
     while (i < text.length) {
         val boldAt = text.indexOf("**", i)
         val codeAt = text.indexOf('`', i)
+        // ★ v1.6.0 模块三：行内链接 [text](url)
+        val linkAt0 = text.indexOf("[", i)
+        val linkAt = if (linkAt0 < 0) -1 else {
+            // 必须是 ](url) 完整结构才算链接，否则当作普通 [ 字符
+            val close = text.indexOf("](", linkAt0)
+            if (close < 0) -1 else {
+                val end = text.indexOf(')', close + 2)
+                if (end < 0) -1 else linkAt0
+            }
+        }
 
-        // 两种标记都没有了 → 剩下的原样追加，结束
-        if (boldAt < 0 && codeAt < 0) {
+        // 三种标记都没有了 → 剩下的原样追加，结束
+        if (boldAt < 0 && codeAt < 0 && linkAt < 0) {
             builder.append(text.substring(i))
             break
         }
@@ -8146,14 +8465,28 @@ private fun inlineFormat(text: String): AnnotatedString {
         // 谁的标记更靠前就先处理谁
         val useBold = when {
             boldAt < 0 -> false
-            codeAt < 0 -> true
-            else -> boldAt <= codeAt
+            (codeAt < 0 || boldAt <= codeAt) && (linkAt < 0 || boldAt <= linkAt) -> true
+            else -> false
         }
-        val start = if (useBold) boldAt else codeAt
+        val useLink = !useBold && linkAt >= 0 && (codeAt < 0 || linkAt < codeAt)
+        val start = if (useBold) boldAt else if (useLink) linkAt else codeAt
 
         if (start > i) builder.append(text.substring(i, start))
 
-        if (useBold) {
+        if (useLink) {
+            // [text](url)：★ v1.6.0 模块三。Compose ui 1.7（BOM 2024.09）的
+            // AnnotatedString.Builder 没有 withLink/pushLink 点击 API（实测字节码确认），
+            // 所以链接只做视觉可辨：label 用极客绿 + 下划线渲染；URL 不显示。
+            // 点击跳转等将来升级 compose BOM 后再补，当前不引入任何依赖。
+            val close = text.indexOf("](", start)
+            val end = text.indexOf(')', close + 2)
+            val label = text.substring(start + 1, close)
+            builder.withStyle(SpanStyle(
+                color = TodoDoneColor,
+                textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
+            )) { append(label) }
+            i = end + 1
+        } else if (useBold) {
             val end = text.indexOf("**", start + 2)
             if (end < 0) {
                 builder.append(text.substring(start))
@@ -8208,21 +8541,31 @@ private fun MarkdownText(
     ) {
         for (block in blocks) {
             when (block) {
+                // ★ v1.6.0 模块二：DeepSeek 同款字号阶梯。
+                //   H1 22sp Bold / H2 19sp Bold / H3 17sp Medium，标题自带上下留白。
                 is MdBlock.Heading -> Text(
                     text = inlineFormat(block.text),
                     color = textColor,
-                    fontWeight = FontWeight.Bold,
-                    style = when (block.level) {
-                        1 -> MaterialTheme.typography.titleLarge
-                        2 -> MaterialTheme.typography.titleMedium
-                        else -> MaterialTheme.typography.titleSmall
-                    }
+                    fontWeight = when (block.level) {
+                        1 -> FontWeight.Bold
+                        2 -> FontWeight.Bold
+                        else -> FontWeight.Medium
+                    },
+                    fontSize = when (block.level) {
+                        1 -> 22.sp
+                        2 -> 19.sp
+                        else -> 17.sp
+                    },
+                    modifier = Modifier.padding(top = 10.dp, bottom = 2.dp)
                 )
 
+                // ★ v1.6.0 模块二：正文 16sp / 行高 26sp / 字距 0.3sp，沉浸阅读
                 is MdBlock.Paragraph -> Text(
                     text = inlineFormat(block.text),
                     color = textColor,
-                    style = MaterialTheme.typography.bodyMedium
+                    fontSize = 16.sp,
+                    lineHeight = 26.sp,
+                    letterSpacing = 0.3.sp
                 )
 
                 is MdBlock.Code -> CodeBlock(
@@ -8235,6 +8578,15 @@ private fun MarkdownText(
                 is MdBlock.Formula -> FormulaBlock(block.text)
 
                 is MdBlock.Table -> MarkdownTable(block.header, block.rows)
+
+                // ★ v1.6.0 模块三：分割线——1dp 半透明横线，上下留白
+                is MdBlock.HorizontalRule -> Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 10.dp)
+                        .height(1.dp)
+                        .background(textColor.copy(alpha = 0.25f))
+                )
 
                 is MdBlock.ListItem -> Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
                     block.items.forEachIndexed { n, item ->
@@ -8251,7 +8603,9 @@ private fun MarkdownText(
                             Text(
                                 text = inlineFormat(item),
                                 color = textColor,
-                                style = MaterialTheme.typography.bodyMedium
+                                fontSize = 16.sp,
+                                lineHeight = 26.sp,
+                                letterSpacing = 0.3.sp
                             )
                         }
                     }
@@ -8271,7 +8625,9 @@ private fun MarkdownText(
                         Text(
                             text = inlineFormat(block.text),
                             color = textColor.copy(alpha = 0.72f),
-                            style = MaterialTheme.typography.bodyMedium
+                            fontSize = 16.sp,
+                            lineHeight = 26.sp,
+                            letterSpacing = 0.3.sp
                         )
                     }
                 }
@@ -8607,49 +8963,48 @@ private fun MarkdownTable(header: List<String>, rows: List<List<String>>) {
             (longest * 8).dp.coerceIn(64.dp, 220.dp)
         }
     }
-    Surface(
-        color = CodeBlockBackground,
-        shape = RoundedCornerShape(6.dp),
-        border = BorderStroke(1.dp, CodeBlockBorder),
-        modifier = Modifier.fillMaxWidth()
+    // ★ v1.6.0 模块二：表格去掉 1dp 重边框和深底色，改用极细半透明横线分隔，视觉更轻
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
     ) {
-        Column(modifier = Modifier.horizontalScroll(rememberScrollState())) {
-            TableRow(header, widths, header = true)
-            for (r in rows) TableRow(r, widths, header = false)
-        }
+        TableRow(header, widths, header = true)
+        for (r in rows) TableRow(r, widths, header = false)
     }
 }
 
-/** 表格的一行。只画右 / 下两条线，外框交给 Surface，避免叠成双线。 */
+/**
+ * 表格的一行。★ v1.6.0 模块二：只画极细半透明横线（行底 0.5dp）分隔，
+ * 不再画竖线、不再有外框；单元格等宽 14sp / 行高 20sp、垂直 padding 8dp。
+ */
 @Composable
 private fun TableRow(cells: List<String>, widths: List<Dp>, header: Boolean) {
-    Row {
+    Row(
+        modifier = Modifier.drawBehind {
+            // 极细半透明横线：0.5dp，取正文色 35% 透明度在 draw 时拿不到，
+            // 用固定灰色半透明（深浅主题都可读）
+            val stroke = 0.5.dp.toPx()
+            drawLine(
+                color = Color.Gray.copy(alpha = 0.35f),
+                start = Offset(0f, size.height - stroke / 2f),
+                end = Offset(size.width, size.height - stroke / 2f),
+                strokeWidth = stroke
+            )
+        }
+    ) {
         for (c in widths.indices) {
             Box(
                 modifier = Modifier
                     .width(widths[c])
-                    .drawBehind {
-                        val stroke = 1.dp.toPx()
-                        val half = stroke / 2f
-                        drawLine(
-                            color = CodeBlockBorder,
-                            start = Offset(size.width - half, 0f),
-                            end = Offset(size.width - half, size.height),
-                            strokeWidth = stroke
-                        )
-                        drawLine(
-                            color = CodeBlockBorder,
-                            start = Offset(0f, size.height - half),
-                            end = Offset(size.width, size.height - half),
-                            strokeWidth = stroke
-                        )
-                    }
-                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                    .padding(horizontal = 8.dp, vertical = 8.dp)
             ) {
                 Text(
                     text = inlineFormat(cells.getOrElse(c) { "" }),
                     color = CodeBlockText,
-                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
                     fontWeight = if (header) FontWeight.Bold else FontWeight.Normal
                 )
             }
@@ -10169,7 +10524,9 @@ fun InputBar(
     text: String,
     enabled: Boolean,
     isStreaming: Boolean,
-    attachments: List<Attachment>,
+    // ★ v1.6.0 模块六：列表已滚离底部 → 毛玻璃加重一档，视觉上更「沉」
+    scrolled: Boolean = false,
+    attachments: List<Attachment> = emptyList(),
     onTextChange: (String) -> Unit,
     onAttachClick: () -> Unit,
     onRemoveAttachment: (Int) -> Unit,
@@ -10204,7 +10561,12 @@ fun InputBar(
                 .padding(horizontal = 14.dp)
                 .padding(bottom = 10.dp),
             shape = RoundedCornerShape(30.dp),
-            color = glassFill(),
+            // ★ v1.6.0 模块六：滚动联动明暗——滚离底部时底色叠一层更实的不透明度
+            color = if (scrolled) {
+                val base = glassFill()
+                if (LocalIsDark.current) base.copy(alpha = (base.alpha + 0.12f).coerceAtMost(1f))
+                else base.copy(alpha = (base.alpha + 0.2f).coerceAtMost(1f))
+            } else glassFill(),
             border = BorderStroke(1.dp, glassEdge()),
             shadowElevation = 8.dp,
             tonalElevation = 0.dp
