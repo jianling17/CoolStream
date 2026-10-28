@@ -5,36 +5,34 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 
 // ============================================================
-// 全篇等宽字体
+// ★ v1.6.1 DeepSeek 规范：全局正文字体统一 SansSerif（系统无衬线/Roboto）。
 //
-// 如果在每个 Text 上单独写 fontFamily = FontFamily.Monospace，
-// 侧边栏、对话框、按钮这些地方极容易漏掉（漏了就是"一半等宽一半不等宽"）。
-// 所以这里直接把 Material 的 15 个字号档全部换成等宽字体：
-// 以后写 Text 不用再管字体，默认就是等宽。
-//
-// 字号 / 行高 / 字重全部沿用 Material 默认值，只替换 fontFamily，
-// 所以视觉大小和原来一致，不会突然变大变小。
+// 原设计是全篇等宽（极客风）；对标 DeepSeek 后改为：
+//   - 正文、标题、输入框、侧栏 → SansSerif（Typography 默认档整体替换）
+//   - 代码块、行内代码、工具卡片标题、算式 → 在使用点显式 FontFamily.Monospace（保留等宽）
+// 之前每个 Text 上单独写的 fontFamily = FontFamily.Monospace 只保留在
+// 代码相关组件上，聊天主区域与系统组件不再覆盖。
 // ============================================================
-private val Mono = FontFamily.Monospace
+private val Sans = FontFamily.SansSerif
 
-private fun TextStyle.mono(): TextStyle = copy(fontFamily = Mono)
+private fun TextStyle.sans(): TextStyle = copy(fontFamily = Sans)
 
 val Typography: Typography = Typography().let { base ->
     Typography(
-        displayLarge = base.displayLarge.mono(),
-        displayMedium = base.displayMedium.mono(),
-        displaySmall = base.displaySmall.mono(),
-        headlineLarge = base.headlineLarge.mono(),
-        headlineMedium = base.headlineMedium.mono(),
-        headlineSmall = base.headlineSmall.mono(),
-        titleLarge = base.titleLarge.mono(),
-        titleMedium = base.titleMedium.mono(),
-        titleSmall = base.titleSmall.mono(),
-        bodyLarge = base.bodyLarge.mono(),
-        bodyMedium = base.bodyMedium.mono(),
-        bodySmall = base.bodySmall.mono(),
-        labelLarge = base.labelLarge.mono(),
-        labelMedium = base.labelMedium.mono(),
-        labelSmall = base.labelSmall.mono()
+        displayLarge = base.displayLarge.sans(),
+        displayMedium = base.displayMedium.sans(),
+        displaySmall = base.displaySmall.sans(),
+        headlineLarge = base.headlineLarge.sans(),
+        headlineMedium = base.headlineMedium.sans(),
+        headlineSmall = base.headlineSmall.sans(),
+        titleLarge = base.titleLarge.sans(),
+        titleMedium = base.titleMedium.sans(),
+        titleSmall = base.titleSmall.sans(),
+        bodyLarge = base.bodyLarge.sans(),
+        bodyMedium = base.bodyMedium.sans(),
+        bodySmall = base.bodySmall.sans(),
+        labelLarge = base.labelLarge.sans(),
+        labelMedium = base.labelMedium.sans(),
+        labelSmall = base.labelSmall.sans()
     )
 }

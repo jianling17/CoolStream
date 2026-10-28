@@ -8,21 +8,21 @@ import androidx.compose.ui.graphics.Color
 // ============================================================
 
 // ---------------- 暗色 Dark ----------------
-val DkBackground     = Color(0xFF000000)   // 全局背景：绝对纯黑（OLED 省电）
-val DkSurface        = Color(0xFF0D1117)   // AI 气泡底：极暗灰（比纯黑亮一档，才看得出边界）
-val DkSurfaceVar     = Color(0xFF161B22)   // 次级面板（顶栏等）
-val DkBorder         = Color(0xFF30363D)   // 边框：AI 气泡 / 输入框
-val DkInputBackground = Color(0xFF000000)  // 输入框底：纯黑
+val DkBackground     = Color(0xFF1A1A1A)   // ★ v1.6.1 DeepSeek 规范：深灰黑（比纯黑护眼）
+val DkSurface        = Color(0xFF282A2C)   // ★ v1.6.1 DeepSeek 规范：代码块/工具卡片底
+val DkSurfaceVar     = Color(0xFF282A2C)   // ★ v1.6.1 DeepSeek 规范
+val DkBorder         = Color(0xFF3E4042)   // ★ v1.6.1 DeepSeek 规范边框
+val DkInputBackground = Color(0xFF282A2C)  // ★ v1.6.1：输入框底与卡片一致
 
 // 用户气泡：二选一。
 // 深邃蓝（当前启用）：
-val DkUserBubble     = Color(0xFF1F6FEB)
+val DkUserBubble     = Color(0xFF2C2F33)   // ★ v1.6.1 DeepSeek 规范：深空灰气泡
 // GitHub 绿（想换就注释掉上面那行，改成下面这行）：
 // val DkUserBubble  = Color(0xFF238636)
 
 val DkOnUserBubble   = Color(0xFFFFFFFF)   // 用户气泡文字
-val DkText           = Color(0xFFC9D1D9)   // 正文
-val DkTextDim        = Color(0xFF8B949E)   // 次要文字 / 占位符
+val DkText           = Color(0xFFECECEC)   // ★ v1.6.1 DeepSeek 规范：高亮灰白正文
+val DkTextDim        = Color(0xFF8E8E93)   // ★ v1.6.1 DeepSeek 规范：清晰中灰辅助文字
 val DkError          = Color(0xFFF85149)   // 错误提示（GitHub 红）
 
 // ---------------- 亮色 Light ----------------
@@ -31,10 +31,10 @@ val LtSurface        = Color(0xFFF6F8FA)   // AI 气泡底：浅灰（白底上�
 val LtSurfaceVar     = Color(0xFFF0F3F9)   // 次级面板
 val LtBorder         = Color(0xFFD0D7DE)   // 边框：AI 气泡 / 输入框
 val LtInputBackground = Color(0xFFFFFFFF)  // 输入框底：纯白
-val LtUserBubble     = Color(0xFF0969DA)   // 用户气泡（GitHub 蓝）
+val LtUserBubble     = Color(0xFF2C2F33)   // ★ v1.6.1 DeepSeek 规范：深空灰气泡
 val LtOnUserBubble   = Color(0xFFFFFFFF)   // 用户气泡文字
-val LtText           = Color(0xFF24292F)   // 正文
-val LtTextDim        = Color(0xFF57606A)   // 次要文字 / 占位符
+val LtText           = Color(0xFF1A1A1A)   // ★ v1.6.1 高对比度：深邃黑灰
+val LtTextDim        = Color(0xFF8E8E93)   // ★ v1.6.1：辅助信息清晰灰
 val LtError          = Color(0xFFCF222E)   // 错误提示
 
 // ---------------- 代码块（两种主题共用）----------------

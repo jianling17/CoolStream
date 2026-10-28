@@ -3958,15 +3958,17 @@ fun ChatScreen() {
                                 ?: "CoolStream",
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            // ★ v1.6.1：顶栏标题 Bold → Medium，字号缩小一号
+                            // ★ v1.6.1 DeepSeek 规范：标题 Medium 16sp；暗色提亮 F3F3F3，亮色跟随主题
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Medium,
-                            fontSize = 16.sp
+                            fontSize = 16.sp,
+                            color = if (isSystemInDarkTheme()) Color(0xFFF3F3F3) else MaterialTheme.colorScheme.onSurface
                         )
                     },
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                            Icon(Icons.Default.Menu, contentDescription = stringResource(R.string.drawer_open))
+                            // ★ v1.6.1：顶栏图标提亮（暗色 F3F3F3，亮色跟随主题）
+                            Icon(Icons.Default.Menu, contentDescription = stringResource(R.string.drawer_open), tint = if (isSystemInDarkTheme()) Color(0xFFF3F3F3) else MaterialTheme.colorScheme.onSurface)
                         }
                     },
                     actions = {
@@ -7686,11 +7688,11 @@ fun MessageBubble(
                         }
                         Text(
                             text = if (placeholder) stringResource(R.string.thinking) else bodyText,
-                            // 占位阶段有跳点了，文字弱化成次级色
-                            color = if (placeholder && showCursor) textColor.copy(alpha = 0.7f) else textColor,
-                            // 等宽字体：极客风的关键
-                            fontFamily = FontFamily.Monospace,
-                            style = MaterialTheme.typography.bodyMedium,
+                            // ★ v1.6.1：占位弱化改实体辅助灰（去发虚 alpha）；字体回 SansSerif（DeepSeek 规范）
+                            color = if (placeholder && showCursor) Color(0xFF8E8E93) else textColor,
+                            fontFamily = FontFamily.SansSerif,
+                            fontSize = 16.sp,
+                            lineHeight = 26.sp,
                             // ★ v1.6.0 模块一：AI 平铺左右 16dp
                             modifier = Modifier.padding(
                                 horizontal = if (flatAi) 16.dp else 14.dp,
@@ -8538,7 +8540,8 @@ private fun inlineFormat(raw: String): AnnotatedString {
                 builder.append(text.substring(start))
                 break
             }
-            builder.withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+            // ★ v1.6.1 DeepSeek 规范：加粗文字显式亮白，杜绝继承发灰色
+            builder.withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = Color(0xFFFFFFFF))) {
                 append(text.substring(start + 2, end))
             }
             i = end + 2
@@ -8593,10 +8596,11 @@ private fun MarkdownText(
                 is MdBlock.Heading -> Text(
                     text = inlineFormat(block.text),
                     color = textColor,
+                    // ★ v1.6.1 DeepSeek 规范：H1/H2 W600、H3 W500
                     fontWeight = when (block.level) {
-                        1 -> FontWeight.Bold
-                        2 -> FontWeight.Bold
-                        else -> FontWeight.Medium
+                        1 -> FontWeight.W600
+                        2 -> FontWeight.W600
+                        else -> FontWeight.W500
                     },
                     fontSize = when (block.level) {
                         1 -> 22.sp
@@ -8606,12 +8610,13 @@ private fun MarkdownText(
                     modifier = Modifier.padding(top = 10.dp, bottom = 2.dp)
                 )
 
-                // ★ v1.6.1：正文 15sp / 行高 24sp（整体缩小一号）
+                // ★ v1.6.1 DeepSeek 规范：正文 16sp / W400 / 行高 26sp（配高对比度扎实感）
                 is MdBlock.Paragraph -> Text(
                     text = inlineFormat(block.text),
                     color = textColor,
-                    fontSize = 15.sp,
-                    lineHeight = 24.sp,
+                    fontSize = 16.sp,
+                    lineHeight = 26.sp,
+                    fontWeight = FontWeight.W400,
                     letterSpacing = 0.3.sp
                 )
 
@@ -8646,16 +8651,16 @@ private fun MarkdownText(
                                 text = if (block.ordered) (n + 1).toString() + "." else "•",
                                 color = TodoDoneColor.copy(alpha = 0.9f),
                                 fontWeight = if (block.ordered) FontWeight.Bold else FontWeight.Normal,
-                                fontSize = 15.sp,
-                                lineHeight = 24.sp,
+                                fontSize = 16.sp,
+                                lineHeight = 26.sp,
                                 maxLines = 1,
                                 modifier = Modifier.width(if (block.ordered) 26.dp else 18.dp)
                             )
                             Text(
                                 text = inlineFormat(item),
                                 color = textColor,
-                                fontSize = 15.sp,
-                                lineHeight = 24.sp,
+                                fontSize = 16.sp,
+                                lineHeight = 26.sp,
                                 letterSpacing = 0.3.sp,
                                 modifier = Modifier.weight(1f)
                             )
@@ -8674,11 +8679,12 @@ private fun MarkdownText(
                                 .background(TodoDoneColor.copy(alpha = 0.85f), RoundedCornerShape(1.5.dp))
                         )
                         Spacer(Modifier.width(10.dp))
+                        // ★ v1.6.1：引用文字去发虚 alpha，用辅助灰实体色
                         Text(
                             text = inlineFormat(block.text),
-                            color = textColor.copy(alpha = 0.72f),
-                            fontSize = 15.sp,
-                            lineHeight = 24.sp,
+                            color = Color(0xFF8E8E93),
+                            fontSize = 16.sp,
+                            lineHeight = 26.sp,
                             letterSpacing = 0.3.sp
                         )
                     }
@@ -9314,12 +9320,12 @@ private fun ToolCallCard(
         false -> Color(0xFFF85149)
     }
 
-    // ★ v1.6.1 对标 DeepSeek：去边框、极淡透明灰背景
+    // ★ v1.6.1 DeepSeek 规范：工具卡片实色底 282A2C + 细边框 3E4042
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.04f),
-        border = null,
+        color = Color(0xFF282A2C),
+        border = BorderStroke(0.5.dp, Color(0xFF3E4042)),
         shadowElevation = 0.dp,
         tonalElevation = 0.dp
     ) {
