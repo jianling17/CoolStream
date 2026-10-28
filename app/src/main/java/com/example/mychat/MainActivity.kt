@@ -3958,7 +3958,10 @@ fun ChatScreen() {
                                 ?: "CoolStream",
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.titleMedium
+                            // ★ v1.6.1：顶栏标题 Bold → Medium，字号缩小一号
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 16.sp
                         )
                     },
                     navigationIcon = {
@@ -7489,6 +7492,8 @@ fun MessageBubble(
         } else {
             ToolCallCard(message = message, modifier = modifier)
         }
+        // ★ v1.6.1：工具卡片与下方正文 16dp 间距
+        Spacer(Modifier.height(16.dp))
         return
     }
 
@@ -8438,7 +8443,48 @@ internal fun parseMarkdown(src: String): List<MdBlock> {
  * 做法：从左往右扫，每次找「离当前位置最近的标记」，处理完跳过，继续扫。
  * 单个标记没有配对（常见于流式中断）时原样输出，不吞字符。
  */
-private fun inlineFormat(text: String): AnnotatedString {
+/**
+ * ★ v1.6.1 计算式排版：给 a=43、26195÷600、3*4 这类算式的等号/乘除号两侧补空格。
+ * 只在「数字或空格」与运算符相邻时才补，避免误伤 a==b、*=、URL 里的 = 等（前后必须有一侧是数字）。
+ * 已有空格的（"a = b"）不重复补。
+ */
+internal fun spaceCalcOps(text: String): String {
+    if (!text.any { it.isDigit() }) return text
+    val sb = StringBuilder(text.length + 8)
+    for ((idx, c) in text.withIndex()) {
+        when (c) {
+            '=', '÷', '×' -> {
+                val prev = if (idx > 0) text[idx - 1] else ' '
+                val next = if (idx + 1 < text.length) text[idx + 1] else ' '
+                val prevOk = prev.isDigit() || prev == ' '
+                val nextOk = next.isDigit() || next == ' '
+                if (prevOk && nextOk) {
+                    if (prev != ' ') sb.append(' ')
+                    sb.append(c)
+                    if (next != ' ') sb.append(' ')
+                } else {
+                    sb.append(c)
+                }
+            }
+            // 乘除号用 ASCII 形式：两侧是数字且下一字符不是再一个 *（避免打坏 **加粗**）
+            '*', '/' -> {
+                val prev = if (idx > 0) text[idx - 1] else ' '
+                val next = if (idx + 1 < text.length) text[idx + 1] else ' '
+                if (prev.isDigit() && next.isDigit()) {
+                    sb.append(' ').append(c).append(' ')
+                } else {
+                    sb.append(c)
+                }
+            }
+            else -> sb.append(c)
+        }
+    }
+    return sb.toString()
+}
+
+private fun inlineFormat(raw: String): AnnotatedString {
+    // ★ v1.6.1 计算式排版入口：等号/乘除号两侧补空格后再做行内标记解析
+    val text = spaceCalcOps(raw)
     val builder = AnnotatedString.Builder()
     var i = 0
 
@@ -8537,7 +8583,8 @@ private fun MarkdownText(
 
     Column(
         modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(6.dp)
+        // ★ v1.6.1：块间距 6dp → 16dp（正文块与块之间加大留白）
+        verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         for (block in blocks) {
             when (block) {
@@ -8559,12 +8606,12 @@ private fun MarkdownText(
                     modifier = Modifier.padding(top = 10.dp, bottom = 2.dp)
                 )
 
-                // ★ v1.6.0 模块二：正文 16sp / 行高 26sp / 字距 0.3sp，沉浸阅读
+                // ★ v1.6.1：正文 15sp / 行高 24sp（整体缩小一号）
                 is MdBlock.Paragraph -> Text(
                     text = inlineFormat(block.text),
                     color = textColor,
-                    fontSize = 16.sp,
-                    lineHeight = 26.sp,
+                    fontSize = 15.sp,
+                    lineHeight = 24.sp,
                     letterSpacing = 0.3.sp
                 )
 
@@ -8588,24 +8635,29 @@ private fun MarkdownText(
                         .background(textColor.copy(alpha = 0.25f))
                 )
 
-                is MdBlock.ListItem -> Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                // ★ v1.6.1 对标 DeepSeek：悬挂缩进=圆点固定宽度列，正文整体换行后与首行文本对齐；
+                // 列表项之间 8dp 垂直间距
+                is MdBlock.ListItem -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     block.items.forEachIndexed { n, item ->
                         Row {
                             Text(
-                                // 有序用编号，无序用实心圆点；minWidth 做悬挂缩进，
-                                // 换行时正文对齐到标记之后，不会顶到圆点底下
+                                // 有序用编号，无序用实心圆点；固定宽度列 + 单行：
+                                // 正文换行时只对齐到文本列开头，不会顶到圆点/编号底下
                                 text = if (block.ordered) (n + 1).toString() + "." else "•",
                                 color = TodoDoneColor.copy(alpha = 0.9f),
                                 fontWeight = if (block.ordered) FontWeight.Bold else FontWeight.Normal,
-                                modifier = Modifier.widthIn(min = if (block.ordered) 22.dp else 14.dp)
+                                fontSize = 15.sp,
+                                lineHeight = 24.sp,
+                                maxLines = 1,
+                                modifier = Modifier.width(if (block.ordered) 26.dp else 18.dp)
                             )
-                            Spacer(Modifier.width(6.dp))
                             Text(
                                 text = inlineFormat(item),
                                 color = textColor,
-                                fontSize = 16.sp,
-                                lineHeight = 26.sp,
-                                letterSpacing = 0.3.sp
+                                fontSize = 15.sp,
+                                lineHeight = 24.sp,
+                                letterSpacing = 0.3.sp,
+                                modifier = Modifier.weight(1f)
                             )
                         }
                     }
@@ -8625,8 +8677,8 @@ private fun MarkdownText(
                         Text(
                             text = inlineFormat(block.text),
                             color = textColor.copy(alpha = 0.72f),
-                            fontSize = 16.sp,
-                            lineHeight = 26.sp,
+                            fontSize = 15.sp,
+                            lineHeight = 24.sp,
                             letterSpacing = 0.3.sp
                         )
                     }
@@ -9262,11 +9314,12 @@ private fun ToolCallCard(
         false -> Color(0xFFF85149)
     }
 
+    // ★ v1.6.1 对标 DeepSeek：去边框、极淡透明灰背景
     Surface(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        color = glassFill(),
-        border = BorderStroke(1.dp, glassEdge()),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.04f),
+        border = null,
         shadowElevation = 0.dp,
         tonalElevation = 0.dp
     ) {
@@ -9274,7 +9327,7 @@ private fun ToolCallCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .clickable { expanded = !expanded }
-                .padding(12.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             // ---------- 标题行 ----------
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -9289,8 +9342,9 @@ private fun ToolCallCard(
                 Text(
                     text = title,
                     fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = cs.onSurface,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    color = cs.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
@@ -10282,13 +10336,14 @@ private fun FileCardRow(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    // ★ v1.6.1 对标 DeepSeek：文档卡片改透明底 + 细边框（不再用突兀的黑色实底）
     Surface(
-        color = CodeBlockBackground,
-        shape = RoundedCornerShape(6.dp),
-        border = BorderStroke(1.dp, CodeBlockBorder),
+        color = Color.Transparent,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f)),
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
+            .clip(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick)
     ) {
         Row(
@@ -10300,7 +10355,7 @@ private fun FileCardRow(
             Column(Modifier.weight(1f)) {
                 Text(
                     text = card.name,
-                    color = CodeBlockText,
+                    color = MaterialTheme.colorScheme.onSurface,
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelMedium,
                     maxLines = 1,
@@ -10308,7 +10363,7 @@ private fun FileCardRow(
                 )
                 Text(
                     text = "点击全屏阅读",
-                    color = CodeBlockText.copy(alpha = 0.55f),
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelSmall,
                     maxLines = 1
