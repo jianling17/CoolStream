@@ -8484,7 +8484,7 @@ internal fun spaceCalcOps(text: String): String {
     return sb.toString()
 }
 
-private fun inlineFormat(raw: String): AnnotatedString {
+private fun inlineFormat(raw: String, textColor: Color): AnnotatedString {
     // ★ v1.6.1 计算式排版入口：等号/乘除号两侧补空格后再做行内标记解析
     val text = spaceCalcOps(raw)
     val builder = AnnotatedString.Builder()
@@ -8541,7 +8541,7 @@ private fun inlineFormat(raw: String): AnnotatedString {
                 break
             }
             // ★ v1.6.1 DeepSeek 规范：加粗文字显式亮白，杜绝继承发灰色
-            builder.withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = Color(0xFFFFFFFF))) {
+            builder.withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = textColor)) {
                 append(text.substring(start + 2, end))
             }
             i = end + 2
@@ -8594,7 +8594,7 @@ private fun MarkdownText(
                 // ★ v1.6.0 模块二：DeepSeek 同款字号阶梯。
                 //   H1 22sp Bold / H2 19sp Bold / H3 17sp Medium，标题自带上下留白。
                 is MdBlock.Heading -> Text(
-                    text = inlineFormat(block.text),
+                    text = inlineFormat(block.text, textColor),
                     color = textColor,
                     // ★ v1.6.1 DeepSeek 规范：H1/H2 W600、H3 W500
                     fontWeight = when (block.level) {
@@ -8612,7 +8612,7 @@ private fun MarkdownText(
 
                 // ★ v1.6.1 DeepSeek 规范：正文 16sp / W400 / 行高 26sp（配高对比度扎实感）
                 is MdBlock.Paragraph -> Text(
-                    text = inlineFormat(block.text),
+                    text = inlineFormat(block.text, textColor),
                     color = textColor,
                     fontSize = 16.sp,
                     lineHeight = 26.sp,
@@ -8657,7 +8657,7 @@ private fun MarkdownText(
                                 modifier = Modifier.width(if (block.ordered) 26.dp else 18.dp)
                             )
                             Text(
-                                text = inlineFormat(item),
+                                text = inlineFormat(item, textColor),
                                 color = textColor,
                                 fontSize = 16.sp,
                                 lineHeight = 26.sp,
@@ -8681,7 +8681,7 @@ private fun MarkdownText(
                         Spacer(Modifier.width(10.dp))
                         // ★ v1.6.1：引用文字去发虚 alpha，用辅助灰实体色
                         Text(
-                            text = inlineFormat(block.text),
+                            text = inlineFormat(block.text, textColor),
                             color = Color(0xFF8E8E93),
                             fontSize = 16.sp,
                             lineHeight = 26.sp,
@@ -9058,7 +9058,7 @@ private fun TableRow(cells: List<String>, widths: List<Dp>, header: Boolean) {
                     .padding(horizontal = 8.dp, vertical = 8.dp)
             ) {
                 Text(
-                    text = inlineFormat(cells.getOrElse(c) { "" }),
+                    text = inlineFormat(cells.getOrElse(c) { "" }, CodeBlockText),
                     color = CodeBlockText,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 14.sp,
