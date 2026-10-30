@@ -117,6 +117,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlin.time.Duration.Companion.milliseconds
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -4970,7 +4972,7 @@ fun Sidebar(
             contentHits = emptyMap()
             return@LaunchedEffect
         }
-        kotlinx.coroutines.delay(200)
+        delay(200.milliseconds)
         contentHits = fn(q)
     }
 
@@ -5346,7 +5348,7 @@ private fun SessionRow(
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     // ★ v1.6.0 模块四：置顶会话标题前带图钉
-                    text = if (isPinned) "\uD83D\uDCCC " + title else title,
+                    text = if (isPinned) "\uD83D\uDCCC $title" else title,
                     style = MaterialTheme.typography.bodyMedium,
                     color = if (selected) cs.onSurface else cs.onSurfaceVariant,
                     maxLines = 1,
@@ -7515,7 +7517,7 @@ fun MessageBubble(
     var sprung by remember(message.id) { mutableStateOf(false) }
     LaunchedEffect(message.id) {
         if (!isUser && !isErr) {
-            kotlinx.coroutines.delay(10)   // 让首帧先以 scale 0.96 落地，再弹
+            delay(10.milliseconds)   // 让首帧先以 scale 0.96 落地，再弹
             sprung = true
         } else {
             sprung = true
@@ -7701,7 +7703,6 @@ fun MessageBubble(
                         )
                         if (showCursor) {
                             BlinkingCursor(
-                                color = textColor,
                                 modifier = Modifier.padding(top = 10.dp, end = 14.dp)
                             )
                         }
@@ -7908,9 +7909,9 @@ private fun CyberSplash(onDone: () -> Unit) {
 
     LaunchedEffect(Unit) {
         appeared = true
-        kotlinx.coroutines.delay(450 + 800)
+        delay(1250.milliseconds)
         leaving = true
-        kotlinx.coroutines.delay(250)
+        delay(250.milliseconds)
         onDone()
     }
 
@@ -8014,7 +8015,7 @@ private fun ThinkingDots(modifier: Modifier = Modifier) {
  * 气泡正文和 50ms 流式批处理完全不受影响。
  */
 @Composable
-private fun BlinkingCursor(color: Color, modifier: Modifier = Modifier) {
+private fun BlinkingCursor(modifier: Modifier = Modifier) {
     val alpha by rememberInfiniteTransition(label = "streamCursor").animateFloat(
         initialValue = 1f,
         targetValue = 0.15f,
@@ -10585,6 +10586,7 @@ fun InputBar(
     text: String,
     enabled: Boolean,
     isStreaming: Boolean,
+    modifier: Modifier = Modifier,
     // ★ v1.6.0 模块六：列表已滚离底部 → 毛玻璃加重一档，视觉上更「沉」
     scrolled: Boolean = false,
     attachments: List<Attachment> = emptyList(),
@@ -10593,8 +10595,7 @@ fun InputBar(
     onRemoveAttachment: (Int) -> Unit,
     onMicClick: () -> Unit,
     onSend: () -> Unit,
-    onStop: () -> Unit,
-    modifier: Modifier = Modifier
+    onStop: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
     val canSend = (text.isNotBlank() || attachments.any { it.state == AttachState.READY }) && enabled
