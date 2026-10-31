@@ -8108,7 +8108,8 @@ private fun CyberSplash(onDone: () -> Unit) {
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                text = "v1.6.0",
+                // ★ 动态读构建版本，不再硬编码（BuildConfig 注入的是 versionName "1.7.0+build.xxx"，取 + 前主版本）
+                text = "v" + BuildConfig.BUILD_VERSION_NAME.substringBefore('+'),
                 color = TodoDoneColor.copy(alpha = appear * 0.8f),
                 fontSize = 12.sp,
                 fontFamily = FontFamily.Monospace
