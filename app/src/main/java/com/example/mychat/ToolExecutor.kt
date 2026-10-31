@@ -18,6 +18,7 @@ package com.example.mychat
  * ★ 搬迁是纯移动：函数体一行未改，行为与之前完全一致。
  */
 import android.content.ComponentName
+import android.graphics.Bitmap
 import android.content.res.Configuration
 import android.content.ServiceConnection
 import android.net.Uri
@@ -400,6 +401,151 @@ internal fun backupBeforeOverwrite(file: File): String {
         Log.e(TOOL_LOG_TAG, "备份失败（继续写入）: ${e.message}", e)
         "，原文件备份失败（${e.javaClass.simpleName}）"
     }
+}
+
+// ============================================================
+// 3.x v1.7.0 原生 Office 工具：read_pdf（视觉渲染）
+// ============================================================
+
+/** read_pdf 最多渲染的页数：PDF 全本渲染会撑爆内存，只看开头。 */
+internal const val PDF_MAX_PAGES = 3
+
+/** 渲染页面的最长边像素（与 ImageDownsampler.DEFAULT_MAX_EDGE 对齐）。 */
+private const val PDF_RENDER_MAX_EDGE = 1024
+
+/** runAgentLoop 注入视觉消息时识别的哨兵前缀。 */
+internal const val PDF_VIS_SENTINEL = "<<PDFVIS:"
+
+/**
+ * Vision 模型启发式判断。
+ *
+ * App 没有模型的capability清单（任何中转站都能叫任何名字），只能按名字猜：
+ * 名字里带视觉关键词，或命中已知视觉模型家族前缀，才算「大概率支持图片」。
+ * 误伤时用户会收到明确话术，可以换模型；比盲发几百 KB 图片然后收一个
+ * 400 报错体验好。
+ */
+internal fun looksLikeVisionModel(model: String): Boolean {
+    val m = model.lowercase()
+    val keywords = listOf("vision", "vl", "-v", "4o", "omni", "multimodal")
+    if (keywords.any { it in m }) return true
+    // 已知视觉模型家族：前缀命中即可，后缀版本号不管
+    val families = listOf(
+        "glm-4v", "glm-4.5v", "qwen-vl", "qwen2-vl", "qwen2.5-vl",
+        "gpt-4o", "gpt-4-turbo", "gpt-5", "o3",
+        "gemini", "claude-3", "claude-4", "claude-sonnet", "claude-opus",
+        "doubao-1.5-vision", "pixtral", "step-1v", "yi-vision"
+    )
+    return families.any { m.startsWith(it) || m.contains(it) }
+}
+
+/**
+ * read_pdf：PdfRenderer 视觉渲染前 N 页。
+ *
+ * ★ 为什么输出是「图片文件路径 + 哨兵」而不是直接塞 base64：
+ *   ① tool 消息的 content 在 OpenAI 协议里只能是字符串，图片必须走 role:"user"
+ *      的多模态数组 —— 所以渲染结果要跨过 executeTool 的字符串边界；
+ *   ② base64 一页就是几百 KB，塞进 output 会被 persistOversizeToolOutput
+ *      当成超长输出落盘截断，直接丢数据。
+ *   所以这里把每页落成 JPEG 临时文件，output 只带路径列表；
+ *   MainActivity 的 runAgentLoop 看到哨兵后，紧跟一条 user 多模态消息注入。
+ *
+ * 防 OOM 三道闸：只渲染前 [PDF_MAX_PAGES] 页；每页按最长边
+ * [PDF_RENDER_MAX_EDGE] 缩放；Bitmap 用完立刻 recycle。
+ */
+private fun readPdfVisual(path: String): ToolExecResult {
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+    // ★ Vision 拦截：纯文本模型喂图片只会白烧一轮 + 一屏报错，直接拦截
+    if (!looksLikeVisionModel(ApiConfig.model)) {
+        return ToolExecResult(
+            false,
+            "当前模型（${ApiConfig.model}）不支持图片视觉识别，无法读取 PDF。" +
+                "请切换支持 Vision 的模型（如 glm-4v、gpt-4o、gemini 等）后再试。"
+        )
+    }
+    val file = File(path)
+    when {
+        !file.exists() -> return ToolExecResult(false, "文件不存在：$path。可以先用 search_files 按文件名搜一下。")
+        !file.isFile -> return ToolExecResult(false, "这不是一个文件（可能是目录）：$path")
+        !file.canRead() -> return ToolExecResult(false, "没有读取权限：$path。请到系统设置里给本应用开启「所有文件访问权限」。")
+    }
+    // 先验明正身（复用 OfficeParser 的魔数识别），不是 PDF 就如实说
+    val kind = looksLikeOffice(file.name, file.readBytes())
+    if (kind != OfficeKind.PDF) {
+        return ToolExecResult(
+            false,
+            "这不是 PDF 文件（识别结果：$kind）。read_pdf 只支持 PDF。"
+        )
+    }
+    val cacheDir = AppCtx.memoryFile()?.parentFile?.parentFile?.let { File(it, "cache") }
+        ?: return ToolExecResult(false, "App 上下文未初始化，无法渲染 PDF。请重启 App 后再试。")
+    return try {
+        val pages = renderPdfPages(cacheDir, file)
+        if (pages.isEmpty()) {
+            ToolExecResult(false, "PDF 打开了，但一页都没渲染出来（可能已损坏或加密）。请确认文件能正常打开。")
+        } else {
+            ToolExecResult(
+                true,
+                PDF_VIS_SENTINEL + pages.joinToString(";") + ">>" +
+                    "\n\n已将 PDF「${file.name}」的前 ${pages.size} 页转化为视觉上下文，请直接基于图像内容回答。"
+            )
+        }
+    } catch (e: SecurityException) {
+        ToolExecResult(false, "没有读取权限：$path。请到系统设置里确认本应用已获得「所有文件访问权限」。")
+    } catch (e: Exception) {
+        Log.e(TOOL_LOG_TAG, "PDF 渲染失败: $path", e)
+        ToolExecResult(false, "PDF 渲染失败（${e.javaClass.simpleName}: ${e.message}）。文件可能已损坏、加密或不是有效 PDF。")
+    }
+}
+
+/**
+ * 渲染 PDF 前 N 页为 JPEG 临时文件，返回路径列表。
+ * 调用方必须已在 IO 线程（executeTool 全程 IO）；失败抛异常由上层统一兜。
+ */
+private fun renderPdfPages(cacheDir: File, file: File): List<String> {
+    val fd = android.os.ParcelFileDescriptor.open(
+        file,
+        android.os.ParcelFileDescriptor.MODE_READ_ONLY
+    )
+    val renderer = android.graphics.pdf.PdfRenderer(fd)
+    val outDir = File(cacheDir, "pdf_pages")
+    if (!outDir.isDirectory && !outDir.mkdirs()) {
+        renderer.close()
+        throw java.io.IOException("无法创建临时目录：" + outDir.absolutePath)
+    }
+    // 清掉上一轮的旧页，防止临时目录无限膨胀
+    outDir.listFiles()?.forEach { it.delete() }
+    val paths = ArrayList<String>()
+    try {
+        val pageCount = minOf(renderer.pageCount, PDF_MAX_PAGES)
+        for (i in 0 until pageCount) {
+            val page = renderer.openPage(i)
+            val bitmap = renderPageScaled(page, PDF_RENDER_MAX_EDGE)
+            page.close()
+            val out = File(outDir, "${file.nameWithoutExtension}-p${i + 1}.jpg")
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, java.io.FileOutputStream(out))
+            bitmap.recycle()  // ★ 边渲染边释放，绝不攒着
+            paths.add(out.absolutePath)
+        }
+    } finally {
+        renderer.close()
+        fd.close()
+    }
+    return paths
+}
+
+/** 渲染一页并按最长边缩放。Bitmap 用完由调用方 recycle。 */
+private fun renderPageScaled(page: android.graphics.pdf.PdfRenderer.Page, maxEdge: Int): Bitmap {
+    // 渲染倍率：目标最长边 / 页面原始尺寸，但绝不放大超过 2 倍（纯浪费内存）
+    val longSide = maxOf(page.width, page.height)
+    var scale = if (longSide > 0) maxEdge.toFloat() / longSide else 1f
+    if (scale > 2f) scale = 2f
+    val w = (page.width * scale).toInt().coerceAtLeast(1)
+    val h = (page.height * scale).toInt().coerceAtLeast(1)
+    val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    // 白底：PDF 透明底在 JPEG 里会变黑
+    bitmap.eraseColor(android.graphics.Color.WHITE)
+    page.render(bitmap, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+    return bitmap
 }
 
 // ============================================================
@@ -2456,6 +2602,17 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                     ToolExecResult(false, "参数错误：缺少 path（.xlsx 文件的绝对路径）")
                 } else {
                     readExcelSheet(path)
+                }
+            }
+
+
+            // ★ v1.7.0 任务三：PDF 视觉渲染（PdfRenderer 前 3 页 → 图片文件 → 多模态上下文）。
+            "read_pdf" -> {
+                val path = cleanPath(argOf(argsJson, "path"))
+                if (path.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 path（.pdf 文件的绝对路径）")
+                } else {
+                    readPdfVisual(path)
                 }
             }
 

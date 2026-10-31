@@ -1715,9 +1715,27 @@ private const val TOOL_DEFINITIONS = """
           "rows": {
             "type": "string",
             "description": "二维数组的 JSON 字符串，例如 [[\"姓名\",\"分数\"],[\"小明\",\"95\"]]。所有单元格一律写成字符串。"
+          },
+          "required": ["path", "rows"]
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_pdf",
+      "description": "阅读 PDF 文件：把前 3 页渲染成图像交给视觉模型理解。用户让你读 PDF / 总结 PDF / 从 PDF 找信息时用。需要当前模型支持视觉（Vision）；纯文本模型会收到明确提示。超过 3 页的长 PDF 只能读到开头部分。"
+        ,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "pdf 文件的绝对路径，例如 /sdcard/Download/论文.pdf"
           }
         },
-        "required": ["path", "rows"]
+        "required": ["path"]
       }
     }
   }
@@ -3169,6 +3187,48 @@ fun runAgentLoop(
                         put("tool_call_id", callId)
                         put("content", result.output)
                     })
+                    // ★ v1.7.0 任务三：read_pdf 的渲染页转多模态上下文。
+                    //   OpenAI 协议里 tool 消息的 content 只能是字符串，图片必须放在
+                    //   role:"user" 的 content 数组里 —— 所以这里检测哨兵，把渲染出的
+                    //   页面文件转成 image_url，紧跟一条 user 消息注入下一轮请求。
+                    if (result.ok && result.output.startsWith(PDF_VIS_SENTINEL)) {
+                        val end = result.output.indexOf(">>", PDF_VIS_SENTINEL.length)
+                        if (end > 0) {
+                            val paths = result.output
+                                .substring(PDF_VIS_SENTINEL.length, end)
+                                .split(";")
+                                .filter { it.isNotBlank() }
+                            val parts = JSONArray()
+                            parts.put(
+                                JSONObject().put("type", "text").put(
+                                    "text",
+                                    "这是用户 PDF 文档渲染出的页面图像，请阅读图中内容并继续回答上面的问题。"
+                                )
+                            )
+                            var encoded = 0
+                            for (p in paths) {
+                                imageToDataUrl(p)?.let { url ->
+                                    parts.put(
+                                        JSONObject().put("type", "image_url")
+                                            .put("image_url", JSONObject().put("url", url))
+                                    )
+                                    encoded++
+                                }
+                            }
+                            if (encoded > 0) {
+                                messages.put(
+                                    JSONObject().put("role", "user").put("content", parts)
+                                )
+                            } else {
+                                // 一页都没编码成功：别让请求挂掉，把哨兵消息替换成失败说明
+                                messages.remove(messages.length() - 1)
+                                messages.put(
+                                    JSONObject().put("role", "tool").put("tool_call_id", callId)
+                                        .put("content", "PDF 页面已渲染，但转码为图像时失败，无法提供视觉内容。")
+                                )
+                            }
+                        }
+                    }
                 }
 
                 totalChars += roundChars
