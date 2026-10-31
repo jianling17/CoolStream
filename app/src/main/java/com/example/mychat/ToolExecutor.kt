@@ -403,6 +403,99 @@ internal fun backupBeforeOverwrite(file: File): String {
 }
 
 // ============================================================
+// 3.x v1.7.0 原生 Office 工具：read_excel / create_excel
+// ============================================================
+
+/**
+ * read_excel：读取 .xlsx 的单元格文本。
+ * 输出按「行内 \t 分隔、行间换行」的 TSV 风格给模型，天然可读可复制。
+ */
+private fun readExcelSheet(path: String): ToolExecResult {
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+    val file = File(path)
+    when {
+        !file.exists() -> return ToolExecResult(false, "文件不存在：$path。可以先用 search_files 按文件名搜一下。")
+        !file.isFile -> return ToolExecResult(false, "这不是一个文件（可能是目录）：$path")
+        !file.canRead() -> return ToolExecResult(false, "没有读取权限：$path。请到系统设置里给本应用开启「所有文件访问权限」。")
+    }
+    val bytes = try {
+        file.readBytes()
+    } catch (e: Exception) {
+        return ToolExecResult(false, "读取失败：$path（${e.javaClass.simpleName}: ${e.message}）")
+    }
+    // 先验明正身：不是 xlsx（比如旧版 .xls）就如实说，不硬解
+    val kind = looksLikeOffice(file.name, bytes)
+    if (kind != OfficeKind.XLSX) {
+        return ToolExecResult(
+            false,
+            "这不是 .xlsx 文件（识别结果：$kind）。read_excel 只支持 xlsx；"
+                + "旧版 .xls 请先在 WPS/Office 里另存为 .xlsx 再试。"
+        )
+    }
+    val parsed = parseOfficeBytes(file.name, bytes)
+    if (!parsed.ok) {
+        return ToolExecResult(false, parsed.message)
+    }
+    val text = truncateOfficeText(parsed.text)
+    return ToolExecResult(true, "已读取 Excel 表格：${file.name}（${text.length} 字符）\n\n$text")
+}
+
+/**
+ * create_excel：把 rows 二维数组 JSON 生成 .xlsx。
+ * fail-closed：JSON 解析失败 / buildXlsx 失败，都拦截并明确报错，绝不写坏文件。
+ */
+private fun createExcelSheet(path: String, rowsJson: String): ToolExecResult {
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+    if (!path.endsWith(".xlsx", ignoreCase = true)) {
+        return ToolExecResult(false, "文件名必须以 .xlsx 结尾（当前：$path）。Excel 表格请用 .xlsx 扩展名。")
+    }
+    val rows: List<List<String>> = try {
+        val arr = org.json.JSONArray(rowsJson)
+        (0 until arr.length()).map { r ->
+            val row = arr.getJSONArray(r)
+            (0 until row.length()).map { c ->
+                row.getString(c)
+            }
+        }
+    } catch (e: Exception) {
+        return ToolExecResult(
+            false,
+            "rows 格式不对：必须是二维字符串数组，例如 [[\"姓名\",\"分数\"],[\"小明\",\"95\"]]。（${e.javaClass.simpleName}）"
+        )
+    }
+    if (rows.isEmpty()) {
+        return ToolExecResult(false, "rows 是空的，没有生成的意义。请先准备好表格内容。")
+    }
+    val result = buildXlsx(rows)
+    if (!result.ok || result.bytes == null) {
+        return ToolExecResult(false, result.message)
+    }
+    val file = File(path)
+    val parent = file.parentFile
+    if (parent != null && !parent.isDirectory && !parent.mkdirs()) {
+        return ToolExecResult(false, "无法创建目录：${parent.absolutePath}。请换一个已存在的目录。")
+    }
+    return try {
+        val existedBefore = file.exists() && file.isFile
+        val backupNote = if (existedBefore) backupBeforeOverwrite(file) else ""
+        file.writeBytes(result.bytes)
+        val msg = if (existedBefore) {
+            "已覆盖生成 Excel 表格：${file.name}（${rows.size} 行）$backupNote"
+        } else {
+            "已创建 Excel 表格：${file.name}（${rows.size} 行）"
+        }
+        return ToolExecResult(true, msg)
+    } catch (e: SecurityException) {
+        return ToolExecResult(false, "没有写入权限：$path。请到系统设置里确认本应用已获得「所有文件访问权限」。")
+    } catch (e: IOException) {
+        val friendly = friendlyIoReason(e)
+        return ToolExecResult(false, "$friendly：$path（${e.javaClass.simpleName}: ${e.message}）")
+    } catch (e: Exception) {
+        return ToolExecResult(false, "写入失败（${e.javaClass.simpleName}: ${e.message}）。原文件未被破坏。")
+    }
+}
+
+// ============================================================
 // 3.x v1.7.0 原生 Office 工具：read_word / create_word
 // ============================================================
 
@@ -2355,6 +2448,32 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                 }
             }
 
+
+            // ★ v1.7.0 任务二：原生 Excel 读/写（OfficeParser 读 + OfficeWriter inlineStr 写）。
+            "read_excel" -> {
+                val path = cleanPath(argOf(argsJson, "path"))
+                if (path.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 path（.xlsx 文件的绝对路径）")
+                } else {
+                    readExcelSheet(path)
+                }
+            }
+
+            "create_excel" -> {
+                val path = cleanPath(argOf(argsJson, "path"))
+                val rowsJson = argOf(argsJson, "rows")
+                when {
+                    path.isBlank() -> ToolExecResult(
+                        false,
+                        "参数错误：缺少 path（要生成的 .xlsx 绝对路径，例如 /sdcard/Download/账本.xlsx）"
+                    )
+                    rowsJson.isBlank() -> ToolExecResult(
+                        false,
+                        "参数错误：rows 是空的。rows 应该是二维数组，例如 [[\"列A\",\"列B\"],[\"1\",\"2\"]]"
+                    )
+                    else -> createExcelSheet(path, rowsJson)
+                }
+            }
             else -> {
                 Log.e(TOOL_LOG_TAG, "未知工具: $name")
                 ToolExecResult(false, "未知工具：$name")

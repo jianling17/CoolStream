@@ -1682,6 +1682,44 @@ private const val TOOL_DEFINITIONS = """
         "required": ["path", "content"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_excel",
+      "description": "读取 .xlsx Excel 表格的单元格内容。用户让你处理/分析/汇总表格数据时用。只支持 xlsx；旧版 .xls 会明确报错。输出按行给出，同行单元格用制表符分隔。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "xlsx 文件的绝对路径，例如 /sdcard/Download/账本.xlsx"
+          }
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_excel",
+      "description": "把二维表格数据生成 .xlsx Excel 文件保存到手机。rows 是二维字符串数组：外层是行，内层是单元格，第一行通常是表头。只支持文本单元格，不支持公式/图表/合并单元格。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "要生成的 .xlsx 绝对路径，例如 /sdcard/Download/账本.xlsx"
+          },
+          "rows": {
+            "type": "string",
+            "description": "二维数组的 JSON 字符串，例如 [[\"姓名\",\"分数\"],[\"小明\",\"95\"]]。所有单元格一律写成字符串。"
+          }
+        },
+        "required": ["path", "rows"]
+      }
+    }
   }
 ]
 """

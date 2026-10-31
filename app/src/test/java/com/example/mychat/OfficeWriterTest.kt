@@ -153,4 +153,26 @@ class OfficeWriterTest {
         val parsed = parseOfficeBytes("t.xlsx", r.bytes!!)
         assertFalse(parsed.ok)
     }
+
+    @Test
+    fun xlsxGridFidelity() {
+        // 3 行 2 列：读回后每行的单元格顺序与列数必须保真（\t 分列、\n 分行）
+        val rows = listOf(
+            listOf("表头1", "表头2"),
+            listOf("r1c1", "r1c2"),
+            listOf("r2c1", "r2c2")
+        )
+        val r = buildXlsx(rows)
+        assertTrue(r.ok)
+        val parsed = parseOfficeBytes("g.xlsx", r.bytes!!)
+        assertTrue(parsed.ok)
+        val lines = parsed.text.split("\n").filter { it.isNotBlank() }
+        assertEquals(3, lines.size)
+        lines.forEach { line ->
+            val cells = line.split("\t")
+            assertEquals(2, cells.size)
+        }
+        assertTrue(lines[0].contains("表头1"))
+        assertTrue(lines[2].contains("r2c2"))
+    }
 }
