@@ -88,7 +88,7 @@ android {
         // ============================================================
 
         // ▼▼▼ 发版时改这一行 ▼▼▼
-        val appBaseVersion = "1.6.1"
+        val appBaseVersion = "1.7.0"
 
         val nowDate = Date()
         val versionStamp = SimpleDateFormat("yyMMddHHmm", Locale.US).format(nowDate)

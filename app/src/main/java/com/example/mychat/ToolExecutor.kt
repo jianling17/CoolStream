@@ -402,6 +402,83 @@ internal fun backupBeforeOverwrite(file: File): String {
     }
 }
 
+// ============================================================
+// 3.x v1.7.0 原生 Office 工具：read_word / create_word
+// ============================================================
+
+/** read_word：读 .docx 正文。复用 OfficeParser 的 zip+扫描提取，再统一截断。 */
+private fun readWordDoc(path: String): ToolExecResult {
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+    val file = File(path)
+    when {
+        !file.exists() -> return ToolExecResult(false, "文件不存在：$path。可以先用 search_files 按文件名搜一下。")
+        !file.isFile -> return ToolExecResult(false, "这不是一个文件（可能是目录）：$path")
+        !file.canRead() -> return ToolExecResult(false, "没有读取权限：$path。请到系统设置里给本应用开启「所有文件访问权限」。")
+    }
+    val bytes = try {
+        file.readBytes()
+    } catch (e: Exception) {
+        return ToolExecResult(false, "读取失败：$path（${e.javaClass.simpleName}: ${e.message}）")
+    }
+    // 先验明正身：不是 docx（比如旧版 .doc 或纯文本）就如实说，不硬解
+    val kind = looksLikeOffice(file.name, bytes)
+    if (kind != OfficeKind.DOCX) {
+        return ToolExecResult(
+            false,
+            "这不是 .docx 文件（识别结果：$kind）。read_word 只支持 docx；"
+                + "旧版 .doc 请先在 WPS/Office 里另存为 .docx 再试。"
+        )
+    }
+    val parsed = parseOfficeBytes(file.name, bytes)
+    if (!parsed.ok) return ToolExecResult(false, parsed.message)
+    val text = truncateOfficeText(parsed.text)
+    return ToolExecResult(true, "已读取 Word 文档：${file.name}（${text.length} 字符）\n\n$text")
+}
+
+/**
+ * create_word：把纯文本生成 .docx。
+ * ★ fail-closed：OfficeWriter 先在内存里拼出完整 zip，成功才落盘；
+ *   落盘前目标已有同名文件时走备份，绝不覆盖丢失用户原文件。
+ */
+private fun createWordDoc(path: String, content: String): ToolExecResult {
+    workspaceViolation(path)?.let { return ToolExecResult(false, it) }
+    if (content.isBlank()) {
+        return ToolExecResult(false, "文档内容为空，没有生成的意义。请先写好正文再调用 create_word。")
+    }
+    if (!path.endsWith(".docx", ignoreCase = true)) {
+        return ToolExecResult(false, "文件名必须以 .docx 结尾（当前：$path）。Word 文档请用 .docx 扩展名。")
+    }
+    val result = buildDocx(content)
+    if (!result.ok || result.bytes == null) {
+        return ToolExecResult(false, result.message)
+    }
+    val file = File(path)
+    val parent = file.parentFile
+    if (parent != null && !parent.isDirectory && !parent.mkdirs()) {
+        return ToolExecResult(false, "无法创建目录：${parent.absolutePath}。请换一个已存在的目录。")
+    }
+    return try {
+        val existedBefore = file.exists() && file.isFile
+        val backupNote = if (existedBefore) backupBeforeOverwrite(file) else ""
+        file.writeBytes(result.bytes)
+        val msg = if (existedBefore) {
+            "已覆盖生成 Word 文档：$path（${result.bytes.size} 字节）$backupNote"
+        } else {
+            "已生成 Word 文档：$path（${result.bytes.size} 字节）。可在文件管理器或 WPS/Office 中打开。"
+        }
+        ToolExecResult(true, msg)
+    } catch (e: SecurityException) {
+        ToolExecResult(false, "没有写入权限：$path。请到系统设置里确认本应用已获得「所有文件访问权限」。")
+    } catch (e: IOException) {
+        val friendly = friendlyIoReason(e)
+        ToolExecResult(false, "$friendly：$path（${e.javaClass.simpleName}: ${e.message}）")
+    } catch (e: Exception) {
+        // 兜底：磁盘上绝不留半成品
+        runCatching { if (file.exists() && file.length() != buildDocx(content).bytes?.size?.toLong()) file.delete() }
+        ToolExecResult(false, OFFICE_WRITE_FAIL_MESSAGE + "（" + e.javaClass.simpleName + "）")
+    }
+}
+
 /** 统计 needle 在 haystack 里出现几次（不重叠） */
 internal fun countOccurrences(haystack: String, needle: String): Int {
     if (needle.isEmpty()) return 0
@@ -2245,6 +2322,36 @@ internal fun executeTool(name: String, argsJson: String): ToolExecResult {
                     ToolExecResult(false, "参数错误：缺少 query（要检索的关键词）")
                 } else {
                     recallMemory(query)
+                }
+            }
+
+            // ★ v1.7.0 任务一：原生 Word 读取（复用 OfficeParser 的 docx 提取）。
+            //   不再拐弯走 read_file 的二进制探测 —— 专用工具语义更清晰，
+            //   模型不用先猜「这文件是不是 zip 容器」。
+            "read_word" -> {
+                val path = cleanPath(argOf(argsJson, "path"))
+                if (path.isBlank()) {
+                    ToolExecResult(false, "参数错误：缺少 path（.docx 文件的绝对路径）")
+                } else {
+                    readWordDoc(path)
+                }
+            }
+
+            // ★ v1.7.0 任务一：原生 Word 生成（OfficeWriter 手写最小 OOXML）。
+            //   content 是正文；空行分段、普通换行分段落。纯文本，不支持图片/表格。
+            "create_word" -> {
+                val path = cleanPath(argOf(argsJson, "path"))
+                val content = argOf(argsJson, "content")
+                when {
+                    path.isBlank() -> ToolExecResult(
+                        false,
+                        "参数错误：缺少 path（要生成的 .docx 绝对路径，例如 /sdcard/Download/报告.docx）"
+                    )
+                    content.isEmpty() -> ToolExecResult(
+                        false,
+                        "参数错误：content 是空的，一个字都没写。"
+                    )
+                    else -> createWordDoc(path, content)
                 }
             }
 

@@ -1644,6 +1644,44 @@ private const val TOOL_DEFINITIONS = """
         "required": ["query"]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_word",
+      "description": "读取 .docx Word 文档的正文纯文本。用户让你处理/总结/翻译 Word 文档时用。只支持 docx；旧版 .doc 会明确报错。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "docx 文件的绝对路径，例如 /sdcard/Download/报告.docx"
+          }
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_word",
+      "description": "把纯文本内容生成一个 .docx Word 文档保存到手机。适合生成报告、总结、信函等。只支持纯文本段落（空行=分段）；不支持图片和表格。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "要生成的 .docx 绝对路径，例如 /sdcard/Download/周报.docx"
+          },
+          "content": {
+            "type": "string",
+            "description": "文档正文。用换行分段，段落之间可以用空行分隔。"
+          }
+        },
+        "required": ["path", "content"]
+      }
+    }
   }
 ]
 """
