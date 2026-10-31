@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- v1.7.0 任务四：办公文档卡片的「用系统应用打开」需要 FileProvider 共享文件路径 -->
+<paths>
+    <!-- 外部存储根（MANAGE_EXTERNAL_STORAGE 已授权，生成的 docx/xlsx 在这里） -->
+    <external-path name="external_files" path="." />
+    <!-- cacheDir（PDF 渲染页）与 filesDir -->
+    <cache-path name="cache" path="." />
+    <files-path name="files" path="." />
+</paths>

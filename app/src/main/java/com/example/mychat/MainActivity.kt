@@ -7629,6 +7629,11 @@ fun MessageBubble(
         val todoView = remember(message.content) { parseToolCall(message.content) }
         if (todoView.name == "todo") {
             TodoCard(view = todoView, modifier = modifier)
+        } else if (officeDocCardOf(message.content) != null) {
+            // ★ v1.7.0 任务四：办公读写五工具走极简文档卡片，不走通用折叠卡片。
+            //   卡片自含点击状态（同 FileCardList 的做法）：readerPath 不上提到
+            //   MessageBubble 顶层，避免流式期间多一份无谓的 state 快照。
+            OfficeDocCardRow(content = message.content, modifier = modifier)
         } else {
             ToolCallCard(message = message, modifier = modifier)
         }
@@ -10538,6 +10543,7 @@ private fun FileCardList(cards: List<FileCard>, modifier: Modifier = Modifier) {
     }
 }
 
+
 /** 单次最多读这么多字节进阅读器；再大就不是「长文」而是「误点了一个日志文件」了 */
 internal const val LONG_TEXT_READ_LIMIT = 2_000_000
 
@@ -10564,6 +10570,153 @@ internal fun readLongTextFile(path: String): String {
     }
     return String(buf, 0, read, Charsets.UTF_8) +
         "\n\n…（文件共 " + total + " 字节，这里只显示前 2MB）"
+}
+
+
+// ============================================================
+// v1.7.0 任务四：办公读写五工具（read_word / read_excel / read_pdf /
+// create_word / create_excel）的极简文档卡片。
+// ============================================================
+
+/** 办公文档卡片的形状：读取类走全屏文本预览，生成类走系统应用打开。 */
+internal data class OfficeDocCard(
+    val tool: String,
+    val path: String,
+    val name: String,
+    /** true = 读取类（📄 已读取文档）；false = 生成类（📄 已生成文档） */
+    val isRead: Boolean,
+    /** 副标题括号里的说明（如「1234 字符」「已转为视觉上下文」） */
+    val subtitle: String
+)
+
+/** 五个办公读写工具名。 */
+private val OFFICE_DOC_TOOLS = setOf("read_word", "read_excel", "read_pdf", "create_word", "create_excel")
+
+/**
+ * 从一条 TOOL_CALL 消息里解出办公文档卡片；不是办公工具 / 未成功返回 null。
+ *
+ * 纯函数（收 content 字符串），JVM 可单测。设计约定：
+ *  · 只有 ok == true 才出卡片 —— 失败的信息走通用 ToolCallCard 的红点 + 错误文本，
+ *    那才是失败该有的样子；成功才配得上「📄 已读取/已生成」的干净卡片。
+ *  · path 统一从 arguments.path 取：五个工具都有这个参数，比从各不相同的话术
+ *    文本里抠文件名稳得多。
+ *  · PDF 读取的正文是图像不是文本，副标题必须是「已转为视觉上下文」，
+ *    提示用户点开也没有全文可读。
+ */
+internal fun officeDocCardOf(content: String): OfficeDocCard? {
+    // 便宜预筛：工具名字段在最前面（isTodoToolPayload 同款思路，避免流式期间整段 JSON 解析）
+    val tool = OFFICE_DOC_TOOLS.firstOrNull { content.startsWith("{\"tool\":\"" + it + "\"") }
+        ?: return null
+    return try {
+        val root = JSONObject(content)
+        if (root.opt("ok") != true) return null
+        val path = (root.optJSONObject("arguments")?.opt("path") as? String).orEmpty()
+        if (path.isBlank()) return null
+        val output = (root.opt("output") as? String).orEmpty()
+        val isRead = tool.startsWith("read_")
+        val subtitle = when {
+            tool == "read_pdf" -> "已转为视觉上下文"
+            isRead -> Regex("(\\d+) 字符").find(output)?.groupValues?.get(1)?.let { it + " 字符" } ?: "已读取"
+            tool == "create_excel" -> Regex("(\\d+) 行").find(output)?.groupValues?.get(1)?.let { it + " 行 · 点击打开" } ?: "点击打开"
+            else -> "点击打开"
+        }
+        OfficeDocCard(
+            tool = tool,
+            path = path,
+            name = path.substringAfterLast('/'),
+            isRead = isRead,
+            subtitle = subtitle
+        )
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/** 生成类卡片点击：用系统应用（WPS / Office / PDF 阅读器）打开文档。 */
+internal fun openGeneratedDoc(context: android.content.Context, path: String) {
+    try {
+        val file = java.io.File(path)
+        if (!file.exists()) {
+            android.widget.Toast.makeText(context, "文件不存在：" + file.name, android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            context.packageName + ".fileprovider",
+            file
+        )
+        val mime = when {
+            path.endsWith(".docx", true) -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            path.endsWith(".xlsx", true) -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            path.endsWith(".pdf", true) -> "application/pdf"
+            else -> "application/octet-stream"
+        }
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, mime)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        Log.e(TAG, "openGeneratedDoc 失败: $path", e)
+        android.widget.Toast.makeText(context, "未找到能打开这类文档的应用", android.widget.Toast.LENGTH_SHORT).show()
+    }
+}
+
+/**
+ * 极简「📄 文档卡片」：透明底 + 细边框（FileCardRow 同款视觉），
+ * 读取类点击 → 全屏文本预览（LongTextReaderDialog）；
+ * 生成类点击 → 系统应用打开（openGeneratedDoc）。
+ */
+@Composable
+private fun OfficeDocCardRow(
+    content: String,
+    modifier: Modifier = Modifier
+) {
+    val cs = MaterialTheme.colorScheme
+    val context = LocalContext.current
+    val card = remember(content) { officeDocCardOf(content) } ?: return
+    // 读取类的全屏预览：state 关在卡片里，不上提（同 FileCardList 的理由）
+    var readerPath by remember(card.path) { mutableStateOf<String?>(null) }
+    Surface(
+        color = Color.Transparent,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(0.5.dp, cs.onSurface.copy(alpha = 0.18f)),
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable {
+                if (card.isRead) readerPath = card.path else openGeneratedDoc(context, card.path)
+            }
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(text = "📄", style = MaterialTheme.typography.labelMedium)
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = (if (card.isRead) "已读取文档：" else "已生成文档：") + card.name,
+                    color = cs.onSurface,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "(${card.subtitle})",
+                    color = cs.onSurface.copy(alpha = 0.55f),
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+    val open = readerPath
+    if (open != null) {
+        LongTextReaderDialog(path = open, onClose = { readerPath = null })
+    }
+
 }
 
 /**
